@@ -1,9 +1,16 @@
 # Big Ambitions – Going Public Server
 
-> The repository name has no hyphens on purpose: AMP cannot upgrade instances from template repositories whose name contains one.
 
 ![Going Public Server](logo.jpg)
 
+
+<img src="Screenshot 2026-10-29 101200.png" alt="" width="300">
+<img src="Screenshot 2026-10-29 101231.png" alt="" width="300">
+
+
+> The repository name has no hyphens on purpose: AMP cannot upgrade instances from template repositories whose name contains one.
+>
+> 
 Dedicated server for **Big Ambitions** multiplayer, as a template for the
 [AMP](https://cubecoders.com/AMP) game server panel. The game runs headless under Proton with the
 **Going Public Server** mod; players join with the server's address and server key.
