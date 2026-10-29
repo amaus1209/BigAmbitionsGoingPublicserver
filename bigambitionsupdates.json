@@ -29,7 +29,7 @@
         "UpdateSourcePlatform": "Linux",
         "UpdateSource": "GithubRelease",
         "UpdateSourceData": "GoingPublicServer-Server.zip",
-        "UpdateSourceArgs": "amaus1209/Big-Ambitions-Going-Publicserver",
+        "UpdateSourceArgs": "amaus1209/BigAmbitionsGoingPublicServer",
         "UpdateSourceTarget": "{{$FullRootDir}}",
         "UnzipUpdateSource": true,
         "OverwriteExistingFiles": true,
