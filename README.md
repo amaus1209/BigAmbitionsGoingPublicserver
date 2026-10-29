@@ -4,9 +4,11 @@
 ![Going Public Server](logo.jpg)
 
 
-<img src="Screenshot 2026-10-29 101200.png" alt="" width="300">
-<img src="Screenshot 2026-10-29 101231.png" alt="" width="300">
-
+<img src="Screenshot 2026-10-29 101200.png" alt="" width="600">
+<img src="Screenshot 2026-10-29 101231.png" alt="" width="600">
+<img src="Screenshot 2026-10-29 101245.png" alt="" width="600">
+<img src="Screenshot 2026-10-29 101259.png" alt="" width="600">
+<img src="Screenshot 2026-10-29 101550.png" alt="" width="600">
 
 > The repository name has no hyphens on purpose: AMP cannot upgrade instances from template repositories whose name contains one.
 >
