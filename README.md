@@ -1,5 +1,7 @@
 # Big Ambitions – Going Public Server
 
+> The repository name has no hyphens on purpose: AMP cannot upgrade instances from template repositories whose name contains one.
+
 ![Going Public Server](logo.jpg)
 
 Dedicated server for **Big Ambitions** multiplayer, as a template for the
@@ -11,7 +13,7 @@ Dedicated server for **Big Ambitions** multiplayer, as a template for the
 ## Installing on an AMP server (Linux)
 
 1. In AMP (ADS): **Configuration → Instance Deployment → Configuration Repositories**, add
-   `amaus1209/Big-Ambitions-Going-Publicserver:main`, then **Fetch latest**.
+   `amaus1209/BigAmbitionsGoingPublicServer:main`, then **Fetch latest**.
 2. Create an instance from the template **Big Ambitions (Going Public server)**.
 3. In the instance: **Update**. AMP downloads the game with SteamCMD (it asks for a Steam login that owns
    Big Ambitions, and the Steam Guard code if the account has one), Proton GE, and the newest
@@ -28,16 +30,20 @@ Configuration → Updates → **Steam Workshop Items**: one Workshop item ID per
 downloads them with the same Steam login; the server installs them at the next start. Players who lack a
 mod get a button that opens its Workshop page in Steam.
 
-### Optional: player pages (download, ranking)
+### Optional on the host: ranking page and save backups
 
-The release also contains a join page and a ranking. To serve them through AMP's own web server, link the
-folder once on the host (as the user AMP runs as):
+Instances run in containers and cannot reach AMP's web folder, so two small jobs run on the host, as the user AMP
+runs as (`crontab -e`; the scripts come with every instance in `bigambitions/bamp-tools/`):
 
 ```
-ln -s ~/.ampdata/instances/<instance>/bigambitions/telemetry-data/web ~/.ampdata/instances/ADS01/WebRoot/monitor
+* * * * *  ~/.ampdata/instances/<instance>/bigambitions/bamp-tools/bamp-web-sync.sh
+17 4 * * * ~/.ampdata/instances/<instance>/bigambitions/bamp-tools/backup-saves.sh --all >> ~/backups/saves/backup.log 2>&1
 ```
 
-They are then at `https://<your AMP address>/monitor/join.html` (the instance's Connection Link).
+- `bamp-web-sync.sh` serves the ranking of **all** Going Public Server instances at
+  `https://<your AMP address>/monitor/index.html` (the instance's Connection Link); each player opens the
+  ranking of their server with its server key.
+- `backup-saves.sh --all` saves every instance's multiplayer saves to `~/backups/saves/` (14 per instance).
 
 ## Players
 
@@ -51,7 +57,7 @@ They are then at `https://<your AMP address>/monitor/join.html` (the instance's 
 ## Deutsch
 
 **Installation in AMP:** Konfiguration → Instance Deployment → Configuration Repositories:
-`amaus1209/Big-Ambitions-Going-Publicserver:main` eintragen, **Fetch latest**, eine Instanz aus der Vorlage
+`amaus1209/BigAmbitionsGoingPublicServer:main` eintragen, **Fetch latest**, eine Instanz aus der Vorlage
 **Big Ambitions (Going Public server)** anlegen, **Update** (lädt das Spiel per SteamCMD mit einem Steam-Konto,
 das Big Ambitions besitzt – bei Steam Guard fragt AMP nach dem Code –, Proton GE und das neueste Release von
 hier), dann **Start**. Der Server-Schlüssel steht auf der Statusseite. UDP-Port 7777 freigeben.
