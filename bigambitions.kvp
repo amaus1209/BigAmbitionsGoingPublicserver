@@ -22,7 +22,7 @@ Meta.ExtraContainerPackages=["python3","xvfb","xauth"]
 Meta.ConfigReleaseState=NotSpecified
 Meta.NoCommercialUsage=False
 Meta.ConfigVersion=1
-Meta.ReleaseNotes=First draft - untested. Telemetry collector (server-side monitor) on TCP 18780 started by bamp-start.sh.
+Meta.ReleaseNotes=1.0.11: telemetry collector removed; the server key is shown on the status page.
 Meta.BreakingReleaseNotes=
 Meta.ImportableExtensions=[]
 Meta.AppConfigId=6b0c6a3e-9d1f-4a5e-8c2b-2f6d1e7a4b90
@@ -95,8 +95,8 @@ Console.UserJoinRegex=^.*\[BAMP-HEADLESS\] JOIN (?<username>.+)$
 Console.UserLeaveRegex=^.*\[BAMP-HEADLESS\] LEAVE (?<username>.+)$
 Console.UserChatRegex=^$
 Console.UpdateAvailableRegex=^$
-Console.MetricsRegex=^.*\[Collector\] Werte: Quellen=(?<Quellen>\d+) Spieler=\d+ Nachrichten/s=(?<Nachrichten_pro_s>\d+)$
-Console.ServerInfoRegex=^.*\[Collector\] Info: Schluessel=(?<Server_Schluessel>\S+) \| Quellen=(?<Telemetrie_Quellen>.*)$
+Console.MetricsRegex=^$
+Console.ServerInfoRegex=^.*\[Server\] Info: Schluessel=(?<Server_Schluessel>\S+)$
 Console.SuppressLogAtStart=False
 Console.ActivateLogRegex=
 Console.UserActions={}

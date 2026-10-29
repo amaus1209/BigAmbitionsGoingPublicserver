@@ -318,38 +318,10 @@
         "Hidden": true
     },
     {
-        "DisplayName": "Telemetry monitor",
-        "Category": "Big Ambitions:storefront",
-        "Subcategory": "Telemetry:monitoring:2",
-        "Description": "Run the BAMP telemetry collector next to the server: it feeds the values and the server key on the status page. Players only need the server key (Join a Game > Server key).",
-        "Keywords": "",
-        "FieldName": "TelemetryCollector",
-        "InputType": "checkbox",
-        "ParamFieldName": "$.TelemetryCollector",
-        "DefaultValue": "true",
-        "EnumValues": {
-            "False": "false",
-            "True": "true"
-        }
-    },
-    {
-        "DisplayName": "Telemetry port",
-        "Category": "Big Ambitions:storefront",
-        "Subcategory": "Telemetry:monitoring:2",
-        "Description": "TCP port of the collector and the web monitor",
-        "Keywords": "",
-        "FieldName": "$TelemetryPort",
-        "InputType": "number",
-        "ParamFieldName": "$.TelemetryCollectorPort",
-        "DefaultValue": "18780",
-        "EnumValues": {},
-        "Hidden": true
-    },
-    {
         "DisplayName": "Server key",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Telemetry:monitoring:2",
-        "Description": "Players need this key to join (Join a Game > Server key; just the key, or KEY@SERVER) and to open the ranking page; it is also the telemetry key. Empty = one is created on first start, shown in the console ('[Collector] Schlüssel: ...') and kept in telemetry-data/key.txt.",
+        "Subcategory": "Players:monitoring:2",
+        "Description": "Players need this key to join (Join a Game > Server key) and to open the ranking page. Empty = one is created on first start, shown on the status page and kept in telemetry-data/key.txt.",
         "Keywords": "",
         "FieldName": "TelemetryKey",
         "InputType": "text",
@@ -360,7 +332,7 @@
     {
         "DisplayName": "Web address for players",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Telemetry:monitoring:2",
+        "Subcategory": "Players:monitoring:2",
         "Description": "Where players reach this AMP panel, e.g. https://amp.example.org or http://203.0.113.5:8080 - used for the server's mod list. Empty = https://<the address players join>.",
         "Keywords": "",
         "FieldName": "PlayerWebUrl",
