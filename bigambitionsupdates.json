@@ -48,8 +48,8 @@
         "UpdateStageName": "Settings in the server language",
         "UpdateSourcePlatform": "Linux",
         "UpdateSource": "Executable",
-        "UpdateSourceData": "/bin/bash",
-        "UpdateSourceArgs": "\"{{$FullRootDir}}bamp-tools/localize-amp.sh\" \"{{$FullBaseDir}}bamp-server.json\" \"{{$FullRootDir}}../configmanifest.json\"",
+        "UpdateSourceData": "/usr/bin/python3",
+        "UpdateSourceArgs": "\"{{$FullRootDir}}bamp-tools/localize-template.py\" \"{{ServerLanguage}}\" --manifest \"{{$FullRootDir}}../configmanifest.json\"",
         "SkipOnFailure": true
     },
     {
