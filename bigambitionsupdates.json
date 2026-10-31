@@ -45,6 +45,14 @@
         "SkipOnFailure": true
     },
     {
+        "UpdateStageName": "Settings for AMP",
+        "UpdateSourcePlatform": "Linux",
+        "UpdateSource": "Executable",
+        "UpdateSourceData": "/usr/bin/python3",
+        "UpdateSourceArgs": "\"{{$FullRootDir}}bamp-tools/seed-settings.py\" \"{{$FullBaseDir}}bamp-server.json\" \"{{$FullRootDir}}bamp-tools/bigambitionsconfig.json\"",
+        "SkipOnFailure": true
+    },
+    {
         "UpdateStageName": "Settings in the server language",
         "UpdateSourcePlatform": "Linux",
         "UpdateSource": "Executable",

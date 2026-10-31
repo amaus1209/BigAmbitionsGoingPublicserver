@@ -527,21 +527,16 @@
         "DisplayName": "Frame cap while running",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Server:dns:1",
-        "Description": "Frames per second of the server while players are on it. Raise it when the game gets choppy with many players (more CPU); lower it to save CPU.",
+        "Description": "Frames per second of the server while players are on it: 60, 120 or 200. More frames make the world react faster (more CPU); the network sends on its own clock either way.",
         "Keywords": "",
         "FieldName": "HeadlessFps",
         "InputType": "enum",
         "ParamFieldName": "$.HeadlessFps",
-        "DefaultValue": "30",
+        "DefaultValue": "200",
         "EnumValues": {
-            "10": "10 FPS",
-            "15": "15 FPS",
-            "20": "20 FPS",
-            "25": "25 FPS",
-            "30": "30 FPS",
-            "40": "40 FPS",
-            "50": "50 FPS",
-            "60": "60 FPS"
+            "60": "60 FPS",
+            "120": "120 FPS",
+            "200": "200 FPS"
         }
     },
     {
@@ -560,6 +555,23 @@
             "5": "5 FPS",
             "10": "10 FPS",
             "15": "15 FPS"
+        }
+    },
+    {
+        "DisplayName": "Network rate",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "How often positions, cars and traffic go over the network: Normal (positions 10 Hz, traffic 5 Hz, as before 1.0.14), High (20 / 10 Hz), Very high (30 / 15 Hz) or Maximum (60 / 30 Hz). Higher is smoother while driving; every player's stream goes to every other player, so the traffic grows quickly with more players. The players get the server's level when they join.",
+        "Keywords": "",
+        "FieldName": "NetRate",
+        "InputType": "enum",
+        "ParamFieldName": "$.NetRate",
+        "DefaultValue": "2",
+        "EnumValues": {
+            "0": "Normal (10 / 5 Hz)",
+            "1": "High (20 / 10 Hz)",
+            "2": "Very high (30 / 15 Hz)",
+            "3": "Maximum (60 / 30 Hz)"
         }
     },
     {

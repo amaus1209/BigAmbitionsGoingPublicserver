@@ -6,7 +6,7 @@ Meta.Arch=x86_64
 Meta.Author=community (unofficial)
 Meta.URL=https://github.com/amaus1209/BigAmbitionsGoingPublicServer
 Meta.DisplayImageSource=url:https://raw.githubusercontent.com/amaus1209/BigAmbitionsGoingPublicServer/main/logo.jpg
-Meta.EndpointURIFormat=https://{ip}/monitor/index.html
+Meta.EndpointURIFormat=https://{ip}/monitor/{GenericModule.App.Ports.$GamePort}/index.html
 Meta.ConfigManifest=bigambitionsconfig.json
 Meta.MetaConfigManifest=bigambitionsmetaconfig.json
 Meta.ConfigRoot=bigambitions.kvp
@@ -95,8 +95,8 @@ Console.UserJoinRegex=^.*\[BAMP-HEADLESS\] JOIN (?<username>.+)$
 Console.UserLeaveRegex=^.*\[BAMP-HEADLESS\] LEAVE (?<username>.+)$
 Console.UserChatRegex=^$
 Console.UpdateAvailableRegex=^$
-Console.MetricsRegex=^$
-Console.ServerInfoRegex=^.*\[Server\] Info: Schluessel=(?<Server_Schluessel>\S+) \| Version=(?<Server_Version>\S+)$
+Console.MetricsRegex=^\[BAMP-METRICS\] in=(?<Netz_rein_KB_s>[\d.]+) out=(?<Netz_raus_KB_s>[\d.]+) inmsg=(?<Nachrichten_rein_s>\d+) outmsg=(?<Nachrichten_raus_s>\d+) fps=(?<Server_FPS>\d+)$
+Console.ServerInfoRegex=^.*\[Server\] Info: (?:Port=(?<Spiel_Port>\S+) \| )?Schluessel=(?<Server_Password>\S+) \| Version=(?<Server_Version>\S+)$
 Console.SuppressLogAtStart=False
 Console.ActivateLogRegex=
 Console.UserActions={}

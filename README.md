@@ -4,22 +4,90 @@
 ![Going Public Server](logo.jpg)
 
 
-<img src="Screenshot 2026-10-29 101200.png" alt="" width="600">
-<img src="Screenshot 2026-10-29 101231.png" alt="" width="600">
-<img src="Screenshot 2026-10-29 101245.png" alt="" width="600">
-<img src="Screenshot 2026-10-29 101259.png" alt="" width="600">
-<img src="Screenshot 2026-10-29 101550.png" alt="" width="600">
+<img src="Screenshot/Bildschirmfoto_20261031_200853.png" alt="Driving through the city at night, a friend's car with its owner's name" width="600">
+<img src="Screenshot/Bildschirmfoto_20261031_200920.png" alt="Two players in the street, the friend's name in green" width="600">
+<img src="Screenshot/Bildschirmfoto_20261031_200953.png" alt="The phone's Business page: two players merged into one company" width="600">
+<img src="Screenshot/Screenshot 2026-10-29 101200.png" alt="" width="600">
+<img src="Screenshot/Screenshot 2026-10-29 101231.png" alt="" width="600">
+<img src="Screenshot/Screenshot 2026-10-29 101245.png" alt="" width="600">
+<img src="Screenshot/Screenshot 2026-10-29 101259.png" alt="" width="600">
+<img src="Screenshot/Screenshot 2026-10-29 101550.png" alt="" width="600">
 
 > The repository name has no hyphens on purpose: AMP cannot upgrade instances from template repositories whose name contains one.
->
-> 
-Dedicated server for **Big Ambitions** multiplayer, as a template for the
-[AMP](https://cubecoders.com/AMP) game server panel. The game runs headless under Proton with the
-**Going Public Server** mod; players join with the server's address and server key.
+
+**Always-on multiplayer server for Big Ambitions.** Play together on a dedicated server that keeps running: the world
+stays when you log off, it pauses while nobody is online, and you join with the server's address and server key. The
+server is a template for the [AMP](https://cubecoders.com/AMP) game server panel; the game runs headless under Proton
+with the **Going Public Server** mod
+([Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182)).
 
 *Deutsch weiter unten.*
 
-## Installing on an AMP server (Linux)
+## Important
+
+- **The server runs on AMP only** (Linux, headless, under Proton). There is no other server download yet. Players
+  can no longer host a game themselves: multiplayer means joining a dedicated server.
+- **Server and players need the same version.** Steam keeps the players' subscription up to date; update the AMP
+  instance when a new release is out (the server refuses other versions).
+- **No other mods on the server.** The server runs Going Public Server and nothing else: leave AMP's
+  *Steam Workshop Items* empty and put nothing into `bamp-mods-extra/`. The built-in modules replace Immersion,
+  BAScheduler, SmartSuite and VoogleRoute - players should not run those mods at the same time either.
+- **Linux / Steam Deck (Proton):** play with **GE-Proton** (tested: GE-Proton11-11, the same as the server; install it
+  with ProtonUp-Qt, then Properties → Compatibility). With Proton Experimental and Proton 11.0-2 the game crashed now
+  and then while loading the world. Windows is not affected.
+
+## News
+
+<!-- Going Public Server 1.0.13+ shows every heading of this section as a card in the game's News panel on the
+     main menu, newest first. German: the section "Neuigkeiten" in the German part. -->
+
+### Going Public Server 1.0.14
+- The load status shows while the game loads the mod; the server's own character is gone everywhere.
+- Passengers see car parks, friends show their buildings, "Walk there automatically" on the map's building card.
+- AMP: 60/120/200 FPS, a network rate setting; new worlds take the Custom values from the first start.
+
+### Going Public Server 1.0.13
+- Linux/Proton: the test file skip-tiny-patches.txt no longer turns multiplayer off.
+- The main menu shows the mod's load status and these news; the mod's version is next to the game's.
+- The bug report of the original Going Public is gone.
+
+### 1.0.12: Joining a server
+The server saves first, then lets you in, and always loads its own copy of your save. A save made inside a
+building now starts you in front of it.
+
+### 1.0.12: Built-in modules
+F6 RPG camera (F8 settings), F7 shop signs, Shift+F9 planner, Shift+F10 insights, Shift+F11 navigation. The
+server admin switches each one on or off in AMP.
+
+### 1.0.12: Steam names and friends
+Steam names above the players, friends in green and on the city map, a Friends tab on the phone's Business
+page. Taxes by phone: Contacts -> Internal Revenue Service.
+
+## Players: joining a server
+
+1. Subscribe to **Going Public Server** in the Steam Workshop of Big Ambitions and enable it in the game's mod list.
+2. **Multiplayer → Join Game**: **Host address** = the server's address, **Server key** = the key from the server
+   admin.
+3. Your progress stays on the server. **Escape → Leave server** saves it and takes you to the main menu.
+
+## Built in
+
+- **Steam names and friends**: the Steam name above every player, friends in green and on the city map, friend
+  requests on the phone (Business → Friends); a friend's rented and bought buildings show under it there.
+- **Pay taxes by phone**: Contacts → Internal Revenue Service → Call.
+- **F7 Shop signs**: your own pictures on signs, storefront signs and billboards.
+- **F6 RPG camera** (settings F8): third-person camera on foot and in the car.
+- **Shift+F9 Planner**: checks schedules, fills them with the game's own auto-fill and suggests opening hours from
+  customer demand.
+- **Shift+F10 Insights**: profit per business, sales, staff, real estate and alerts.
+- **Shift+F11 Navigation**: search a destination or click it on the city map, route line on foot and by car, and your
+  character can walk there by itself.
+- On the main menu: the mod's load status, these news, and the mod's version next to the game's.
+- 23 languages.
+
+## Server owners: AMP
+
+### Installing
 
 1. In AMP (ADS): **Configuration → Instance Deployment → Configuration Repositories**, add
    `amaus1209/BigAmbitionsGoingPublicServer:main`, then **Fetch latest**.
@@ -27,54 +95,181 @@ Dedicated server for **Big Ambitions** multiplayer, as a template for the
 3. In the instance: **Update**. AMP downloads the game with SteamCMD (it asks for a Steam login that owns
    Big Ambitions, and the Steam Guard code if the account has one), Proton GE, and the newest
    **Going Public Server** release from this repository.
-4. **Start**. The console shows `[BAMP-HEADLESS] READY`, the status page shows the **server key**.
-5. Open UDP port 7777 (the game port) in your firewall.
+4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server password** (the server key players join with), the server version, and metrics (network in and out, messages, server FPS).
+5. Open the game port (UDP, 7777 by default) in your firewall.
 
-Settings (world, save to load, max players, autosave, frame rate, language …) are on the instance's
-configuration page. Choose the server language there and run **Update** once more to see the settings in it.
+### Updating
 
-### Workshop mods on the server
+- **Update** downloads the newest release; restart the instance afterwards. Players get the matching version from the
+  Steam Workshop.
+- After an update, start the server once: new settings get their default then, and values set in AMP apply from the
+  next start.
+- **Stop** saves the world first and then ends the server (a few seconds).
 
-Configuration → Updates → **Steam Workshop Items**: one Workshop item ID per line, then **Update**. AMP
-downloads them with the same Steam login; the server installs them at the next start. Players who lack a
-mod get a button that opens its Workshop page in Steam.
+### Settings (the instance's Configuration page)
 
-### Optional on the host: ranking page and save backups
+- **Server language**: choose it, then run **Update** once more to see the settings in that language.
+- **Server**: world, load a save once, the server's character name, max players, pausing (empty, idle, everyone in
+  the pause menu), server key, autosave, **Frame cap while running** (60, 120 or 200 FPS) and while empty, and
+  **Network rate** (Normal 10 / 5 Hz, High 20 / 10 Hz, Very high 30 / 15 Hz, Maximum 60 / 30 Hz - how often
+  positions, cars and traffic go over the network; higher drives more smoothly, and since every player's stream goes
+  to every other player, the data grows quickly with more players).
+- **New world**: name and difficulty (Easy, Normal, Hard or Custom - the Custom values have their own tab). They only
+  count when the server creates that world (it does not exist yet).
+- **Modules**: switch each built-in module on or off for everybody. **RPG camera** and the navigation's route line are
+  the same for every player on the server.
+- **Game rules**: rent from owned buildings, building prices, bank loan limit and business sale.
 
-Instances run in containers and cannot reach AMP's web folder, so two small jobs run on the host, as the user AMP
-runs as (`crontab -e`; the scripts come with every instance in `bigambitions/bamp-tools/`):
+### On the host: ranking page, save backups, AMP in German
+
+Instances run in containers and cannot reach AMP's web folder, so small jobs run on the host, as the user AMP runs as
+(`crontab -e`; the scripts come with every instance in `bigambitions/bamp-tools/`):
 
 ```
 * * * * *  ~/.ampdata/instances/<instance>/bigambitions/bamp-tools/bamp-web-sync.sh
 17 4 * * * ~/.ampdata/instances/<instance>/bigambitions/bamp-tools/backup-saves.sh --all >> ~/backups/saves/backup.log 2>&1
 ```
 
-- `bamp-web-sync.sh` serves the ranking of **all** Going Public Server instances at
-  `https://<your AMP address>/monitor/index.html` (the instance's Connection Link); each player opens the
-  ranking of their server with its server key.
+- `bamp-web-sync.sh` serves each instance's ranking at `https://<your AMP address>/monitor/<game port>/index.html`
+  (the instance's Connection Link); players open it with their server's key. Merged companies show as "merged with ...". It also copies a German
+  translation of AMP's own interface into AMP's web folder: open AMP once with `https://<your AMP address>/?lang=de`
+  (per browser).
 - `backup-saves.sh --all` saves every instance's multiplayer saves to `~/backups/saves/` (14 per instance).
 
-## Players
+## Translations of other mods
 
-1. Subscribe to **Going Public Server** in the Steam Workshop of Big Ambitions. It must be the same version as
-   the server (the server refuses other versions; Steam keeps the subscription up to date).
-2. Start Big Ambitions, enable the mod, then **Multiplayer → Join a Game**: host address = the server's
-   address, **Server key** = the key from the server's status page.
+Going Public Server adds the game languages other mods are missing (for the mods players run themselves - the server
+runs none). The tables are in `ModTranslations/`; the game fetches them at every start, so a new translation needs no
+mod update.
+
+**Translating yourself:** at every start the server writes one ready file per mod and language to
+`bigambitions/modtr-templates/ModTranslations/` (AMP file manager) - laid out like `ModTranslations/` here, with the
+current translation or, where there is none, the English text. Translate only the text after the colon; keep keys,
+placeholders (`{0}`, `{name}`) and tags (`<b>`). Upload the file to the same path here (Add file → Upload files). The
+*Translations* action checks it and renews `index.json`; a red X under *Actions* names a line to fix.
+
+## Credits
+
+Unofficial fork of [Going Public](https://github.com/Melaus123/BigAmbitionMulti) by Melaus (MIT license).
+
+The built-in modules are our own implementations, modelled on these Workshop mods. Many thanks to their authors:
+
+- RPG camera: [Immersion - RPG Camera](https://steamcommunity.com/sharedfiles/filedetails/?id=3791985529) by Chamiks
+- Planner: [BAScheduler - Schedule, Staff & Opening Hours Planner](https://steamcommunity.com/sharedfiles/filedetails/?id=3795741870) by Shanpapa
+- Insights and game rules: [SmartSuite Empire Management](https://steamcommunity.com/sharedfiles/filedetails/?id=3793254452) (SmartInsights, SmartRent) by ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ
+- Navigation: [Voogle Route](https://steamcommunity.com/sharedfiles/filedetails/?id=3740623471) with
+  [LIB BA Player Location](https://steamcommunity.com/sharedfiles/filedetails/?id=3741773276) and
+  [LIB BA Unified UI](https://steamcommunity.com/sharedfiles/filedetails/?id=3790426259) by - Capitaine -
+
+Big Ambitions belongs to Hovgaard Games; every player and the server need their own copy of the game.
 
 ---
 
 ## Deutsch
 
-**Installation in AMP:** Konfiguration → Instance Deployment → Configuration Repositories:
+### Neuigkeiten
+
+#### Going Public Server 1.0.14
+- Der Ladestatus erscheint schon, während das Spiel den Mod lädt; die Server-Figur ist überall verschwunden.
+- Mitfahrer sehen Parkhäuser, Freunde zeigen ihre Gebäude, „Ziel automatisch hinlaufen“ in der Gebäude-Info der Karte.
+- AMP: 60/120/200 FPS, Netzwerk-Takt; neue Welten übernehmen die benutzerdefinierten Werte ab dem ersten Start.
+
+#### Going Public Server 1.0.13
+- Linux/Proton: Die Testdatei skip-tiny-patches.txt schaltet den Mehrspieler nicht mehr ab.
+- Das Hauptmenü zeigt den Ladestatus des Mods und diese Neuigkeiten; die Mod-Version steht neben der des Spiels.
+- Die Fehlermeldung des ursprünglichen Going Public ist entfernt.
+
+#### 1.0.12: Beitreten
+Der Server speichert zuerst und lässt dich dann herein; er lädt immer seine eigene Kopie deines Spielstands.
+Wer in einem Gebäude gespeichert hat, startet jetzt davor.
+
+#### 1.0.12: Eingebaute Module
+F6 RPG-Kamera (F8 Einstellungen), F7 Ladenschilder, Umschalt+F9 Planer, Umschalt+F10 Auswertung,
+Umschalt+F11 Navigation. Der Server-Admin schaltet jedes in AMP an oder aus.
+
+#### 1.0.12: Steam-Namen und Freunde
+Steam-Namen über den Spielern, Freunde grün und auf der Stadtkarte, der Tab Friends auf der Business-Seite im
+Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
+
+### Wichtig
+
+- **Der Server läuft nur unter AMP** (Linux, ohne Grafik, unter Proton). Einen anderen Server-Download gibt es noch
+  nicht. Spieler können selbst kein Spiel mehr hosten: Mehrspieler heißt, einem dedizierten Server beizutreten.
+- **Server und Spieler brauchen dieselbe Version.** Steam hält das Abo der Spieler aktuell; die AMP-Instanz nach einem
+  neuen Release aktualisieren (der Server lehnt andere Versionen ab).
+- **Keine anderen Mods auf dem Server.** Der Server läuft nur mit Going Public Server: in AMP die
+  *Steam Workshop Items* leer lassen und nichts nach `bamp-mods-extra/` legen. Die eingebauten Module ersetzen
+  Immersion, BAScheduler, SmartSuite und VoogleRoute - auch Spieler sollen diese Mods nicht gleichzeitig nutzen.
+- **Linux / Steam Deck (Proton):** mit **GE-Proton** spielen (getestet: GE-Proton11-11, wie der Server; mit
+  ProtonUp-Qt installieren, dann Eigenschaften → Kompatibilität). Mit Proton Experimental und Proton 11.0-2 stürzte
+  das Spiel gelegentlich beim Laden der Welt ab. Unter Windows tritt das nicht auf.
+
+### Spieler: einem Server beitreten
+
+1. **Going Public Server** im Steam Workshop von Big Ambitions abonnieren und in der Mod-Liste des Spiels aktivieren.
+2. **Mehrspieler → Spiel beitreten**: **Host-Adresse** = Adresse des Servers, **Server-Schlüssel** = der Schlüssel vom
+   Server-Admin.
+3. Dein Fortschritt bleibt auf dem Server. **Esc → Server verlassen** speichert ihn und bringt dich ins Hauptmenü.
+
+### Eingebaut
+
+- **Steam-Namen und Freunde**: Steam-Name über jedem Spieler, Freunde in Grün und auf der Stadtkarte,
+  Freundschaftsanfragen im Handy (Business → Friends); dort stehen unter jedem Freund seine gemieteten und gekauften
+  Gebäude.
+- **Steuern per Telefon**: Kontakte → Internal Revenue Service → Anrufen.
+- **F7 Ladenschilder**: eigene Bilder auf Schildern, Ladenschildern und Werbetafeln.
+- **F6 RPG-Kamera** (Einstellungen F8): Kamera hinter der Figur, zu Fuß und im Auto.
+- **Umschalt+F9 Planer**: prüft Schichtpläne, füllt sie mit der Funktion des Spiels und schlägt Öffnungszeiten nach
+  Kundennachfrage vor.
+- **Umschalt+F10 Auswertung**: Gewinn je Geschäft, Verkäufe, Personal, Immobilien und Warnungen.
+- **Umschalt+F11 Navigation**: Ziel suchen oder auf der Stadtkarte anklicken, Routenlinie zu Fuß und mit dem Auto, auf
+  Wunsch läuft die Figur selbst hin.
+- Im Hauptmenü: der Ladestatus des Mods, diese Neuigkeiten und die Mod-Version neben der des Spiels.
+- 23 Sprachen.
+
+### Server-Betreiber: AMP
+
+**Installation:** Konfiguration → Instance Deployment → Configuration Repositories:
 `amaus1209/BigAmbitionsGoingPublicServer:main` eintragen, **Fetch latest**, eine Instanz aus der Vorlage
 **Big Ambitions (Going Public server)** anlegen, **Update** (lädt das Spiel per SteamCMD mit einem Steam-Konto,
 das Big Ambitions besitzt – bei Steam Guard fragt AMP nach dem Code –, Proton GE und das neueste Release von
-hier), dann **Start**. Der Server-Schlüssel steht auf der Statusseite. UDP-Port 7777 freigeben.
+hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Passwort (den Server-Schlüssel), Server-Version und Messwerte (Netzwerk rein/raus, Nachrichten, Server-FPS).
+Den Spiel-Port freigeben (UDP, standardmäßig 7777).
 
-Die Server-Sprache in den Einstellungen wählen und noch einmal **Update** – danach erscheinen die
-Einstellungen in dieser Sprache.
+**Aktualisieren:** **Update** lädt das neueste Release, danach die Instanz neu starten. Die Spieler bekommen die passende
+Version aus dem Steam Workshop. Nach einem Update den Server einmal starten: Neue Einstellungen bekommen dann ihren
+Standardwert, in AMP gesetzte Werte gelten ab dem nächsten Start. **Stop** speichert zuerst die Welt und beendet den
+Server dann (wenige Sekunden).
 
-**Workshop-Mods:** Konfiguration → Updates → **Steam Workshop Items**: eine ID pro Zeile, dann **Update**.
+**Einstellungen** (Konfigurationsseite der Instanz):
+- **Server-Sprache**: wählen, dann noch einmal **Update** – danach erscheinen die Einstellungen in dieser Sprache.
+- **Server**: Welt, Spielstand einmal laden, Name der Server-Figur, Spieleranzahl, Pausieren (leer, untätig, alle im
+  Pausenmenü), Server-Schlüssel, automatisches Speichern, **Bildrate im Betrieb** (60, 120 oder 200 FPS) und ohne
+  Spieler sowie **Netzwerk-Takt** (Normal 10 / 5 Hz, Hoch 20 / 10 Hz, Sehr hoch 30 / 15 Hz, Maximal 60 / 30 Hz – wie
+  oft Positionen, Autos und Verkehr über das Netz gehen; höher fährt sich flüssiger, und weil der Strom jedes Spielers
+  an jeden anderen geht, wächst die Datenmenge mit mehr Spielern schnell).
+- **Neue Welt**: Name und Schwierigkeit (Einfach, Normal, Schwer oder Benutzerdefiniert – die benutzerdefinierten Werte
+  haben einen eigenen Reiter). Sie zählen nur, wenn der Server diese Welt anlegt (es gibt sie noch nicht).
+- **Module**: jedes eingebaute Modul für alle an- oder ausschalten. **RPG-Kamera** und die Routenlinie der Navigation
+  sind auf dem Server für alle Spieler gleich.
+- **Spielregeln**: Miete aus eigenen Gebäuden, Gebäudepreise, Kreditrahmen der Bank und Geschäftsverkauf.
 
-**Spieler:** **Going Public Server** im Steam Workshop von Big Ambitions abonnieren (gleiche Version wie der
-Server), Mod aktivieren, **Multiplayer → Join a Game** mit der Server-Adresse und dem **Server key**.
+**Auf dem Host (Cron, siehe oben):** `bamp-web-sync.sh` stellt die Rangliste jeder Instanz unter
+`https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html` bereit (der Verbindungslink der Instanz) (fusionierte Firmen stehen als „fusioniert mit …“ dabei) und legt
+die deutsche Übersetzung der AMP-Oberfläche ab: AMP einmal mit `https://<AMP-Adresse>/?lang=de` öffnen (pro Browser).
+`backup-saves.sh --all` sichert die Mehrspieler-Spielstände aller Instanzen nach `~/backups/saves/` (14 pro Instanz).
+
+**Übersetzungen anderer Mods selbst bearbeiten** (für die Mods, die Spieler selbst nutzen – der Server nutzt keine):
+Der Server legt bei jedem Start unter `bigambitions/modtr-templates/ModTranslations/` (AMP-Dateimanager) für jede Mod
+und Sprache eine fertige Datei an - aktuelle Übersetzung oder, wo es keine gibt, der englische Text. Nur den Text
+rechts vom Doppelpunkt übersetzen, Schlüssel, Platzhalter (`{0}`, `{name}`) und Tags (`<b>`) unverändert lassen, dann
+in denselben Pfad unter `ModTranslations/` hier hochladen. Die Action *Translations* prüft die Datei und erneuert
+`index.json`; ein rotes X unter *Actions* nennt die Zeile mit dem Fehler.
+
+### Herkunft
+
+Inoffizieller Fork von [Going Public](https://github.com/Melaus123/BigAmbitionMulti) von Melaus (MIT-Lizenz). Die
+eingebauten Module sind eigene Umsetzungen nach dem Vorbild dieser Workshop-Mods (Links oben unter *Credits*): Immersion -
+RPG Camera von Chamiks, BAScheduler von Shanpapa, SmartSuite Empire Management (SmartInsights, SmartRent) von
+ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ und Voogle Route mit LIB BA Player Location und LIB BA Unified UI von - Capitaine -. Vielen Dank an ihre
+Autoren. Big Ambitions gehört Hovgaard Games; jeder Spieler und auch der Server brauchen eine eigene Lizenz des Spiels.
