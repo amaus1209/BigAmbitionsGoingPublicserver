@@ -52,7 +52,7 @@
         "DisplayName": "World",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Server:dns:1",
-        "Description": "The world the server runs: the worlds on this server, or \"(world played last)\". The server fills the list itself; AMP shows new worlds after the next restart of the instance. On a server without any world, \"New world: difficulty\" creates one called \"Server\".",
+        "Description": "The world the server runs: the worlds on this server, or \"(world played last)\". The server fills the list itself; AMP shows new worlds after the next restart of the instance. A new world comes from \"New world: name\" (tab New world); on a server without any world, \"New world: difficulty\" creates one called \"Server\".",
         "Keywords": "",
         "FieldName": "DedicatedSession",
         "InputType": "enum",
@@ -77,10 +77,22 @@
         }
     },
     {
+        "DisplayName": "New world: name",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "New world:public:2",
+        "Description": "Create a new world with this name: at the next start the server creates it with the difficulty below, confirms character creation with 'Server character name' and plays it. Afterwards it is a world like any other - keep 'World' on '(world played last)' to stay in it. Empty = no new world; a name that exists already just keeps that world, so use a new name for each new world.",
+        "Keywords": "new game,custom game,new world",
+        "FieldName": "DedicatedNewWorld",
+        "InputType": "text",
+        "ParamFieldName": "$.DedicatedNewWorld",
+        "DefaultValue": "",
+        "EnumValues": {}
+    },
+    {
         "DisplayName": "New world: difficulty",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "New world:public:2",
-        "Description": "When the world set above does not exist yet, the server creates it with this difficulty, confirms character creation with 'Server character name' and saves it under that name. Easy, Normal and Hard are the game's own presets; Custom uses the settings below, like the game's 'Custom Game' screen. Off = a missing world is an error.",
+        "Description": "Difficulty of a new world: the one named in 'New world: name', or the world set above while it does not exist yet. Easy, Normal and Hard are the game's own presets; Custom uses the values on the 'Custom' tab, like the game's 'Custom Game' screen. Off = no new world.",
         "Keywords": "",
         "FieldName": "DedicatedNewGame",
         "InputType": "enum",
@@ -97,7 +109,7 @@
     {
         "DisplayName": "Days per year",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "How many days a game year has: 30-365. Only for 'Custom'. Normal: 60.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameDaysPerYear",
@@ -109,7 +121,7 @@
     {
         "DisplayName": "Starting money",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Money every new character starts with. Only for 'Custom'. Easy 15000, Normal 10000, Hard 4200.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameStartingMoney",
@@ -121,7 +133,7 @@
     {
         "DisplayName": "Rival attacks multiplier",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "This will affect the severity of Rival attacks. Set to 0 to disable all Rival attacks. In percent, 0-150. Only for 'Custom'. Normal: 100.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameRivalAttacks",
@@ -133,7 +145,7 @@
     {
         "DisplayName": "Starting age",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "18-65. Only for 'Custom'. Normal: 18.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameStartingAge",
@@ -145,7 +157,7 @@
     {
         "DisplayName": "Disable aging",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Characters do not get older. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameDisableAging",
@@ -157,7 +169,7 @@
     {
         "DisplayName": "Disable happiness",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Happiness plays no part. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameDisableHappiness",
@@ -169,7 +181,7 @@
     {
         "DisplayName": "Disable energy",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Energy plays no part. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameDisableEnergy",
@@ -181,7 +193,7 @@
     {
         "DisplayName": "All courses unlocked",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "All business school courses automatically completed. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameAllCoursesUnlocked",
@@ -193,7 +205,7 @@
     {
         "DisplayName": "Unlock all contacts",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Every contact is in the phone from the start. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameAllContactsUnlocked",
@@ -205,7 +217,7 @@
     {
         "DisplayName": "Disable vehicle damage",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Vehicles take no damage. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameDisableVehicleDamage",
@@ -217,7 +229,7 @@
     {
         "DisplayName": "Disable vehicle fuel consumption",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Vehicles use no fuel. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameDisableVehicleFuel",
@@ -229,7 +241,7 @@
     {
         "DisplayName": "Tax percentage",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Impacts annual tax rate from the IRS: 0-100. Only for 'Custom'. Normal: 5.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameTaxPercentage",
@@ -241,7 +253,7 @@
     {
         "DisplayName": "Employee hourly salary multiplier",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "In percent, 50-130. Only for 'Custom'. Normal: 70.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameSalary",
@@ -253,7 +265,7 @@
     {
         "DisplayName": "Public prices multiplier",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Impacts cost of various public expenses like wholesale/imported goods, hospital fees, etc. In percent, 70-130. Only for 'Custom'. Normal: 70.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGamePublicPrices",
@@ -265,7 +277,7 @@
     {
         "DisplayName": "Bank interest multiplier",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Impacts interest payments on loans and investments. In percent, 70-130. Only for 'Custom'. Normal: 70.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameBankInterest",
@@ -277,7 +289,7 @@
     {
         "DisplayName": "Base Customer Promotion Multiplier",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Impacts base level of customers without traffic or marketing. In percent, 10-100. Only for 'Custom'. Normal: 55.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameCustomerPromotion",
@@ -289,7 +301,7 @@
     {
         "DisplayName": "Wholesale Urgent Fee Multiplier",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Impacts the price of the urgent fee when buying from wholesale suppliers. In percent, 0-200. Only for 'Custom'. Normal: 20.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameWholesaleUrgentFee",
@@ -301,7 +313,7 @@
     {
         "DisplayName": "Importer Urgent Fee Multiplier",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Impacts the price of the urgent fee when buying from importers. In percent, 0-200. Only for 'Custom'. Normal: 75.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameImporterUrgentFee",
@@ -313,7 +325,7 @@
     {
         "DisplayName": "Disable Wholesale / Import Limits",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Disables the weekly limit for wholesale and import suppliers. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameDisableImportLimits",
@@ -325,7 +337,7 @@
     {
         "DisplayName": "All products available from importers",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Allows all products to be purchased from importers. Only for 'Custom'.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameAllProductsFromImporters",
@@ -337,7 +349,7 @@
     {
         "DisplayName": "Export Price Multiplier",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Impacts the price exporters pay for factory produced goods. In percent, 10-130. Only for 'Custom'. Normal: 65.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameExportPrices",
@@ -349,7 +361,7 @@
     {
         "DisplayName": "Resale Value",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "New world:public:2",
+        "Subcategory": "Custom:tune:3",
         "Description": "Percentage of an item's or vehicle's value received when selling it: 10-100. Only for 'Custom'. Normal: 75.",
         "Keywords": "new game,custom game",
         "FieldName": "NewGameResaleValue",
@@ -585,7 +597,7 @@
     {
         "DisplayName": "Server key",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Players:monitoring:3",
+        "Subcategory": "Players:monitoring:4",
         "Description": "Players need this key to join (Join a Game > Server key) and to open the ranking page. Empty = one is created on first start, shown on the status page and kept in telemetry-data/key.txt.",
         "Keywords": "",
         "FieldName": "TelemetryKey",
@@ -597,7 +609,7 @@
     {
         "DisplayName": "Web address for players",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Players:monitoring:3",
+        "Subcategory": "Players:monitoring:4",
         "Description": "Where players reach this AMP panel, e.g. https://amp.example.org or http://203.0.113.5:8080 - used for the server's mod list. Empty = https://<the address players join>.",
         "Keywords": "",
         "FieldName": "PlayerWebUrl",
@@ -609,7 +621,7 @@
     {
         "DisplayName": "Pay taxes by phone",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Modules:extension:4",
+        "Subcategory": "Modules:extension:5",
         "Description": "Module 1: players can call the Internal Revenue Service in the phone's contacts and pay their taxes there.",
         "Keywords": "",
         "FieldName": "ModuleIrsPhone",
@@ -621,7 +633,7 @@
     {
         "DisplayName": "Shop signs (F7)",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Modules:extension:4",
+        "Subcategory": "Modules:extension:5",
         "Description": "Module 2: players put their own pictures on their shop signs and billboards; the other players see them.",
         "Keywords": "",
         "FieldName": "ModuleShopSigns",
@@ -633,7 +645,7 @@
     {
         "DisplayName": "RPG camera (F6, F8)",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Modules:extension:4",
+        "Subcategory": "Modules:extension:5",
         "Description": "Module 3: a third-person camera on foot and in the car. On this server every player gets the settings in 'RPG camera'; the camera's own settings window only shows them.",
         "Keywords": "",
         "FieldName": "ModuleCamera",
@@ -645,7 +657,7 @@
     {
         "DisplayName": "Planner (Shift+F9)",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Modules:extension:4",
+        "Subcategory": "Modules:extension:5",
         "Description": "Module 4: schedule checks, the game's own auto-fill and opening hours by customer demand for the players' own businesses.",
         "Keywords": "",
         "FieldName": "ModulePlanner",
@@ -657,7 +669,7 @@
     {
         "DisplayName": "Insights (Shift+F10)",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Modules:extension:4",
+        "Subcategory": "Modules:extension:5",
         "Description": "Module 5: the books of the players' businesses and buildings - profit, history, staff, sales and real estate.",
         "Keywords": "",
         "FieldName": "ModuleInsights",
@@ -669,7 +681,7 @@
     {
         "DisplayName": "Navigation (Shift+F11)",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Modules:extension:4",
+        "Subcategory": "Modules:extension:5",
         "Description": "Module 6: a destination from the search, your places, bookmarks or a click on the city map, with the route line on foot and in the car. Only each player's own view.",
         "Keywords": "",
         "FieldName": "ModuleNavigation",
@@ -681,7 +693,7 @@
     {
         "DisplayName": "Navigation: route line",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Modules:extension:4",
+        "Subcategory": "Modules:extension:5",
         "Description": "Shows the route line for every player on this server. Off = only the pin with the distance and the destination at the top.",
         "Keywords": "camera",
         "FieldName": "NavRouteLine",
@@ -693,7 +705,7 @@
     {
         "DisplayName": "Angle on foot",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "Starting angle of the camera on foot in degrees, 5-75; players still tilt it with the right mouse button. These camera settings apply to every player on this server. Default: 20.",
         "Keywords": "camera",
         "FieldName": "CamFootPitch",
@@ -705,7 +717,7 @@
     {
         "DisplayName": "Distance on foot",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "Starting distance on foot in metres, 2.5-40; players still zoom with the mouse wheel. Default: 8.",
         "Keywords": "camera",
         "FieldName": "CamFootDist",
@@ -717,7 +729,7 @@
     {
         "DisplayName": "Angle in the car",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "Starting angle in the car in degrees, 3-60. Default: 18.",
         "Keywords": "camera",
         "FieldName": "CamCarPitch",
@@ -729,7 +741,7 @@
     {
         "DisplayName": "Distance in the car",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "Starting distance in the car in metres, 5-45. Default: 15.",
         "Keywords": "camera",
         "FieldName": "CamCarDist",
@@ -741,7 +753,7 @@
     {
         "DisplayName": "Target height",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "How high above the feet the camera aims, in metres, 0-3. Default: 1.5.",
         "Keywords": "camera",
         "FieldName": "CamHeight",
@@ -753,7 +765,7 @@
     {
         "DisplayName": "Shoulder offset",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "-1 (character on the left) to 1 (on the right); 0 = centred.",
         "Keywords": "camera",
         "FieldName": "CamShoulder",
@@ -765,7 +777,7 @@
     {
         "DisplayName": "Mouse sensitivity",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "For turning and tilting, 0.2-3; 1 = normal.",
         "Keywords": "camera",
         "FieldName": "CamSensitivity",
@@ -777,7 +789,7 @@
     {
         "DisplayName": "Field of view",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "In degrees, 30-90. Default: 55.",
         "Keywords": "camera",
         "FieldName": "CamFov",
@@ -789,7 +801,7 @@
     {
         "DisplayName": "View distance",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "Times the game's own view distance, 0.5-3; 1 = the game's own, higher costs performance.",
         "Keywords": "camera",
         "FieldName": "CamViewDistance",
@@ -801,7 +813,7 @@
     {
         "DisplayName": "Right-click dead zone",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "How many pixels the mouse moves before a right-drag turns the camera, 0-30. Default: 3.",
         "Keywords": "camera",
         "FieldName": "CamDeadZone",
@@ -813,7 +825,7 @@
     {
         "DisplayName": "Swing back behind the car",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "When driving on, the camera turns back behind the car.",
         "Keywords": "camera",
         "FieldName": "CamRecenter",
@@ -825,7 +837,7 @@
     {
         "DisplayName": "Also inside buildings",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "RPG camera:videocam:5",
+        "Subcategory": "RPG camera:videocam:6",
         "Description": "The RPG camera also inside buildings and garages (off = the game's view there).",
         "Keywords": "camera",
         "FieldName": "CamIndoors",
@@ -837,7 +849,7 @@
     {
         "DisplayName": "Rent from owned buildings",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Game rules:gavel:6",
+        "Subcategory": "Game rules:gavel:7",
         "Description": "SmartRent: multiplies the daily rent the tenants of the players' own buildings pay. 1x is the game's own.",
         "Keywords": "",
         "FieldName": "RuleRentReturn",
@@ -856,7 +868,7 @@
     {
         "DisplayName": "Building prices",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Game rules:gavel:6",
+        "Subcategory": "Game rules:gavel:7",
         "Description": "SmartRent: the market value of every building in percent - buying, selling and the value shown all follow it. 100% is the game's own.",
         "Keywords": "",
         "FieldName": "RuleBuildingPrice",
@@ -873,7 +885,7 @@
     {
         "DisplayName": "Business sale",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Game rules:gavel:6",
+        "Subcategory": "Game rules:gavel:7",
         "Description": "SmartRent: players can sell a business in Insights (Shift+F10). The lease ends as in BizMan (furniture, vehicles and deposit back), and they also get a goodwill of 30 days' average profit.",
         "Keywords": "",
         "FieldName": "RuleBusinessSale",
@@ -885,7 +897,7 @@
     {
         "DisplayName": "Business sale: minimum age",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Game rules:gavel:6",
+        "Subcategory": "Game rules:gavel:7",
         "Description": "How many days a business must exist before it can be sold.",
         "Keywords": "",
         "FieldName": "RuleBusinessSaleMinDays",
@@ -902,7 +914,7 @@
     {
         "DisplayName": "Business sale: days with profit",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Game rules:gavel:6",
+        "Subcategory": "Game rules:gavel:7",
         "Description": "How many days with profit a business needs in the game's books (they reach back one game year) before it can be sold.",
         "Keywords": "",
         "FieldName": "RuleBusinessSaleProfitDays",
@@ -917,7 +929,7 @@
     {
         "DisplayName": "Bank loan limit",
         "Category": "Big Ambitions:storefront",
-        "Subcategory": "Game rules:gavel:6",
+        "Subcategory": "Game rules:gavel:7",
         "Description": "SmartRent: multiplies how much a bank lends on the player's wealth and income. Each bank's own maximum still applies. 1x is the game's own.",
         "Keywords": "",
         "FieldName": "RuleLoanLimit",
