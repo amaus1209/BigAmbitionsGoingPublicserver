@@ -22,7 +22,7 @@ Meta.ExtraContainerPackages=["python3","xvfb","xauth"]
 Meta.ConfigReleaseState=NotSpecified
 Meta.NoCommercialUsage=False
 Meta.ConfigVersion=1
-Meta.ReleaseNotes=1.0.11: telemetry collector removed; the server key is shown on the status page.
+Meta.ReleaseNotes=Going Public Server - dedicated server for Big Ambitions.
 Meta.BreakingReleaseNotes=
 Meta.ImportableExtensions=[]
 Meta.AppConfigId=6b0c6a3e-9d1f-4a5e-8c2b-2f6d1e7a4b90
@@ -96,7 +96,7 @@ Console.UserLeaveRegex=^.*\[BAMP-HEADLESS\] LEAVE (?<username>.+)$
 Console.UserChatRegex=^$
 Console.UpdateAvailableRegex=^$
 Console.MetricsRegex=^$
-Console.ServerInfoRegex=^.*\[Server\] Info: Schluessel=(?<Server_Schluessel>\S+)$
+Console.ServerInfoRegex=^.*\[Server\] Info: Schluessel=(?<Server_Schluessel>\S+) \| Version=(?<Server_Version>\S+)$
 Console.SuppressLogAtStart=False
 Console.ActivateLogRegex=
 Console.UserActions={}
