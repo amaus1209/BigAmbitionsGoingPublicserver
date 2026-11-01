@@ -41,6 +41,22 @@ with the **Going Public Server** mod
 <!-- Going Public Server 1.0.13+ shows every heading of this section as a card in the game's News panel on the
      main menu, newest first. German: the section "Neuigkeiten" in the German part. -->
 
+### Going Public Server 1.0.16.2
+- **Internet radio plays**: in 1.0.16.1 every stream stayed silent (the game engine cannot play an endless MP3 stream) - the mod now decodes the streams itself. http and https stations; the song that plays shows under the station's name.
+- **Radio on foot**: a switch in the phone's Radio tab - the radio keeps playing out of the car, also without headphones; inside buildings it is silent (the loudspeakers play there).
+- **Shop loudspeakers** play internet stations too: in your shop, the Radio tab picks for "Shop loudspeakers", and a loudspeaker's "Next station" goes on into the internet stations. Everybody in the shop hears the same station; the server keeps it with the world.
+- **Passengers** hear the driver's station (internet stations too); after getting out their own radio plays again.
+- AMP shows the server key and version again (they vanished from the console once the world was up).
+
+### Going Public Server 1.0.16.1
+- **Self-driving** stops at red lights, steers properly into turns, no longer drives into hydrants and blinks.
+- **Passengers** see the wheels turn and steer and hear the engine and the driver's radio.
+- **Radio**: a Radio tab in the phone's menu to pick the station. The server's station list comes from GitHub in the language chosen in AMP (250 German stations; the most popular stations of the country for more languages); https streams only; your own stations in `streams.txt`.
+- A world with energy/hunger off stays that way after a restart or a reconnect.
+- A sitting player is shown sitting to the others; an NPC on his seat is hidden meanwhile.
+- **Merger**: dissolving needs every member's agreement and sells everything first (shops with goodwill, bought buildings at market value, cars and homes; the staff are let go) - then the money is shared equally. A merged member gets the partner's staff list back after a reconnect.
+- The version line at the bottom left reads "GPS-MM v. 1.0.16.1".
+
 ### Going Public Server 1.0.16
 - A player's cars stay in the world when he leaves; a car left in the road or parked illegally is parked at the roadside. Back on the server, his cars stand where the others saw them.
 - A short right click into the world (not on a building or object, map closed) deletes the route.
@@ -135,7 +151,8 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
 - **New world**: name and difficulty (Easy, Normal, Hard or Custom - the Custom values have their own tab). They only
   count when the server creates that world (it does not exist yet).
 - **Modules**: switch each built-in module on or off for everybody. **RPG camera** and the navigation's route line are
-  the same for every player on the server.
+  the same for every player on the server. **Radio station list**: the language of the radio stations every player gets
+  (the files in `radio/` of this repository - edit one to change that list for everybody; Off = none).
 - **Game rules**: rent from owned buildings, building prices, bank loan limit and business sale.
 
 ### On the host: ranking page, save backups, AMP in German
@@ -188,6 +205,22 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 ## Deutsch
 
 ### Neuigkeiten
+
+#### Going Public Server 1.0.16.2
+- **Internetradio spielt**: In 1.0.16.1 blieb jeder Stream stumm (die Spiel-Engine kann keinen endlosen MP3-Stream abspielen) - die Mod dekodiert die Streams jetzt selbst. http- und https-Sender; unter dem Sendernamen steht das laufende Lied.
+- **Radio zu Fuß**: ein Schalter im Radio-Tab des Handys - das Radio spielt auch außerhalb des Autos weiter, auch ohne Kopfhörer; in Gebäuden ist es still (dort spielen die Lautsprecher).
+- **Laden-Lautsprecher** spielen auch Internetsender: Im eigenen Laden wählt der Radio-Tab für „Laden-Lautsprecher“, und „Nächster Sender“ am Lautsprecher geht nach den Sendern des Spiels durch die Internetsender. Alle im Laden hören denselben Sender; der Server merkt ihn sich mit der Welt.
+- **Mitfahrer** hören den Sender des Fahrers (auch Internetsender); nach dem Aussteigen läuft wieder ihr eigenes Radio.
+- AMP zeigt Serverschlüssel und Version wieder (sie verschwanden aus der Konsole, sobald die Welt geladen war).
+
+#### Going Public Server 1.0.16.1
+- Der **Autopilot** hält an Rot, lenkt sauber in Kurven ein, fährt nicht mehr in Hydranten und blinkt.
+- **Mitfahrer** sehen die Räder drehen und einlenken und hören den Motor und das Radio des Fahrers.
+- **Radio**: eigener Radio-Tab im Handy-Menü zur Senderwahl. Die Senderliste des Servers kommt von GitHub in der Sprache, die in AMP gewählt ist (250 deutsche Sender; für weitere Sprachen die beliebtesten Sender des Landes); nur https-Streams; eigene Sender in `streams.txt`.
+- Eine Welt mit Energie/Hunger aus bleibt so, auch nach einem Neustart oder Wiederverbinden.
+- Ein sitzender Mitspieler wird bei den anderen sitzend gezeigt; ein NPC auf seinem Platz wird solange ausgeblendet.
+- **Fusion**: Auflösen geht nur, wenn alle Mitglieder zustimmen, und verkauft vorher alles (Läden mit Firmenwert, gekaufte Gebäude zum Marktwert, Autos und Wohnungen; die Mitarbeiter werden entlassen) - danach wird das Geld zu gleichen Teilen geteilt. Ein Fusions-Mitglied bekommt nach einem Verbindungsabbruch die Mitarbeiterliste des Partners wieder.
+- Die Versionszeile unten links heißt „GPS-MM v. 1.0.16.1“.
 
 #### Going Public Server 1.0.16
 - Die Autos eines Spielers bleiben in der Welt, wenn er geht; ein Auto auf der Fahrbahn oder im Halteverbot wird am Straßenrand geparkt. Kommt er zurück, stehen seine Autos dort, wo die anderen sie gesehen haben.
@@ -289,7 +322,8 @@ Server dann (wenige Sekunden).
 - **Neue Welt**: Name und Schwierigkeit (Einfach, Normal, Schwer oder Benutzerdefiniert – die benutzerdefinierten Werte
   haben einen eigenen Reiter). Sie zählen nur, wenn der Server diese Welt anlegt (es gibt sie noch nicht).
 - **Module**: jedes eingebaute Modul für alle an- oder ausschalten. **RPG-Kamera** und die Routenlinie der Navigation
-  sind auf dem Server für alle Spieler gleich.
+  sind auf dem Server für alle Spieler gleich. **Radio-Senderliste**: die Sprache der Radiosender, die alle Spieler
+  bekommen (die Dateien in `radio/` dieses Repos - wer eine ändert, ändert die Liste für alle; Off = keine).
 - **Spielregeln**: Miete aus eigenen Gebäuden, Gebäudepreise, Kreditrahmen der Bank und Geschäftsverkauf.
 
 **Auf dem Host (Cron, siehe oben):** `bamp-web-sync.sh` stellt die Rangliste jeder Instanz unter
