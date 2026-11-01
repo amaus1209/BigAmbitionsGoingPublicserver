@@ -575,6 +575,49 @@
         }
     },
     {
+        "DisplayName": "Pause when a connection drops",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "What the world does when a player loses the connection (a timeout, not leaving): Off - the others play on, his cars stay; Up to 60 seconds - it waits a minute for a quick reconnect; Until the player returns - as before 1.0.16.",
+        "Keywords": "",
+        "FieldName": "DisconnectPause",
+        "InputType": "enum",
+        "ParamFieldName": "$.DisconnectPause",
+        "DefaultValue": "off",
+        "EnumValues": {
+            "off": "Off",
+            "60": "Up to 60 seconds",
+            "return": "Until the player returns"
+        }
+    },
+    {
+        "DisplayName": "Only the same mod version",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "Players whose Going Public Server version differs from the server's are refused with a message naming both versions. Off: they can join and get a note in the chat to update.",
+        "Keywords": "",
+        "FieldName": "SameVersionOnly",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.SameVersionOnly",
+        "DefaultValue": "false",
+        "EnumValues": {}
+    },
+    {
+        "DisplayName": "Log detail",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "Normal: the console shows what matters (joins, saves, warnings, errors) - the frequent status lines of the systems are left out. Detailed: everything, for finding a fault.",
+        "Keywords": "",
+        "FieldName": "LogLevel",
+        "InputType": "enum",
+        "ParamFieldName": "$.LogLevel",
+        "DefaultValue": "normal",
+        "EnumValues": {
+            "normal": "Normal",
+            "verbose": "Detailed"
+        }
+    },
+    {
         "DisplayName": "Headless",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Server:dns:1",

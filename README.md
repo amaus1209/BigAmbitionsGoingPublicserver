@@ -41,6 +41,23 @@ with the **Going Public Server** mod
 <!-- Going Public Server 1.0.13+ shows every heading of this section as a card in the game's News panel on the
      main menu, newest first. German: the section "Neuigkeiten" in the German part. -->
 
+### Going Public Server 1.0.16
+- A player's cars stay in the world when he leaves; a car left in the road or parked illegally is parked at the roadside. Back on the server, his cars stand where the others saw them.
+- A short right click into the world (not on a building or object, map closed) deletes the route.
+- The wheels of the cars driving past turn and steer.
+- **Self-driving**: in your car, "Drive there" (top of the screen, or "Drive there automatically" on the map's building card) drives you to the destination - blinkers in turns, stops at red lights and for cars and people ahead - and parks there. Steering, throttle or brake take over.
+- Walking routes show **road** (orange) and **footpath** (blue).
+- The mod keys (F6, F7, F8, Shift+F9/F10/F11) can be changed under **Options, Controls**.
+- Smoother traffic: cars no longer jerk back on your screen, and on the server they brake in time behind the car ahead. Other players move smoothly too, even when packets get lost.
+- A lost connection no longer pauses the world (AMP: "Pause when a connection drops"); the game joins the server again by itself. Weak links get a lower network rate automatically.
+- Navigation: the shortest route, turn hints ("Turn right in 80 m"); self-driving follows the road's speed limit, drives into car parks and can follow a friend.
+- Absent players' cars show "(offline)" and a grey pin on the map; a note (or, if set, a refusal) for an older mod version; less waiting when joining.
+- **Server numbers on the ranking page**: network in and out in one chart (two colours), messages, server FPS, throttled players and each player's ping and loss; AMP's status page is tidy again.
+
+### Going Public Server 1.0.15
+- Linux/Proton: game hooks are written as self-contained jumps - fixes "Open in BizMan" showing the empty list instead of the building (rent, buy) and other rare failures there.
+- The navigation names a destination by its address ("44 Second Street") instead of the street key.
+
 ### Going Public Server 1.0.14
 - The load status shows while the game loads the mod; the server's own character is gone everywhere.
 - Passengers see car parks, friends show their buildings, "Walk there automatically" on the map's building card.
@@ -81,7 +98,8 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
   customer demand.
 - **Shift+F10 Insights**: profit per business, sales, staff, real estate and alerts.
 - **Shift+F11 Navigation**: search a destination or click it on the city map, route line on foot and by car, and your
-  character can walk there by itself.
+  character can walk there by itself, in your car it drives there and parks. A short right click into the world (map
+  closed) deletes the route.
 - On the main menu: the mod's load status, these news, and the mod's version next to the game's.
 - 23 languages.
 
@@ -95,7 +113,7 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
 3. In the instance: **Update**. AMP downloads the game with SteamCMD (it asks for a Steam login that owns
    Big Ambitions, and the Steam Guard code if the account has one), Proton GE, and the newest
    **Going Public Server** release from this repository.
-4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server password** (the server key players join with), the server version, and metrics (network in and out, messages, server FPS).
+4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server password** (the server key players join with), and the server version. Network traffic, server FPS and each player's connection are on the ranking page (see below).
 5. Open the game port (UDP, 7777 by default) in your firewall.
 
 ### Updating
@@ -131,7 +149,9 @@ Instances run in containers and cannot reach AMP's web folder, so small jobs run
 ```
 
 - `bamp-web-sync.sh` serves each instance's ranking at `https://<your AMP address>/monitor/<game port>/index.html`
-  (the instance's Connection Link); players open it with their server's key. Merged companies show as "merged with ...". It also copies a German
+  (the instance's Connection Link); players open it with their server's key. Merged companies show as "merged with ...". Below the ranking, **Server**
+  shows the last hour: network traffic in and out, messages, server FPS, the network rate, throttled players and each
+  player's ping, packet loss and rate (the server writes it every 15 s). It also copies a German
   translation of AMP's own interface into AMP's web folder: open AMP once with `https://<your AMP address>/?lang=de`
   (per browser).
 - `backup-saves.sh --all` saves every instance's multiplayer saves to `~/backups/saves/` (14 per instance).
@@ -168,6 +188,23 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 ## Deutsch
 
 ### Neuigkeiten
+
+#### Going Public Server 1.0.16
+- Die Autos eines Spielers bleiben in der Welt, wenn er geht; ein Auto auf der Fahrbahn oder im Halteverbot wird am Straßenrand geparkt. Kommt er zurück, stehen seine Autos dort, wo die anderen sie gesehen haben.
+- Ein kurzer Rechtsklick in die Welt (nicht auf ein Gebäude oder Objekt, Karte zu) löscht die Route.
+- Die Räder der vorbeifahrenden Autos drehen sich und lenken mit.
+- **Autopilot**: Im eigenen Auto fährt „Hinfahren“ (oben im Bild, oder „Ziel automatisch hinfahren“ in der Gebäude-Info der Karte) zum Ziel - mit Blinker beim Abbiegen, Halt an roten Ampeln und vor Autos und Personen - und parkt dort ein. Lenken, Gas oder Bremse übernimmt.
+- Fußwege zeigen **Straße** (orange) und **Fußweg** (blau).
+- Die Mod-Tasten (F6, F7, F8, Umschalt+F9/F10/F11) lassen sich unter **Optionen, Steuerung** ändern.
+- Flüssigerer Verkehr: Autos springen auf deinem Bildschirm nicht mehr zurück, und auf dem Server bremsen sie rechtzeitig hinter dem Vordermann. Auch andere Spieler bewegen sich flüssig, selbst wenn Pakete verloren gehen.
+- Ein Verbindungsabbruch pausiert die Welt nicht mehr (AMP: „Pause bei Verbindungsabbruch“); das Spiel tritt dem Server selbst wieder bei. Schwache Verbindungen bekommen automatisch einen niedrigeren Netzwerk-Takt.
+- Navigation: kürzeste Route, Abbiegehinweise („Rechts abbiegen in 80 m“); der Autopilot hält das Tempolimit der Straße, fährt in Parkhäuser und kann einem Freund folgen.
+- Autos abwesender Spieler zeigen „(offline)“ und ein graues Symbol auf der Karte; Hinweis (oder auf Wunsch Abweisung) bei älterer Mod-Version; kürzeres Warten beim Beitreten.
+- **Server-Werte auf der Ranglisten-Seite**: Netzverkehr rein und raus in einem Diagramm (zwei Farben), Nachrichten, Server-FPS, gedrosselte Spieler sowie Ping und Verlust je Spieler; AMPs Statusseite ist wieder aufgeräumt.
+
+#### Going Public Server 1.0.15
+- Linux/Proton: Spiel-Umleitungen werden als eigenständige Sprünge geschrieben - behebt „In BizMan öffnen“, das statt des Gebäudes (mieten, kaufen) die leere Liste zeigte, und andere seltene Fehler dort.
+- Die Navigation nennt ein Ziel mit seiner Adresse („44 Second Street“) statt mit dem Straßenschlüssel.
 
 #### Going Public Server 1.0.14
 - Der Ladestatus erscheint schon, während das Spiel den Mod lädt; die Server-Figur ist überall verschwunden.
@@ -223,7 +260,8 @@ Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
   Kundennachfrage vor.
 - **Umschalt+F10 Auswertung**: Gewinn je Geschäft, Verkäufe, Personal, Immobilien und Warnungen.
 - **Umschalt+F11 Navigation**: Ziel suchen oder auf der Stadtkarte anklicken, Routenlinie zu Fuß und mit dem Auto, auf
-  Wunsch läuft die Figur selbst hin.
+  Wunsch läuft die Figur selbst hin, im Auto fährt es hin und parkt. Ein kurzer Rechtsklick in die Welt (Karte zu)
+  löscht die Route.
 - Im Hauptmenü: der Ladestatus des Mods, diese Neuigkeiten und die Mod-Version neben der des Spiels.
 - 23 Sprachen.
 
@@ -233,7 +271,7 @@ Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
 `amaus1209/BigAmbitionsGoingPublicServer:main` eintragen, **Fetch latest**, eine Instanz aus der Vorlage
 **Big Ambitions (Going Public server)** anlegen, **Update** (lädt das Spiel per SteamCMD mit einem Steam-Konto,
 das Big Ambitions besitzt – bei Steam Guard fragt AMP nach dem Code –, Proton GE und das neueste Release von
-hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Passwort (den Server-Schlüssel), Server-Version und Messwerte (Netzwerk rein/raus, Nachrichten, Server-FPS).
+hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Passwort (den Server-Schlüssel) und Server-Version. Netzverkehr, Server-FPS und die Verbindung jedes Spielers stehen auf der Ranglisten-Seite (siehe unten).
 Den Spiel-Port freigeben (UDP, standardmäßig 7777).
 
 **Aktualisieren:** **Update** lädt das neueste Release, danach die Instanz neu starten. Die Spieler bekommen die passende
@@ -257,6 +295,8 @@ Server dann (wenige Sekunden).
 **Auf dem Host (Cron, siehe oben):** `bamp-web-sync.sh` stellt die Rangliste jeder Instanz unter
 `https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html` bereit (der Verbindungslink der Instanz) (fusionierte Firmen stehen als „fusioniert mit …“ dabei) und legt
 die deutsche Übersetzung der AMP-Oberfläche ab: AMP einmal mit `https://<AMP-Adresse>/?lang=de` öffnen (pro Browser).
+Unter der Rangliste zeigt **Server** die letzte Stunde: Netzverkehr rein und raus, Nachrichten, Server-FPS, Netzwerk-Takt,
+gedrosselte Spieler sowie Ping, Paketverlust und Takt je Spieler (der Server schreibt das alle 15 s).
 `backup-saves.sh --all` sichert die Mehrspieler-Spielstände aller Instanzen nach `~/backups/saves/` (14 pro Instanz).
 
 **Übersetzungen anderer Mods selbst bearbeiten** (für die Mods, die Spieler selbst nutzen – der Server nutzt keine):
