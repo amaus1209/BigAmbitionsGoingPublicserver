@@ -16,7 +16,7 @@ jobs:
   index:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check translations and renew the index
         run: python3 tools/modtr-index.py ModTranslations
       - name: Commit the index
