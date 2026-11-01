@@ -1,0 +1,46 @@
+# Going Public Server - station list: Français (fr)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# https MP3 streams only, each one checked. The game loads nothing over http.
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+RMC FR = https://audio.bfmtv.com/rmcradio_128.mp3
+Chérie FM = https://cdnradio.streamakaci.com/cheriefm1.mp3
+法国国际广播电台 = https://rfienchinois64k.ice.infomaniak.ch/rfienchinois-64.mp3
+EuroDance 90 radio = https://stream-eurodance90.fr/radio/8000/128.mp3?1627933323
+Rire et Chansons = https://streaming.nrjaudio.fm/ou8o8xgk7oiu?origine=fluxradios
+Nostalgie 80 90 = https://streaming.nrjaudio.fm/ou62iyxp336f?origine=fluxradios&aw_0_1st.station=Nostalgie-80-90
+OUI FM = https://ouifm.ice.infomaniak.ch/ouifm-high.mp3
+Radio Classique = https://str0.creacast.com/classique1
+Sud Radio = https://ice.creacast.com/sudradio
+BFM radio = https://audio.bfmtv.com/bfmradio_128.mp3
+RMC Info Talk Sport = https://audio.bfmtv.com/rmcradio_128.mp3?aw_0_1st.playerId=RMC_audio_web&aggregator=RMC_audio_web
+Rire et Chansons Sketches = https://streaming.nrjaudio.fm/ou8oqegk7oiu?aw_0_1st.station=Rire-Chansons-SKETCHES&origine=mytuner
+Radio Orient = https://stream.rcs.revma.com/7hnrkawf4p8uv.mp3
+Radio Nostalgie France = https://streaming.nrjaudio.fm/oug7girb92oc?origine=tingfm
+Europe 1 = https://europe1.lmn.fm/europe1.mp3
+Made in 80 = https://madein80.leswebradios.fr/
+RFI Monde = https://rfiafrique64k.ice.infomaniak.ch/rfimonde-64.mp3
+NRJ Paris = https://streaming.nrjaudio.fm/ou5k6tirv93h
+FM 80 FUNKY MUSIC = https://listen.radioking.com/radio/467555/stream/523739
+RADIO NOVA = https://novazz.ice.infomaniak.ch/novazz-128.mp3
+Music Radio = https://radio.musicradio.ai/listen/musicradio.ai/radio.mp3
+Radio Courtoisie = https://ice.creacast.com/radio-courtoisie
+NRJ Nouveaux Hits 2026 = https://streaming.nrjaudio.fm/ouucqs5n3nje
+Rire et Chansons Canulars = https://streaming.nrjaudio.fm/ouwgjmsk6j4d?aw_0_1st.station=Rire-Chansons-CANULARS&origine=mytuner
+Alternative Radio = https://www.radioking.com/play/alternative-radio-1
+Nostalgie Légendes = https://streaming.nrjaudio.fm/ou8ouhgk7oiu
+Meme dans les orties * = https://radio.sk8ter.org:8443/stream
+FG Classics = https://stream.rcs.revma.com/wknqhm4yuchvv?CAID=202605180046506038991434
+Nostalgie Best Of 70 80 90 = https://streaming.nrjaudio.fm/oumrpo8fnozc
+Yumi Co. Radio = https://yumicoradio.net/stream
+Radio Meuh = https://radiomeuh2.ice.infomaniak.ch/radiomeuh2-128.mp3
+Chérie FM 2000 = https://streaming.nrjaudio.fm/ouf2ebtx4thg
+Radio La Belle Aventure = https://flux.radiolabelleaventure.com/listen/radio_la_belle_aventure/radio.mp3
+Génération JUL = https://generations-jul.ice.infomaniak.ch/generations-jul.mp3
+ABC Lounge France = https://str1.openstream.co/589
+Monte Carlo Doualiya = https://montecarlodoualiya128k.ice.infomaniak.ch/mc-doualiya.mp3
+GENERATION SOUL DISCO FUNK RADIO = https://gestream.fr/g-radio-hd.mp3
+Hotmix 80 = https://streaming.hotmixradio.com/hotmix-80-en-mp3?provider=radiobrowser
+Melody Vintage Radio = https://stream.rcs.revma.com/5a05fstup42vv
+ISEKOI Radio - Chill Zone = https://public.isekoi-radio.com/listen/chill/radio.mp3

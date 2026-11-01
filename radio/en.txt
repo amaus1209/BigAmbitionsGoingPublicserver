@@ -1,0 +1,46 @@
+# Going Public Server - station list: English (en)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# https MP3 streams only, each one checked. The game loads nothing over http.
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+Heart 80s = https://media-ssl.musicradio.com/Heart80sMP3
+Adroit Jazz Underground = https://icecast.walmradio.com:8443/jazz
+CNN = https://tunein.cdnstream1.com/2868_96.mp3
+Christmas Vinyl HD = https://icecast.walmradio.com:8443/christmas
+WALM 2 HD = https://icecast.walmradio.com:8443/walm2
+WALM HD = https://icecast.walmradio.com:8443/walm
+Gold = https://media-ssl.musicradio.com/GoldMP3
+MSNBC = https://tunein.cdnstream1.com/3511_96.mp3
+Heart 90s = https://media-ssl.musicradio.com/Heart90sMP3
+FUNKY RADIO = https://funkyradio.streamingmedia.it/play.mp3
+181.FM = https://listen.181fm.com/181-beat_128k.mp3
+Smooth Chill = https://media-ssl.musicradio.com/ChillMP3
+Chillout Ibiza FM = https://edge3.peta.live365.net/b05055_128mp3
+Heart Dance = https://media-ssl.musicradio.com/HeartDanceMP3
+100 Hip Hop and RNB FM (Official) = https://streaming.shoutcast.com/100-hip-hop-and-rnb-fm
+Magic Radio UK = https://stream-mz.hellorayo.co.uk/magicnational.mp3?direct=true&aw_0_1st.playerid=BMUK_TuneIn&aw_0_1st.skey=7374499933&stationCode=mag
+ROCK FM Classic Rock = https://audiotainment-sw.streamabc.net/atsw-classicrock-mp3-128-2538548?
+Classic FM Calm = https://media-ice.musicradio.com/ClassicFMCalmMP3
+Holidaze Halloween Radio = https://ec3.yesstreaming.net:4355/stream
+Intamixx 80s 90s Radio UK = https://radio.intamixx.uk:8443/radio2
+Heart 70s = https://media-ssl.musicradio.com/Heart70sMP3
+UK Bass Radio = https://www.ukbassradio.com/stream
+70s 80s Disco Funk ModernSoul Boogie = https://discofunk.streamingmedia.it/usa
+West Coast – G-Funk & Hip-Hop = https://r.bgp.rodeo/listen/west_coast/radio.mp3
+WAMU American University Radio = https://wamu.cdnstream1.com/wamu.mp3
+Hard Rock Halloween = https://streaming.live365.com/a10373
+House Nation UK = https://streaming.radio.co/s06bd9d805/listen
+Classic FM Movies = https://media-ice.musicradio.com/ClassicFMMoviesMP3
+Miami Beach Radio = https://streaming.radiostreamlive.com/miamibeachradio_devices
+KXTJ "Classic Hits 96.9" San Antonio Tex = https://s5.radio.co/s6ac20f7f4/listen
+181.FM - Highway 181 = https://listen.181fm.com/181-highway_128k.mp3
+Funky Corner Radio (USA) = https://ais-sa2.cdnstream1.com/2447_192.mp3
+Virgin Radio UK = https://radio.virginradio.co.uk/stream
+CNBC Radio = https://tunein.cdnstream1.com/6288_128.mp3
+KLVZ Legends 810AM/95.3 FM = https://ais-sa8.cdnstream1.com/p1w7r97sb0k/c2g93fu0iqz
+metal rock radio = https://kathy.torontocast.com:2800/;
+1 oldies = https://80sexitos.stream.laut.fm/80sexitos
+Comedy 104 - Radiostorm = https://ais-sa5.cdnstream1.com/b42761_64mp3
+Megarock Radio = https://stream3.megarockradio.net:80/
+WQXR 105.9 FM = https://stream.wqxr.org/wqxr-web?nyprBrowserId=32c67956bf1d5600

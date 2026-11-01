@@ -1,0 +1,46 @@
+# Going Public Server - station list: Ελληνικά (el)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# https MP3 streams only, each one checked. The game loads nothing over http.
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+Zeppelin 106.7 = https://radiostreaming.ert.gr/ert-zeppelin
+Electronica Vibes = https://live.piratefm.net/electronica_vibes
+SKAI 100.3 = https://skai.live24.gr/skai1003
+Vanilla Radio Smooth Flavors = https://smooth.vanillaradio.com:8032/live
+Alexandroupolis Dee Jay 94.8 = https://stream.myip.gr/proxy/deejay?mp=/stream
+Pepper 96.6 = https://stream.radiojar.com/pepper
+Blues Radio Athens = https://i4.streams.ovh/sc/bluesrad/stream
+Vanilla Radio Deep Flavors = https://stream.vanillaradio.com:8003/live
+Parapolitika 90.1 = https://netradio.live24.gr/athinaradio
+1055 Rock - Thessaloniki = https://radio.1055rock.gr:31056/live
+Disco Net = https://stream1.468.gr/8004/stream
+Rock FM 96.9 = https://az10.yesstreaming.net:8060/radio.mp3
+Kosmos Jazz GR = https://radiostreaming.ert.gr/ert-webjazz
+Focus FM 103.6 = https://ice.greekstream.net/focusfm
+ΕΡΑσπορ = https://radiostreaming.ert.gr/ert-erasport
+Μάχη 99.8 = https://maxhfm.streams.gr/ic/maxhfm/stream
+RadioKyklos - Greek Hiphop = https://azuracast.streams.ovh/listen/radiokyklos/radio.mp3
+105FM = https://105fm.espiv.net/listen/105fm/stream.mp3
+Vanilla Radio.com = https://fresh.vanillaradio.com:8028/live
+Πειραϊκή Εκκλησία = https://impradio.bytemasters.gr/8002/stream
+Mega News 104.6 = https://nmcdn-ea00263bf2fa4959b1207c5b169d1517.msvdn.net/icecastRelay/S92303783/lih0S0uubyJi/icecast
+Disco Cafe = https://azuracast.streams.ovh:8260/radio.mp3
+Εκκλησία της Ελλάδας 89.5 = https://loki.mental-media.gr:8038/index.html
+Omega Radio Greek Music = https://rdst.win:59962/stream
+Zucca Radio = https://stream.zuccaradio.com/stream
+Psyndora Psytrance = https://cast.magicstreams.gr/sc/psyndora/stream
+Lampsi 92.3 = https://az11.yesstreaming.net:8140/radio.mp3
+ERA-DEFTERO 103.7 FM = https://radiostreaming.ert.gr/ert-deftero
+Radio Art = https://live.radioart.com/fMellow_piano_jazz.mp3
+Radio Art - Roots Reggae = https://live.radioart.com/fRoots_reggae.mp3
+Athens Dee Jay 95.2 = https://netradio.live24.gr/athensdeejay
+ERT 80s = https://radiostreaming.ert.gr/radio-80s
+Psyndora Chillout = https://cast.magicstreams.gr/sc/psychill/stream
+ΕΝΑ 90.5 = https://rdst.win:48000/stream?type=.mp3
+Athens Rock 96.9 = https://az10.yesstreaming.net/radio/8060/radio.mp3
+90s Heaven = https://sp3.streams.ovh/8070/stream
+Ήπειρος 94.5 = https://rdst.win:59450/stream
+Planet 90.6 = https://sh.onweb.gr:7043/;
+Derti 107,7 Heraklion Crete = https://i5.streams.ovh:2200/sc/web101/stream
+Bar Legend Radio = https://solid24.streamupsolutions.com/proxy/nilxzqeg?mp=/stream

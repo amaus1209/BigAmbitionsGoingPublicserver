@@ -1,0 +1,46 @@
+# Going Public Server - station list: Українська (uk)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# https MP3 streams only, each one checked. The game loads nothing over http.
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+Kiss FM = https://online.kissfm.ua/KissFM_HD
+MFM STATION = https://radio.mfm.ua/online128
+Мелодія FM = https://online.melodiafm.ua/MelodiaFM
+Kiss FM Ukrainian = https://online.kissfm.ua/KissFM_Ukr
+РАДІО КИЇВ – 98 FM = https://cdn.vsnw.net:8943/kyiv_fm_128k
+Kiss FM Digital HD = https://online.kissfm.ua/KissFM_Digital_HD
+Lounge FM Chill Out = https://cast.mediaonline.net.ua/chillout320
+Хіт FM = https://online.hitfm.ua/HitFM_HD
+Kiss FM Deep = https://online.kissfm.ua/KissFM_Deep
+1] Авторадіо = https://cast.mediaonline.net.ua/avtoradio
+Радіо НВ 96.0 = https://online-radio.nv.ua/radionv.mp3
+Radio ROCKS Kyiv 103.6FM HD = https://online.radioroks.ua/RadioROKS_HD
+Radio Svoboda (Радіо Свобода) = https://n04.radiojar.com/hcrb063nn3quv?rj-ttl=5&rj-tok=AAABijO2KqMAvyNNc6ijVnKFQA
+Єдині новини 24 = https://online-news.radioplayer.ua/RadioNews
+Kiss FM Ukraine HD = https://online.kissfm.ua/KissFM_Ukr_HD
+NRJ Ukraine = https://cast.mediaonline.net.ua/nrj320
+Radio Relax = https://online.radiorelax.ua/RadioRelax
+TRANCE IS STAR RADIO = https://myradio24.org/tisradio
+Радіо Шлягер FM = https://cast.brg.ua/shanson_main_public_mp3_hq
+FM Disco Melody = https://online.melodiafm.ua/MelodiaFM_Disco
+Lounge FM Terrace = https://cast.mediaonline.net.ua/terrace320
+DJFM DANCE = https://cast.brg.ua/djfmdance_main_public_mp3_hq
+Radio ROKS Classic Rock = https://online.radioroks.ua/RadioROKS_ClassicRock_HD
+REPLAY NEWS = https://replaynewsuk.ice.infomaniak.ch/replaynewsuk-128.mp3
+Прямий FM = https://cast.mediaonline.net.ua/prmfm320
+Radio Jazz Cover = https://online.radiojazz.ua/RadioJazz_Cover_HD
+Одесса радио = https://listen6.myradio24.com/odesradio
+Radio Shanson = https://cast.brg.ua/newshanson_main_public_mp3_hq
+Радіо Байрактар = https://online.radiobayraktar.ua/RadioBayraktar
+Radio Gold Ukraine = https://online.radioplayer.ua/RadioGold
+PowerFM = https://cast.brg.ua/powerfm_main_public_mp3_hq
+Lounge FM = https://cast.mediaonline.net.ua/loungefm320
+Ретро = https://listen1.myradio24.com/5967
+Радіо Хартія (Radio Khartia) = https://a9.asurahosting.com/listen/radio_khartia/radio.mp3
+Радіо П'ятниця = https://cast.mediaonline.net.ua/radiopyatnica320
+Radio ROCKS Новий Рок 103.6FM HD = https://online.radioroks.ua/RadioROKS_NewRock_HD
+True Black Metal Radio = https://trueblackmetalradio.com:8000/radio
+Гуляй Радіо = https://online.radioplayer.ua/GuliayRadio
+Classic Radio = https://online.classicradio.ua/ClassicRadio
+Dr.DIO Radio = https://drdio.studio/stream/live.mp3

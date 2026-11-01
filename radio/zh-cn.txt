@@ -1,0 +1,46 @@
+# Going Public Server - station list: 简体中文 (zh-cn)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# https MP3 streams only, each one checked. The game loads nothing over http.
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+怀集音乐之声 = https://lhttp.qingting.fm/live/4804/64k.mp3
+CNR-1 中国之声 = https://lhttp.qtfm.cn/live/15318317/64k.mp3
+新闻联播 = https://rfienchinois64k.ice.infomaniak.ch//rfienchinois-64.mp3
+500首华语经典 = https://lhttp.qtfm.cn/live/5022308/64k.mp3
+国际新闻 = https://lhttp.qtfm.cn/live/20500172/64k.mp3
+REPLAY NEWS = https://replaynewszh.ice.infomaniak.ch/replaynewszh-128.mp3
+两广之声音乐台 = https://lhttp.qtfm.cn/live/20500149/64k.mp3
+动听音乐台 = https://lhttp-hw.qtfm.cn/live/5022107/64k.mp3
+AsiaFM 亚洲粤语台 = https://lhttp.qtfm.cn/live/15318569/64k.mp3
+50首经典古典音乐 = https://lhttp-hw.qtfm.cn/live/5022308/64k.mp3
+北京新闻广播 = https://lhttp.qtfm.cn/live/339/64k.mp3
+听云相声台 = https://m.tyradio.uk/tyxs.mp3
+听云评书台 = https://m.tyradio.uk/typs.mp3
+Fm891线上音乐台 = https://lhttp.qtfm.cn/live/20500215/64k.mp3
+安徽小说评书广播 = https://lhttp.qtfm.cn/live/1951/64k.mp3
+故事广播-阿基米德故事会 = https://lhttp.qtfm.cn/live/20500182/64k.mp3
+星空电台 STAR RADIO = https://lhttp-hw.qtfm.cn/live/5022379/64k.mp3
+上海经典金曲广播 FM103.7 = https://lhttp-hw.qtfm.cn/live/273/64k.mp3
+广东音乐之声 = https://lhttp.qtfm.cn/live/1260/64k.mp3
+上海流行音乐广播 动感101 FM101.7 = https://lhttp-hw.qtfm.cn/live/274/64k.mp3
+江苏经典流行音乐广播 = https://lhttp.qtfm.cn/live/4938/64k.mp3
+Shanghai FM 101 上海动感101 = https://lhttp.qingting.fm/live/274/64k.mp3
+HardBestFM-Hardcore = https://fm.hardbest.cn/listen/hardcore/radio.mp3
+听云音乐台 = https://m.tyradio.uk/radio.mp3
+广东珠江经济台 = https://lhttp.qtfm.cn/live/1259/64k.mp3
+Chinese Music World = https://radio.chinesemusicworld.com/chinesemusic.mp3
+云梦音乐台 = https://lhttp.qtfm.cn/live/20500187/64k.mp3
+济南故事广播 = https://lhttp.qtfm.cn/live/1672/64k.mp3
+北京文艺广播 = https://lhttp.qtfm.cn/live/333/64k.mp3
+AsiaFM亚洲天空台 = https://lhttp.qingting.fm/live/20071/64k.mp3
+羊城交通电台 = https://lhttp.qtfm.cn/live/1262/64k.mp3
+北京交通广播 = https://lhttp.qingting.fm/live/336/64k.mp3
+Phate Radio 飛特電台 = https://phate.io/listen
+SDBA Classics 94.7 Shanghai = https://lhttp.qingting.fm/live/267/64k.mp3?listening-from-radio-garden=1696445196
+AsiaFM HD音乐台【HTTPS】 = https://lhttp.qtfm.cn/live/15318341/64k.mp3
+Big B Radio亚洲音乐台 = https://antares.dribbcast.com/proxy/apop?mp=/s
+上海经典音乐广播 FM94.7 = https://lhttp-hw.qtfm.cn/live/267/64k.mp3
+北京音乐广播 = https://lhttp.qtfm.cn/live/332/64k.mp3
+HardBestFM = https://fm.hardbest.cn/listen/hardstyle/radio.mp3
+AsiaFM亚洲经典台 = https://lhttp.qingting.fm/live/5021912/64k.mp3

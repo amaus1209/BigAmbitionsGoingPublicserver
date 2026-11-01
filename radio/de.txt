@@ -1,0 +1,256 @@
+# Going Public Server - Senderliste: Deutsch (de)
+# Quelle: radio-browser.info (freie Senderdatenbank), Stand 2026-11-01: die beliebtesten Sender des Landes,
+# nur https-MP3-Streams, jeder einzeln geprüft. Das Spiel lädt nichts über http.
+# Eine Zeile pro Sender:  Name = Adresse   - Ändern oder ergänzen: diese Datei auf GitHub bearbeiten;
+# die Spieler laden sie beim nächsten Spielstart. Gewählt wird die Liste in AMP (Module, Radio-Senderliste).
+
+MANGORADIO = https://mangoradio.stream.laut.fm/mangoradio
+SWR3 = https://liveradio.swr.de/sw282p3/swr3/play.mp3
+Deutschlandfunk - DLF = https://st01.sslstream.dlf.de/dlf/01/128/mp3/stream.mp3?aggregator=web
+Bayern 3 = https://dispatcher.rndfnk.com/br/br3/live/mp3/mid
+TOP 100 CLUB CHARTS = https://breakz-2012-high.rautemusik.fm/?ref=radiobrowser-top100-clubcharts
+OLDIE ANTENNE = https://s1-webradio.oldie-antenne.de/oldie-antenne?aw_0_1st.playerid=OldieAntenneWebPlayer
+BR24 = https://dispatcher.rndfnk.com/br/br24/live/mp3/mid
+WDR4 = https://wdr-wdr4-live.icecastssl.wdr.de/wdr/wdr4/live/mp3/128/stream.mp3
+Halloween Hit Radio = https://stream.laut.fm/halloween-hit-radio
+TOP 100 DJ CHARTS = https://breakz-high.rautemusik.fm/?ref=radiobrowser-top100-djcharts
+ROCKANTENNE Alternative = https://stream.rockantenne.de/alternative/stream/mp3
+DJ & CLUB CHARTS = https://breakz-2012-high.rautemusik.fm/?ref=rb-djclubcharts
+IBIZA CHILLOUT LOUNGE = https://0nlineradio.radioho.st/lounge-ibiza-chillout-lounge?ref=rb26
+NDR 2 = https://icecast.ndr.de/ndr/ndr2/niedersachsen/mp3/128/stream.mp3
+Bayern 1 Oberbayern = https://dispatcher.rndfnk.com/br/br1/obb/mp3/mid
+PIANO JAZZ LOUNGE = https://0nlineradio.radioho.st/lounge-piano-jazz-bar?ref=radio-browser26
+COFFEE LOUNGE = https://0nlineradio.radioho.st/lounge-coffee-bar-lounge?ref=radio-browser26
+1LIVE = https://wdr-1live-live.icecastssl.wdr.de/wdr/1live/live/mp3/128/stream.mp3
+Klassik Radio - Live = https://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3
+Deutschlandfunk Kultur - DLF = https://st02.sslstream.dlf.de/dlf/02/128/mp3/stream.mp3?aggregator=web
+0 N - Classic Rock on Radio = https://0n-classicrock.radionetz.de/0n-classicrock.mp3
+90s Pop = https://0nlineradio.radioho.st/0r-90s?ref=radio-browser26
+SWR1 BW = https://liveradio.swr.de/sw282p3/swr1bw/play.mp3
+DEEJAY REMIXE = https://breakz-high.rautemusik.fm/?ref=radiobrowser-deejay-remixes-radio
+Bayern 2 = https://dispatcher.rndfnk.com/br/br2/live/mp3/mid
+MUSIC FOR SLEEP = https://0nlineradio.radioho.st/classical-classical-music-for-sleep?ref=radio-browser26
+Radio Bollerwagen = https://ffn-stream19.radiohost.de/radiobollerwagen_mp3-192?ref=radioplayer&listenerid=31363233323633323031-323030333a64653a343731363a3730313a623731343a346664383a313761363a39386165-3537373636-4d6f7a696c6c612f352e3020285831313b205562
+0 N - 70s on Radio = https://0n-70s.radionetz.de/0n-70s.mp3
+bigFM Deutschland = https://stream.bigfm.de/deutschland/mp3-128/radio-browser
+TechnoBase.FM = https://listener3.mp3.tb-group.fm/tb.mp3
+BR-Klassik = https://dispatcher.rndfnk.com/br/brklassik/live/mp3/high
+N-JOY = https://icecast.ndr.de/ndr/njoy/live/mp3/128/stream.mp3
+Aktuelle HITS = https://breakz-2012-high.rautemusik.fm/?ref=radiobrowser-akthits
+80s ROCK = https://0nlineradio.radioho.st/0r-80s-rock?ref=radio-browser26
+CLUB CHARTS = https://radio.breakz.fm/?ref=club2-71
+NDR 2 Hamburg = https://icecast.ndr.de/ndr/ndr2/hamburg/mp3/128/stream.mp3?1728423809880&aggregator=web
+NDR 1 Niedersachsen = https://icecast.ndr.de/ndr/ndr1niedersachsen/hannover/mp3/128/stream.mp3?1728424471708&aggregator=web
+Antenne Bayern = https://stream.antenne.de/antenne/stream/mp3
+TRANCE = https://trance-high.rautemusik.fm/?ref=radiobrowser
+Technolovers EDM = https://stream.technolovers.fm/edm?ref=radiobrowser
+SPA LOUNGE = https://0nlineradio.radioho.st/lounge-spa-lounge?ref=radio-browser26
+kontrafunk = https://icecast.multhielemedia.de/listen/kontrafunk/radio.mp3
+NEUERSCHEINUNGEN = https://breakz-high.rautemusik.fm/?ref=rb-neuerscheinungen
+90s90s - Eurodance = https://regiocast.streamabc.net/regc-90s90seurodance7558633-mp3-192-3419489?sABC=6nr0n036%230%23nq59s62359o2nr38nsp8150610pq18p9%23fgernzf.90f90f.qr&aw_0_1st.playerid=streams.90s90s.de&amsparams=playerid:streams.90s90s.de;skey:1793105974
+Blasmusikradio mit Bernd = https://blasmusikradiomitbernd.stream.laut.fm/blasmusikradio_mit_bernd?uuid=4c93471a-ca30-17db-a804-369df9d78ed8&t302=2026-11-01_10-49-41
+Deutschlandfunk Nova - DLF = https://st03.sslstream.dlf.de/dlf/03/128/mp3/stream.mp3?aggregator=web
+Bayern 1 Franken = https://dispatcher.rndfnk.com/br/br1/franken/mp3/mid
+TOP 100 CHARTS = https://breakz-high.rautemusik.fm/?ref=rb-djclubcharts0326
+NATURE RELAX = https://0nlineradio.radioho.st/lounge-nature-sounds?ref=radio-browser26
+Oldies = https://0nlineradio.radioho.st/0r-70s?ref=rb26
+Schwarzwaldradio = https://edge62.streamonkey.net/fho-schwarzwaldradiolive/stream/mp3?aggregator=smk-m3u-mp3
+DEEP HOUSE = https://0nlineradio.radioho.st/technolovers-deep-house?ref=radio-browser26
+Bremen Eins = https://icecast.radiobremen.de/rb/bremeneins/live/mp3/128/stream.mp3
+80s Pop = https://0nlineradio.radioho.st/0r-80s?ref=radio-browser26
+ByteFM = https://bytefm.cast.addradio.de/bytefm/main/high/stream
+Melodic House & Techno @ Technolovers.FM = https://stream.technolovers.fm/melodic-house-techno?ref=radiobrowser-2
+HR Info = https://dispatcher.rndfnk.com/hr/hrinfo/live/mp3/high
+Die Maus = https://wdr-diemaus-live.icecastssl.wdr.de/wdr/diemaus/live/mp3/128/stream.mp3
+0 N - 80s on Radio = https://0n-80s.radionetz.de/0n-80s.mp3
+Schlagerparadies = https://webstream.schlagerparadies.de/schlager30842
+SEX__ by rautemusik (rm.fm) = https://sex-high.rautemusik.fm/?ref=radiobrowser
+TOP 100 = https://radio2.breakz.fm/?ref=rb-gpt-t100
+WDR 5 = https://wdr-wdr5-live.icecastssl.wdr.de/wdr/wdr5/live/mp3/128/stream.mp3
+Technolovers ELECTRO HOUSE = https://stream.technolovers.fm/electro-house?ref=radiobrowser
+SWR Aktuell = https://liveradio.swr.de/sw282p3/swraktuell/play.aac
+SWR1 Rheinland-Pfalz = https://liveradio.swr.de/sw282p3/swr1rp/play.mp3
+HOTEL LOUNGE = https://0nlineradio.radioho.st/lounge-hotel-lounge?ref=radio-browser26
+NDR 90,3 = https://icecast.ndr.de/ndr/ndr903/hamburg/mp3/128/stream.mp3?1728425642817&aggregator=web
+TECHNO__ by rautemusik.fm = https://streams.rautemusik.fm/techno/mp3-192/?ref=radiobrowser
+Technolovers DEEP HOUSE = https://stream.technolovers.fm/deep-house?ref=radiobrowser
+REMIX & PARTYBREAKS = https://stream.breakz.fm/?ref=radiobrowser-remix-partybreaks-radio
+LO-FI = https://0nlineradio.radioho.st/0r-lo-fi?ref=radio-browser26
+WDR 2 Ruhrgebiet = https://wdr-wdr2-ruhrgebiet.icecastssl.wdr.de/wdr/wdr2/ruhrgebiet/mp3/128/stream.mp3
+TOP 200 DJ CHARTS = https://breakz-high.rautemusik.fm/stream.mp3?ref=DJCHARTSRB
+Chillhouse Live = https://stream.chillhouse-live.com/live
+EURO DANCE = https://0nlineradio.radioho.st/technolovers-eurodance?ref=radio-browser26
+HYPERTECHNO = https://0nlineradio.radioho.st/technolovers-hypertechno?ref=radio-browser26
+LOUNGE = https://lounge-high.rautemusik.fm/?ref=radiobrowser
+0 N - 60s on Radio = https://0n-60s.radionetz.de/0n-60s.mp3
+Best Of Rock.FM Alternative Rock = https://bestofrockfm.stream.vip/altrock/mp3-256/bestofrock.fm/
+BACH = https://0nlineradio.radioho.st/0r-bach?ref=radio-browser26
+0 N - 90s on Radio = https://0n-90s.radionetz.de/0n-90s.mp3
+Antenne Niedersachsen = https://stream.antenne.com/antenne-nds/mp3-192
+Nightride FM - Darksynth = https://stream.nightride.fm/darksynth.mp3
+WDR2 = https://wdr-wdr2-rheinruhr.icecastssl.wdr.de/wdr/wdr2/rheinruhr/mp3/128/stream.mp3
+RESTAURANT LOUNGE = https://0nlineradio.radioho.st/lounge-restaurant-lounge?ref=radio-browser26
+Technolovers - MINIMAL = https://stream.technolovers.fm/minimal?ref=radiobrowser
+Radio BOB = https://streams.radiobob.de/numetal/mp3-192/
+Ostseewelle = https://addrad.io/4454pjf
+Bremen Zwei NEU = https://icecast.radiobremen.de/rb/bremenzwei/live/mp3/128/stream.mp3
+Energy Hit Music Only! = https://edge62.streamonkey.net/energy-digital/stream/mp3
+SOFT ROCK = https://0nlineradio.radioho.st/0r-soft-rock?ref=radio-browser26
+CLASSICAL HOTEL LOUNGE = https://0nlineradio.radioho.st/classical-classical-hotel-lounge?ref=radio-browser26
+CHILLOUT PIANO by Epic Piano = https://stream.epic-piano.com/chillout-piano?ref=radiobrowser
+BR Heimat = https://dispatcher.rndfnk.com/br/brheimat/live/mp3/mid
+0 N - Indie on Radio = https://0n-indie.radionetz.de/0n-indie.mp3
+SWR2 = https://f111.rndfnk.com/ard/swr/swr2/live/mp3/256/stream.mp3?aggregator=web&sid=28ew6Usq6cch83eglcsXwLlNRS3&token=Ip5bwQ_T81Lq_mqKc3HUjnxrk94ek2bDcfNyNHuqRGk&tvf=XFsRgyq06xZmMTExLnJuZGZuay5jb20
+Bayern 1 Schwaben = https://dispatcher.rndfnk.com/br/br1/schwaben/mp3/mid
+Bremen Vier = https://icecast.radiobremen.de/rb/bremenvier/live/mp3/128/stream.mp3
+Electro Swing Revolution = https://streamer.radio.co/s2c3cc784b/listen
+Technolovers - PSYTRANCE = https://stream.technolovers.fm/psytrance?ref=radiobrowser
+90s90s Dance Radio = https://regiocast.streamabc.net/regc-90s90sdanceradio-mp3-192-7820726
+DEUTSCHRAP = https://deutschrap-high.rautemusik.fm/?ref=radiobrowser
+Radio Fritz = https://dispatcher.rndfnk.com/rbb/fritz/live/mp3/mid
+CLUB__ by rautemusik (rm.fm) = https://club-high.rautemusik.fm/?ref=radiobrowser
+COUNTRY = https://0nlineradio.radioho.st/0r-country?ref=rb26
+0nlineradio SOFT ROCK = https://stream.0nlineradio.com/soft-rock?ref=radiobrowser
+WDR COSMO -- (https) = https://wdr-cosmo-live.icecastssl.wdr.de/wdr/cosmo/live/mp3/128/stream.mp3
+JazzRadio 106.8 Berlin = https://streaming.radio.co/s774887f7b/listen
+TOGGO Radio = https://radio.toggo.de/live/mp3-192
+hr4 = https://dispatcher.rndfnk.com/hr/hr4/live/mp3/high
+NDR Kultur = https://icecast.ndr.de/ndr/ndrkultur/live/mp3/128/stream.mp3?1728425224079&aggregator=web
+AFRO HOUSE = https://0nlineradio.radioho.st/technolovers-afro-house?ref=radio-browser26
+ffn = https://ffn-de-hz-fal-stream04-cluster01.radiohost.de/ffn_mp3-192
+EPIC CLASSICAL = https://stream.epic-classical.com/classical-music-for-sleep
+0nlineradio BACH = https://stream.0nlineradio.com/bach?ref=radiobrowser
+Nightride FM - Spacesynth = https://stream.nightride.fm/spacesynth.mp3
+ROMANTIC PIANO = https://0nlineradio.radioho.st/piano-romantic-piano?ref=radio-browser26
+SOFT HOUSE = https://0nlineradio.radioho.st/lounge-soft-house-lounge?ref=radio-browser26
+Radio Bonn / Rhein-Sieg = https://rbrs-live.cast.addradio.de/rbrs/live/mp3/high
+NDR 1 Niedersachsen (OL) = https://icecast.ndr.de/ndr/ndr1niedersachsen/oldenburg/mp3/128/stream.mp3
+Best Of Rock.FM Rammstein (mp3-256) = https://bestofrockfm.stream.vip/rammstein/mp3-256
+MOZART = https://0nlineradio.radioho.st/0r-mozart?ref=radio-browser26
+bigFM Tomorrowland One World Radio = https://stream.bigfm.de/tomorrowland/mp3-128/radiobrowser
+NICHT EINSCHALTEN = https://breakz-2012-high.rautemusik.fm/?ref=rbnichteinschalten
+SCHLAGER OLDIES = https://schlager-oldies-high.rautemusik.fm/?ref=radiobrowser
+Bayern 1 Niederbayern = https://dispatcher.rndfnk.com/br/br1/nbopf/mp3/mid
+sunshine live = https://stream.sunshine-live.de/melodic-techno/mp3-128/stream.sunshine-live.de/
+WACKENRADIO = https://wackenradio-high.rautemusik.fm/?ref=radiobrowser
+0nlineradio COUNTRY = https://stream.0nlineradio.com/country?ref=radiobrowser
+90s90s Trance = https://regiocast.streamabc.net/regc-90s90strance-mp3-192-2383645
+BEACH CLUB LOUNGE = https://0nlineradio.radioho.st/lounge-beach-club-lounge?ref=radio-browser26
+PIANO CLASSICAL = https://0nlineradio.radioho.st/classical-classical-piano?ref=radio-browser26
+0 N - Chillout on Radio = https://0n-chillout.radionetz.de/0n-chillout.mp3
+Ella Radio - Coffee Jazz = https://stream.ella-radio.de/ella-coffee-jazz/mp3-192/?ref=radio-browser
+Sunshine Live - Eurodance = https://sunsl.streamabc.net/sunsl-eurodance-mp3-192-9832422
+CLUB RADIO = https://breakz-2012-high.rautemusik.fm/?ref=rb-deindj
+Nightride FM = https://stream.nightride.fm/nightride.mp3
+SWR dasding = https://liveradio.swr.de/d9zadj3/dasding/
+Nightride FM - Chillsynth = https://stream.nightride.fm/chillsynth.mp3
+NDR Schlager = https://icecast.ndr.de/ndr/ndrschlager/live/mp3/128/stream.mp3?1728425971529&aggregator=web
+TOP 40 DEEJAY CHARTS – CLUB CHARTS NONST = https://breakz-high.rautemusik.fm/?ref=26T40
+Radio BOB Progressive Rock = https://streams.radiobob.de/progrock/mp3-192/
+DINNER LOUNGE = https://0nlineradio.radioho.st/lounge-dinner-lounge?ref=radio-browser26
+HR3 (mp3/high) = https://dispatcher.rndfnk.com/hr/hr3/live/mp3/high
+WDR 2 – Rheinland - mp3 = https://wdr-wdr2-rheinland.icecastssl.wdr.de/wdr/wdr2/rheinland/mp3/128/stream.mp3
+1LIVE Chillout = https://wdr-1live-chillout.icecast.wdr.de/wdr/1live/chillout/mp3/128/stream.mp3
+80s80s Rock = https://regiocast.streamabc.net/regc-80s80srock2191507-mp3-192-4255750?sABC=648p713n%231%23r0s395556op64ro793171r5427p80197%23ubzrcntr&context=fHA6LTE=&aw_0_1st.skey=1686925626&cb=914075802&listenerid=e0f395556bc64eb793171e5427c80197&aw_0_1st.playerid=homepage&amsparams=playerid:homepage;skey:1686925626
+COUNTRYHITS.FM = https://country-high.rautemusik.fm/?ref=radiobrowser
+HR1 = https://dispatcher.rndfnk.com/hr/hr1/live/mp3/high
+SWR1 = https://dispatcher.rndfnk.com/swr/swr1/bw/mp3/128/stream.mp3
+Rockland Radio Koblenz = https://streams.rockland.de/koblenz/mp3-192/%20konsoleplayer
+1 A - Oldies von 1A Radio = https://1a-oldies.radionetz.de/1a-oldies.mp3
+90S__ by rautemusik (rm.fm) = https://90s-high.rautemusik.fm/?ref=radiobrowser
+Radio Lippe = https://radiolippe-live.cast.addradio.de/radiolippe/live/mp3/high
+sunshine live - Vocal Trance = https://sunsl.streamabc.net/sunsl-vocaltrance-mp3-192-5826863?sABC=6nr69n80%230%23nq59s62359o2nr38nsp8150610pq18p9%23fgernz.fhafuvar-yvir.qr&aw_0_1st.playerid=stream.sunshine-live.de&amsparams=playerid:stream.sunshine-live.de;skey:1793497728
+0 N - Gothic on Radio = https://0n-gothic.radionetz.de/0n-gothic.mp3
+Mainstage Charts = https://breakz-high.rautemusik.fm/?ref=radiobrowser-mainstage
+Radio 7 = https://streams.radio7.de/dab/mp3-192/web/
+1000 Goldschlager = https://1000goldschlager.stream.laut.fm/1000goldschlager
+DeutschlandFunk Nachrichten = https://ondemand-mp3.dradio.de/file/dradio/nachrichten/nachrichten.mp3
+HOUSE = https://house-high.rautemusik.fm/?ref=radiobrowser
+Best Of Rock.FM AC DC = https://bestofrockfm.stream.vip/acdc/mp3-256/bestofrock.fm/
+Technolovers VOCAL TRANCE = https://stream.technolovers.fm/vocal-trance?ref=radiobrowser
+egoFM Bayern = https://cast.egofm.de/egofm.mp3?ar-distributor=radio-browser
+Technolovers DRUM N BASS = https://stream.technolovers.fm/drummnbass?ref=radiobrowser
+Absolut Relax = https://absolut-relax.live-sm.absolutradio.de/absolut-relax/stream/mp3
+Techno Lovers FM Vocal Trance = https://stream.technolovers.fm/vocal-trance
+2000s = https://0nlineradio.radioho.st/0r-2000er?ref=rb26
+80S__ by rautemusik (rm.fm) = https://80s-high.rautemusik.fm/?ref=radiobrowser
+98.2 Radio Paradiso = https://streams.paradiso.de/Berlin/mp3-128/Web/?pkey=web-radioparadiso-de&tcstring=CPXGs4APXGs4AAFADBDECKCgAAAAAAAAAAYgAAAAAAAA.YAAAAAAAAAAA
+0 N - 2000s on Radio = https://0n-2000s.radionetz.de/0n-2000s.mp3
+NDR Blue = https://icecast.ndr.de/ndr/ndrblue/live/mp3/128/stream.mp3?1728425782606&aggregator=web
+0 N - Lounge on Radio = https://0n-lounge.radionetz.de/0n-lounge.mp3
+Radio PSR = https://streams.radiopsr.de/psr-live/mp3-192/mediaplayer
+Radio Seefunk = https://webradio.radio-seefunk.de/
+StarFM Berlin = https://stream.starfm.de/berlin/mp3-192/iradio
+0 N - Movies on Radio = https://0n-movies.radionetz.de/0n-movies.mp3
+Nightride FM - Horrorsynth = https://stream.nightride.fm/horrorsynth.mp3
+Hitradio RTL Sachsen = https://edge22.radio.hitradio-rtl.de/hrrtl-dresden/stream/mp3?aggregator=smk-m3u-mp3
+Fußball-Bundesliga: Konferenz = https://wdr-sportschau-liga1konferenz.icecastssl.wdr.de/wdr/sportschau/liga1konferenz/mp3/high
+Technolovers HARDSTYLE = https://stream.technolovers.fm/hardstyle?ref=radiobrowser
+CLUB CHARTS TOP 100 = https://breakz-2012-high.rautemusik.fm/?ref=N1CLUBBING26
+WDR 5 Nachrichten = https://www.wdr.de/realaudio/radio/nachrichten/nachrichten_wdr5.mp3
+0 N - Heavy Metal on Radio = https://0n-heavymetal.radionetz.de/0n-heavymetal.mp3
+Technolovers - FUNKY HOUSE = https://stream.technolovers.fm/funky-house?ref=radiobrowser
+100 % = https://club-high.rautemusik.fm/?ref=radiobrowser-100-handsup
+YOU FM (mp3/high) = https://dispatcher.rndfnk.com/hr/youfm/live/mp3/high
+Hitradio Ö3 = https://orf-live.ors-shoutcast.at/oe3-q2a
+hr2-kultur = https://dispatcher.rndfnk.com/hr/hr2/live/mp3/high
+1 A - Chillout von 1A Radio = https://1a-chillout.radionetz.de/1a-chillout.mp3
+0 N - Smooth Jazz on Radio = https://0n-smoothjazz.radionetz.de/0n-smoothjazz.mp3
+Radio Leipzig = https://edge22.radio.radioleipzig.de/radioleipzig-live/stream/mp3?aggregator=smk-m3u-mp3
+SUNSHINE LIVE - Simulcast = https://stream.sunshine-live.de/live/mp3-192/stream.sunshine-live.de/
+Deutschlandfunk Dokumente und Debatten = https://st04.sslstream.dlf.de/dlf/04/128/mp3/stream.mp3?aggregator=web
+Klassik Radio = https://stream.klassikradio.de/national/mp3-192/konsoleplayer
+Absolut Germany = https://absolut-germany.live-sm.absolutradio.de/absolut-germany/stream/mp3
+NDR Info Hamburg = https://icecast.ndr.de/ndr/ndrinfo/hamburg/mp3/128/stream.mp3?1728425407515&aggregator=web
+PartyHits = https://partyhits-high.rautemusik.fm/?ref=radio-browser-ph2
+1LIVE DIGGI -- (https) = https://wdr-1live-diggi.icecastssl.wdr.de/wdr/1live/diggi/mp3/128/stream.mp3
+Berliner Rundfunk = https://stream.berliner-rundfunk.de/brf/mp3-192/homepage/?mode=preroll&aw_0_1st.skey=1738238675&cb=16689425&listenerid=null
+hr1 Südhessen = https://dispatcher.rndfnk.com/hr/hr1/suedhessen/high
+hr3 Nordhessen = https://dispatcher.rndfnk.com/hr/hr3/nordhessen/high
+70's 80's 90's Riw Vintage Channel = https://stream.laut.fm/70s-80s-90s-riw-vintage-channel
+Progressive Trance Mix = https://stream.laut.fm/progressive-trance-mix
+ROCK ANTENNE Blues rock = https://stream.rockantenne.de/blues-rock/stream/mp3
+RPR1. Trier = https://stream.rpr1.de/trier/mp3-128/radiobrowser
+DEUTSCHE HITS = https://deutsche-hits-high.rautemusik.fm/?ref=radiobrowser
+BR Schlager = https://dispatcher.rndfnk.com/br/brschlager/live/mp3/mid
+Tango Berlin = https://tango.stream.laut.fm/tango
+HARDER = https://harder-high.rautemusik.fm/?ref=radiobrowser
+Epic Lounge = https://stream.epic-lounge.com/sleep-meditation?ref=radiobrowser
+Hitradio antenne 1 = https://konsolelabs.streamabc.net/94-a1stg-mp3-192-7580453
+Night Drive Radio – Synthwave & Retrowav = https://a5.asurahosting.com:7920/radio.mp3
+Best Of Rock.FM Hard Rock = https://bestofrockfm.stream.vip/hardrock/mp3-256/bestofrock.fm/
+GOLDIES = https://goldies-high.rautemusik.fm/?ref=radiobrowser
+RADIO BOB - 70er Rock = https://streams.radiobob.de/70errock/mp3-192/streams.radiobob.de/
+The WOLF = https://radio21.streamabc.net/radio21-radio21dabns-mp3-192-3908190
+tagesschau24 = https://icecast.tagesschau.de/ndr/tagesschau24/live/mp3/128/stream.mp3
+Classic Rock von 1A Radio = https://1a-classicrock.radionetz.de/1a-classicrock.mp3
+Sunshine Live Melodic Beats = https://stream.sunshine-live.de/MelodicB/mp3-192/stream.sunshine-live.de/
+Radio Gong 97.1 = https://frontend.streamonkey.net/fhn-gong971/stream/mp3
+ROCK ANTENNE 70er Rock = https://s2-webradio.rockantenne.de/70er-rock/stream/mp3
+Hirschmilch Radio = https://hirschmilch.de:7001/chillout.mp3
+I Love Music = https://ilm.stream27.radiohost.de/ilm_ilovechillhop_mp3-192?upd-meta&upd-scheme=https&_art=dD0xNzkzMTQ5MDY5JmQ9MWM4ZDYwMjYxNWJkM2I4YWU1NTY
+0 N - 50s on Radio = https://0n-50s.radionetz.de/0n-50s.mp3
+NIUS = https://radio.nius.de/live?ref=radio-browser
+1 A - Jazz von 1A Radio = https://1a-jazz.radionetz.de/1a-jazz.mp3
+80s80s Dark Wave = https://regiocast.streamabc.net/regc-80s80sdarkwave3426539-mp3-192-3262123?sABC=650srs31%231%232645n7p950564790903q59976ors7676%23ubzrcntr&context=fHA6LTE=&aw_0_1st.skey=1695543069&cb=579463699&listenerid=2645a7c950564790903d59976bef7676&aw_0_1st.playerid=homepage&amsparams=playerid:homepage;skey:1695543089
+EDM FESTIVAL = https://0nlineradio.radioho.st/0r-edm-festival?ref=rb26
+Bayern 1 Mainfranken = https://dispatcher.rndfnk.com/br/br1/mainfranken/mp3/mid
+Fußball-Bundesliga 2: Konferenz = https://wdr-sportschau-liga2konferenz.icecastssl.wdr.de/wdr/sportschau/liga2konferenz/mp3/high
+BEETHOVEN = https://0nlineradio.radioho.st/0r-beethoven?ref=radio-browser26
+Music of China 中国音乐 = https://vip.wongsong.cn/proxy/wongsong/stream-mp3-WongSong
+SWR4 Freiburg = https://liveradio.swr.de/sw282p3/swr4fr/
+0nlineradio VIVALDI = https://stream.0nlineradio.com/vivaldi?ref=radiobrowser
+Italo Disco = https://italo-disco.stream.laut.fm/italo-disco
+BREAKZ.FM = https://breakz-high.rautemusik.fm/?ref=radiobrowserinfo
+Hirschmilch Radio - Chillout = https://hirschmilch.de:7501/chillout.mp3
+CHOPIN by Epic Piano = https://stream.epic-piano.com/chopin?ref=radiobrowser
+hr1 Nordhessen = https://dispatcher.rndfnk.com/hr/hr1/nordhessen/high
+i love radio = https://ilm.stream35.radiohost.de/ilm_iloveusonlyrapradio_mp3-192?upd-meta&upd-scheme=https&_art=dD0xNzkzNDkyNzY5JmQ9ZDU0OGRiYmNjZjRjOWZmMDcyYmM
+FluxFM Chillhop – Chill Beats and LoFi H = https://streams.fluxfm.de/Chillhop/mp3-320/streams.fluxfm.de/
+Sportschau live: 1.Bundesliga = https://wdr-sportschau-liga1spiel7.icecastssl.wdr.de/wdr/sportschau/liga1spiel7/mp3/high?file=.mp3
+Absolut bella = https://absolut-bella.live-sm.absolutradio.de/absolut-bella/stream/mp3
+BreakZ HipHop & House = https://breakz-high.rautemusik.fm/?ref=radio-browser-info
+TOP40 = https://top40-high.rautemusik.fm/?ref=radiobrowser
+radio SAW Region Magdeburg/Altmark = https://stream.radiosaw.de/saw-magdeburg-altmark/mp3-192
+CHARTHITS~~ ChartHits.FM ~~ House = https://charthits-2012-high.rautemusik.fm/?ref=rb26
+rbb 24 INFORADIO ( mp3 = https://dispatcher.rndfnk.com/rbb/inforadio/live/mp3/mid

@@ -1,0 +1,46 @@
+# Going Public Server - station list: العربية (ar)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# https MP3 streams only, each one checked. The game loads nothing over http.
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+إذاعة مشاري العفاسي = https://qurango.net/radio/mishary_alafasi
+إذاعة محمود خليل الحصري = https://qurango.net/radio/mahmoud_khalil_alhussary_warsh
+إذاعة ياسر الدوسري = https://qurango.net/radio/yasser_aldosari
+Exclusively Pink Floyd = https://streaming.exclusive.radio/er/pinkfloyd/icecast.audio
+Radio Mars = https://radiomars.ice.infomaniak.ch/radiomars-128.mp3
+إذاعة مصطفى إسماعيل = https://qurango.net/radio/mustafa_ismail
+Radio Liban Libre = https://edge.mixlr.com/channel/qtqeb
+SHA3BY FM = https://radio95.radioca.st/;
+Marrakechplus = https://cast5.my-control-panel.com/proxy/marrakec/stream
+Jil FM = https://webradio1.tda.dz:8001/Jeunesse_64K.mp3
+Radio MFM = https://a5.asurahosting.com:7980/radio.mp3
+Radio 9090 = https://9090streaming.mobtada.com/9090FMEGYPT
+diwanfm = https://streaming.diwanfm.net/stream
+تراتيل قصيرة متميزة = https://qurango.net/radio/tarateel
+صور من حياة الصحابة = https://qurango.net/radio/sahabah
+Mosaique FM Tarab = https://radio.mosaiquefm.net/mosatarab
+El Bahdja - الجزائر العاصمة = https://webradio3.tda.dz:8001/ElBahdja_64K.mp3
+إذاعة القرآن الكريم (مكة المكرمة) = https://edge.mixlr.com/channel/rwumx
+Classical Radio - Mozart = https://drive.uber.radio/uber/crmozart/icecast.audio
+Al Bal Radio = https://albal-lbnet2.radioca.st/stream
+Voice of Lebanon (Sawtlebnan) Radio = https://l3.itworkscdn.net/itwaudio/9054/stream
+Hits 1 Algérie = https://radio12.pro-fhi.net/listen/whmnrlow/stream
+Mosaique FM = https://radio.mosaiquefm.net/mosalive
+إذاعة الأخبار كل 5 دقائق REPLAY NEWS = https://replaynewsar.ice.infomaniak.ch/replaynewsar-128.mp3
+Hit Radio (Morocco) = https://hitradio-maroc.ice.infomaniak.ch/hitradio-maroc-128.mp3
+Radio Hits 88.2 Cairo = https://radiohits882.radioca.st/;
+Radio Manarat = https://listen.radioking.com/radio/252934/stream/297385
+Mp3Quran Main = https://qurango.net/radio/mix
+Zitouna Zitouna FM = https://radio.radiotunisienne.tn/radiozaitouna
+AlifAlif FM = https://alifalifjobs.com/radio/8000/AlifAlifLive.mp3
+Algérie Internationale الجزائر الدولية = https://webradio3.tda.dz:8001/Internationale_64K.mp3
+صوت كل لبنان = https://audio.osina.cloud:9323/stream
+Antinea Radio = https://listen.radioking.com/radio/6640/stream/347
+الكويت - البرنامج الثاني = https://montecarlodoualiya128k.ice.infomaniak.ch/mc-doualiya.mp3
+Radio Express FM = https://expressfm.ice.infomaniak.ch/expressfm-64.mp3
+Fame FM Lebanon = https://l3.itworkscdn.net/itwaudio/9044/stream
+France Maghreb 2 = https://francemaghreb2.ice.infomaniak.ch/francemaghreb2-high.mp3
+Exclusive Radio – Black Sabbath = https://streaming.exclusive.radio/er/blacksabbath/icecast.audio
+Aziz Mustaphi = https://d3ctxlq1ktw2nl.cloudfront.net/production/2022-0-3/240607172-44100-2-afb2485b0c30e.mp3
+Chaine 1 القناة الأولى = https://webradio1.tda.dz:8001/Chaine1_64K.mp3

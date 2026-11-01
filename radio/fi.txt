@@ -1,0 +1,46 @@
+# Going Public Server - station list: Suomi (fi)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# https MP3 streams only, each one checked. The game loads nothing over http.
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+Ysäri = https://stream-redirect.bauermedia.fi/ysari/ysari_128.mp3?aw_0_1st.bauer_loggedin=false&aw_0_1st.playerid=BMUK_tunein
+Järviradio = https://jarviradio.radiotaajuus.fi:9000/jr
+Radio Keskisuomalainen = https://cast.radiokeskisuomalainen.fi/radiokeskisuomalainen
+Järviradio Puhe = https://jarviradio.radiotaajuus.fi:9000/jrpuhe
+Radio Helsinki = https://stream.radiohelsinki.fi/stream
+Doubleclap Radio = https://s3.radio.co/scfd7273b2/listen
+Sea FM = https://s3.myradiostream.com/4976/listen.mp3
+Karjalainen Syke = https://radio.diks.fi/karjalainensyke
+Savon Aallot = https://cast.savonaallot.fi/savonaallot
+Radio 957 = https://stream-redirect.bauermedia.fi/radio957/radio957_128.mp3?aw_0_1st.bauer_loggedin=false&aw_0_1st.playerid=BMUK_tunein
+RADIO SANDELS = https://radiosandels.radiotaajuus.fi:9050/radio
+Radio Dei Kajaani = https://stream.dei.fi:8443/kajaani
+Radio Helsinki 98,5 Mhz = https://tunein-ondemand.cdnstream1.com/multi_bump_sonic_pre_pre.mp3?aw_0_1st.playerid=LogitechSqueeze&aw_0_1st.skey=1793506616&aw_0_1st.abtest=&partnerId=LogitechSqueeze&aw_0_1st.stationId=s97243&aw_0_1st.premium=false&source=TuneIn&aw_0_req.gdpr=true&aw_0_1st.platform=tunein&aw_0_1st.genre_id=g22&aw_0_1st.class=music&aw_0_1st.ads_partner_alias=ce.LogitechSqueezebox&aw_0_azn.planguage=en%2cfi&aw_0_1st.is_ondemand=false&aw_0_1st.topicId=na&aw_0_1st.bandId=2&delivery=1
+FugeFM = https://streaming.broadcast.radio/fugefm
+Radio Voima = https://cast2.radiovoima.fi/voima.mp3
+Kerhoradio = https://c40.radioboss.fm:8056/stream
+Radio Dei Lahti = https://stream.dei.fi:8443/lahti
+Radio Sun = https://st.downtime.fi/sun.mp3
+Radio Boofi = https://radio.iranian.fi/listen/vip/radio.mp3
+Radio Moreeni = https://moreenistream.tuni.fi/moreeni.mp3
+HYPR demoscene radio = https://hypr.website/hypr.mp3
+Radio Classic = https://streaming.radioplay.fi/fi_classic_128.mp3
+Radio Auran Aallot = https://streaming.radioplay.fi/fi_auranaallot_128.mp3
+Radio Vaasa = https://stream.protonbroadcast.com:8443/radiovaasa.mp3
+FinnRadio = https://servidor39-5.brlogic.com:7076/live
+Kesäseuraradio = https://kesaseuraradio.out.airtime.pro/kesaseuraradio_b
+Radio Tempo = https://cast.radiotempo.fi/radiotempo
+REPLAY NEWS - Suomi = https://replaynewsfi.ice.infomaniak.ch/replaynewsfi-128.mp3
+Radio Ramona = https://stream.protonbroadcast.com:8443/ramona.mp3
+Fin Est FM = https://shoutcast.finestfm.fi/;
+Radio Kaakko = https://wr2.downtime.fi/kaakko.mp3
+Radio Tuottaja1 = https://kaupunkiradio.radiotaajuus.fi:9013/radio
+Radio Patmos = https://s3.yesstreaming.net:7011/radio
+Radio Pori = https://stream-redirect.bauermedia.fi/radiopori/radiopori_128.mp3?aw_0_1st.bauer_loggedin=false&aw_0_1st.playerid=BMUK_tunein
+Radio City = https://streaming.radioplay.fi/fi_radiocity_128.mp3
+SuomiRap = https://streaming.radioplay.fi/fi_suomirap_128.mp3
+Tekoälyradio = https://streaming.radioplay.fi/fi_tekoalyradio_128.mp3
+Radio Mega = https://streaming.radioplay.fi/fi_radiomega_128.mp3
+Radio Santa Claus = https://streaming.radiostreamlive.com/radiosantaclaus_devices
+Radio City Kiekkoradio = https://wr2.downtime.fi/kiekko.mp3
