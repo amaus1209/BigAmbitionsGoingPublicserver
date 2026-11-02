@@ -463,6 +463,54 @@
         "EnumValues": {}
     },
     {
+        "DisplayName": "Warning before AMP stops the server",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "When AMP stops, restarts or updates the server (its buttons and the schedule) while players are on, they are warned first - at 60, 30 and 10 seconds - and the world is saved after. 0 = at once. At most 90 (AMP waits 150 seconds for the server). For a longer warning, send \"restart <minutes>\" in the console or from the schedule.",
+        "Keywords": "stop,restart,warning,shutdown",
+        "FieldName": "StopWarnSeconds",
+        "InputType": "number",
+        "ParamFieldName": "$.StopWarnSeconds",
+        "DefaultValue": "60",
+        "EnumValues": {}
+    },
+    {
+        "DisplayName": "Steam: only players who own the game",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "Lets in only players whose Steam account owns Big Ambitions: the server asks Steam about a ticket each player's game sends when joining - a Steam emulator cannot make one; Family Sharing counts. Needs the Steam Web API key below. If Steam does not answer, the player is let in and the log says so.",
+        "Keywords": "steam,owner,emulator,piracy",
+        "FieldName": "SteamOwnerCheck",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.SteamOwnerCheck",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
+        "DisplayName": "Steam Web API key",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "For the ownership check: a key from steamcommunity.com/dev/apikey (any Steam account that has bought something on Steam can create one; any domain name will do). It stays on this server and never goes to the players.",
+        "Keywords": "steam,api,key",
+        "FieldName": "SteamWebApiKey",
+        "InputType": "text",
+        "ParamFieldName": "$.SteamWebApiKey",
+        "DefaultValue": "",
+        "EnumValues": {}
+    },
+    {
+        "DisplayName": "Steam: friends can join",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "Players on this server tell Steam where they play: their Steam friends see Join Game and Invite to Game and get onto this server with one click - the address and the server key go to them over Steam. Not for players connected by a local (LAN) address. Off = no Join Game for this server.",
+        "Keywords": "steam,friends,join,invite",
+        "FieldName": "SteamFriendJoin",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.SteamFriendJoin",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
         "DisplayName": "Accept joins automatically",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Server:dns:1",
@@ -758,10 +806,22 @@
         "EnumValues": {}
     },
     {
+        "DisplayName": "Navigation: sat-nav in the phone",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Modules:extension:5",
+        "Description": "While the self-driving drives or a player's character walks to the destination by itself, the sat-nav fills the BizPhone's screen below the music player. Off = it stays on top of the phone, so the phone's apps stay in sight.",
+        "Keywords": "navi,phone,bizphone",
+        "FieldName": "NavPhone",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.NavPhone",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
         "DisplayName": "Radio station list",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Modules:extension:5",
-        "Description": "Internet radio for every player on this server: the station list in this language comes from GitHub (radio/<language>.txt in the template repository) and shows in the phone's Radio app and on the car radio - https streams only. The players' own streams.txt comes first. Off = only their own.",
+        "Description": "Internet radio for every player on this server: the station list in this language comes from GitHub (radio/<language>.txt in the template repository) and shows in the phone's Radio app and on the car radio - MP3 streams, http and https. The players' own streams.txt comes first. Off = only their own.",
         "Keywords": "radio,stream,music",
         "FieldName": "RadioList",
         "InputType": "enum",

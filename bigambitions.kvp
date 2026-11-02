@@ -46,7 +46,7 @@ App.CommandLineParameterFormat=-{0}={1}
 App.CommandLineParameterDelimiter=
 App.ExitMethod=String
 App.ExitTimeout=150
-App.ExitString=stop
+App.ExitString=stop warn
 App.ExitFile=app_exit.lck
 App.HasWriteableConsole=True
 App.HasReadableConsole=True
@@ -93,13 +93,13 @@ Console.ThrowawayMessageRegex=^(?!.*\[BAMP-HEADLESS\]).*(Shader|wine: |fixme:|As
 Console.AppReadyRegex=^.*\[BAMP-HEADLESS\] READY .*$
 Console.UserJoinRegex=^.*\[BAMP-HEADLESS\] JOIN (?<username>.+)$
 Console.UserLeaveRegex=^.*\[BAMP-HEADLESS\] LEAVE (?<username>.+)$
-Console.UserChatRegex=^$
+Console.UserChatRegex=^.*\[BAMP-HEADLESS\] CHAT (?<username>[^:]+): (?<message>.+)$
 Console.UpdateAvailableRegex=^$
 Console.MetricsRegex=^$
-Console.ServerInfoRegex=^.*\[Server\] Info: (?:Port=(?<Spiel_Port>\S+) \| )?Schluessel=(?<Server_Password>\S+) \| Version=(?<Server_Version>\S+)$
+Console.ServerInfoRegex=^.*\[Server\] Info: (?:Port=(?<Spiel_Port>\S+) \| )?Schluessel=(?<Server_Password>\S+) \| Version=(?<Server_Version>\S+)(?: \| Admin=(?<Admin_Seite>\S+))?$
 Console.SuppressLogAtStart=False
 Console.ActivateLogRegex=
-Console.UserActions={}
+Console.UserActions={"Kick":"kick ${Name}","Ban":"ban ${Name}"}
 Limits.SleepMode=False
 Limits.SleepOnStart=False
 Limits.SleepDelayMinutes=5
