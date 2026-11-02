@@ -41,11 +41,19 @@ with the **Going Public Server** mod
 <!-- Going Public Server 1.0.13+ shows every heading of this section as a card in the game's News panel on the
      main menu, newest first. German: the section "Neuigkeiten" in the German part. -->
 
+### Going Public Server 1.0.16.3
+- **Steam: only owners of the game** (AMP switch, with a Steam Web API key): the server lets in only players whose Steam account owns Big Ambitions - it has Steam confirm a ticket each player's game sends when joining, and a Steam emulator cannot make one. Family Sharing counts.
+- **Steam: friends can join**: while you play on a server, your Steam friends see "Join Game" on you (and you can invite them) and land on the same server with one click - address and server key included. The admin can switch it off in AMP.
+- **AMP switch "Navigation: sat-nav in the phone"**: whether the sat-nav fills the BizPhone while the self-driving drives (off = it stays on top of the phone).
+- **Admin page** on the ranking site (sign-in with the AMP account): players online with message, kick and ban (with a reason), the chat to read and write, the ban list with unban, announcements on every player's screen, save, and a restart now or announced in a few minutes (the players are warned). `kick` now only puts a player out; the chat shows in AMP's console, and AMP's player list has Kick and Ban.
+
 ### Going Public Server 1.0.16.2
-- **Internet radio plays**: in 1.0.16.1 every stream stayed silent (the game engine cannot play an endless MP3 stream) - the mod now decodes the streams itself. http and https stations; the song that plays shows under the station's name.
+- **Internet radio plays**: in 1.0.16.1 every stream stayed silent (the game engine cannot play an endless MP3 stream) - the mod now decodes the streams itself. http and https stations; the song that plays shows under the station's name; an "Alphabetical" switch sorts the stations by name.
 - **Radio on foot**: a switch in the phone's Radio tab - the radio keeps playing out of the car, also without headphones; inside buildings it is silent (the loudspeakers play there).
 - **Shop loudspeakers** play internet stations too: in your shop, the Radio tab picks for "Shop loudspeakers", and a loudspeaker's "Next station" goes on into the internet stations. Everybody in the shop hears the same station; the server keeps it with the world.
+- **Radio tab**: favourites with a heart (they stand at the top, and "next station" goes through them), a search field, a clear word when a station sends AAC or HLS instead of MP3.
 - **Passengers** hear the driver's station (internet stations too); after getting out their own radio plays again.
+- **Navigation device**: with a destination set, a small sat-nav in the game's own look on top of the BizPhone (filling its screen while the self-driving drives or you walk there automatically) shows the next turn, the streets around you with the route and the distance left (the map shows the whole route). Routes change lanes where the game's lanes are not linked (no more driving to the end of the road before turning, as at the harbour), turn from the outer lane and keep right. A drive shows in blue, a walk in orange - on the map and in the sat-nav.
 - AMP shows the server key and version again (they vanished from the console once the world was up).
 
 ### Going Public Server 1.0.16.1
@@ -148,10 +156,19 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
   **Network rate** (Normal 10 / 5 Hz, High 20 / 10 Hz, Very high 30 / 15 Hz, Maximum 60 / 30 Hz - how often
   positions, cars and traffic go over the network; higher drives more smoothly, and since every player's stream goes
   to every other player, the data grows quickly with more players).
+- **Warning before AMP stops the server** (on the Server tab): when AMP stops, restarts or updates the server while
+  players are on, they are warned first (default 60 s, at 60, 30 and 10 s), then the world is saved. Announcements and a
+  longer announced restart from AMP itself: in the console `notice <text>` and `restart <minutes>` (`restart cancel`), or
+  as a task "Send console message" with those commands in the instance's **Schedule** (e.g. every day at 4:00
+  `restart 5`).
+- **Steam** (on the Server tab): **only players who own the game** - needs a **Steam Web API key** from
+  steamcommunity.com/dev/apikey (any Steam account that has bought something can make one; it stays on the server) -
+  and **friends can join** (the players' Steam friends see Join Game).
 - **New world**: name and difficulty (Easy, Normal, Hard or Custom - the Custom values have their own tab). They only
   count when the server creates that world (it does not exist yet).
-- **Modules**: switch each built-in module on or off for everybody. **RPG camera** and the navigation's route line are
-  the same for every player on the server. **Radio station list**: the language of the radio stations every player gets
+- **Modules**: switch each built-in module on or off for everybody. **RPG camera**, the navigation's route line and
+  whether the sat-nav goes into the phone (while self-driving or walking there by itself) are the same for every player
+  on the server. **Radio station list**: the language of the radio stations every player gets
   (the files in `radio/` of this repository - edit one to change that list for everybody; Off = none).
 - **Game rules**: rent from owned buildings, building prices, bank loan limit and business sale.
 
@@ -165,6 +182,12 @@ Instances run in containers and cannot reach AMP's web folder, so small jobs run
 17 4 * * * ~/.ampdata/instances/<instance>/bigambitions/bamp-tools/backup-saves.sh --all >> ~/backups/saves/backup.log 2>&1
 ```
 
+- **Admin page**: `https://<your AMP address>/monitor/<game port>/index.html#admin` - in AMP on the instance's status
+  page as "Admin Seite" under the Connection Link, on the ranking page as *Admin* at the top right and below the table -
+  sign in with your AMP account; in AMP it needs the right to use that instance's console. Players online
+  (message, kick, ban with a reason), the chat (read along, write as the server or to one player), the ban list
+  (unban, unban everyone), save and restart. In AMP itself the chat shows in the console, and the player list has Kick
+  and Ban.
 - `bamp-web-sync.sh` serves each instance's ranking at `https://<your AMP address>/monitor/<game port>/index.html`
   (the instance's Connection Link); players open it with their server's key. Merged companies show as "merged with ...". Below the ranking, **Server**
   shows the last hour: network traffic in and out, messages, server FPS, the network rate, throttled players and each
@@ -206,11 +229,19 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 
 ### Neuigkeiten
 
+#### Going Public Server 1.0.16.3
+- **Steam: nur mit gekauftem Spiel** (AMP-Schalter, mit Steam-Web-API-Schlüssel): Der Server lässt nur Spieler herein, deren Steam-Konto Big Ambitions besitzt – er lässt sich von Steam ein Ticket bestätigen, das das Spiel jedes Spielers beim Beitreten mitschickt; ein Steam-Emulator kann keines ausstellen. Die Familienbibliothek zählt.
+- **Steam: Freunde können beitreten**: Spielst du auf einem Server, sehen deine Steam-Freunde bei dir „Spiel beitreten“ (und du kannst sie einladen) und landen mit einem Klick auf demselben Server – mit Adresse und Server-Schlüssel. Der Admin kann es in AMP abschalten.
+- **AMP-Schalter „Navigation: Navi im Handy“**: ob das Navi beim Autopiloten den BizPhone-Bildschirm füllt (aus = es bleibt über dem Handy).
+- **Admin-Seite** auf der Rangliste (Anmeldung mit dem AMP-Konto): Spieler online mit Nachricht, Kicken und Bannen (mit Grund), der Chat zum Mitlesen und Schreiben, die Bannliste mit Entbannen, Ankündigungen auf dem Bildschirm aller Spieler, Speichern und ein Neustart sofort oder in ein paar Minuten angekündigt (die Spieler werden gewarnt). `kick` wirft jetzt nur noch hinaus; der Chat steht in der AMP-Konsole, und AMPs Spielerliste hat die Knöpfe Kick und Ban.
+
 #### Going Public Server 1.0.16.2
-- **Internetradio spielt**: In 1.0.16.1 blieb jeder Stream stumm (die Spiel-Engine kann keinen endlosen MP3-Stream abspielen) - die Mod dekodiert die Streams jetzt selbst. http- und https-Sender; unter dem Sendernamen steht das laufende Lied.
+- **Internetradio spielt**: In 1.0.16.1 blieb jeder Stream stumm (die Spiel-Engine kann keinen endlosen MP3-Stream abspielen) - die Mod dekodiert die Streams jetzt selbst. http- und https-Sender; unter dem Sendernamen steht das laufende Lied; der Schalter „Alphabetisch“ sortiert die Sender nach Namen.
 - **Radio zu Fuß**: ein Schalter im Radio-Tab des Handys - das Radio spielt auch außerhalb des Autos weiter, auch ohne Kopfhörer; in Gebäuden ist es still (dort spielen die Lautsprecher).
 - **Laden-Lautsprecher** spielen auch Internetsender: Im eigenen Laden wählt der Radio-Tab für „Laden-Lautsprecher“, und „Nächster Sender“ am Lautsprecher geht nach den Sendern des Spiels durch die Internetsender. Alle im Laden hören denselben Sender; der Server merkt ihn sich mit der Welt.
+- **Radio-Tab**: Favoriten mit Herz (stehen oben, „Nächster Sender“ geht durch sie), ein Suchfeld, eine klare Meldung, wenn ein Sender AAC oder HLS statt MP3 sendet.
 - **Mitfahrer** hören den Sender des Fahrers (auch Internetsender); nach dem Aussteigen läuft wieder ihr eigenes Radio.
+- **Navigationsgerät**: Ist ein Ziel gesetzt, zeigt ein kleines Navi im Stil des Spiels über dem BizPhone (beim Autopiloten und beim automatischen Hinlaufen füllt es den BizPhone-Bildschirm) die nächste Abbiegung, die Straßen um dich herum mit der Route und die Restentfernung (die Karte zeigt die ganze Route). Die Route wechselt die Spur auch dort, wo die Spuren im Spiel nicht verbunden sind (kein Fahren mehr bis ans Straßenende vor dem Abbiegen, wie am Hafen), biegt von der äußeren Spur ab und hält sich rechts. Mit dem Auto ist die Route blau, zu Fuß orange - auf der Karte und im Navi.
 - AMP zeigt Serverschlüssel und Version wieder (sie verschwanden aus der Konsole, sobald die Welt geladen war).
 
 #### Going Public Server 1.0.16.1
@@ -319,12 +350,26 @@ Server dann (wenige Sekunden).
   Spieler sowie **Netzwerk-Takt** (Normal 10 / 5 Hz, Hoch 20 / 10 Hz, Sehr hoch 30 / 15 Hz, Maximal 60 / 30 Hz – wie
   oft Positionen, Autos und Verkehr über das Netz gehen; höher fährt sich flüssiger, und weil der Strom jedes Spielers
   an jeden anderen geht, wächst die Datenmenge mit mehr Spielern schnell).
+- **Vorwarnung, bevor AMP den Server stoppt** (Reiter Server): Stoppt, startet oder aktualisiert AMP den Server, während
+  Spieler da sind, werden sie erst gewarnt (Standard 60 s, bei 60, 30 und 10 s), dann wird gespeichert. Ankündigungen und
+  einen länger angekündigten Neustart aus AMP selbst: in der Konsole `notice <Text>` und `restart <Minuten>`
+  (`restart cancel`), oder im **Zeitplan** der Instanz als Aufgabe „Konsolennachricht senden“ mit diesen Befehlen (z. B.
+  täglich um 4:00 `restart 5`).
+- **Steam** (Reiter Server): **nur mit gekauftem Spiel** – braucht einen **Steam-Web-API-Schlüssel** von
+  steamcommunity.com/dev/apikey (jedes Steam-Konto mit einem Kauf kann einen erstellen; er bleibt auf dem Server) –
+  und **Freunde können beitreten** (die Steam-Freunde der Spieler sehen „Spiel beitreten“).
 - **Neue Welt**: Name und Schwierigkeit (Einfach, Normal, Schwer oder Benutzerdefiniert – die benutzerdefinierten Werte
   haben einen eigenen Reiter). Sie zählen nur, wenn der Server diese Welt anlegt (es gibt sie noch nicht).
-- **Module**: jedes eingebaute Modul für alle an- oder ausschalten. **RPG-Kamera** und die Routenlinie der Navigation
-  sind auf dem Server für alle Spieler gleich. **Radio-Senderliste**: die Sprache der Radiosender, die alle Spieler
+- **Module**: jedes eingebaute Modul für alle an- oder ausschalten. **RPG-Kamera**, die Routenlinie der Navigation und
+  ob das Navi beim Autopiloten oder automatischen Hinlaufen ins Handy geht, sind auf dem Server für alle Spieler gleich. **Radio-Senderliste**: die Sprache der Radiosender, die alle Spieler
   bekommen (die Dateien in `radio/` dieses Repos - wer eine ändert, ändert die Liste für alle; Off = keine).
 - **Spielregeln**: Miete aus eigenen Gebäuden, Gebäudepreise, Kreditrahmen der Bank und Geschäftsverkauf.
+
+**Admin-Seite:** `https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html#admin` – in AMP auf der Statusseite der Instanz
+als „Admin-Seite“ unter dem Verbindungslink, auf der Rangliste oben rechts („Admin“) und unter der Tabelle – Anmeldung mit dem AMP-Konto; es braucht in AMP das Recht, die Konsole dieser Instanz zu benutzen. Spieler
+online (Nachricht, Kicken, Bannen mit Grund), der Chat (mitlesen, als Server oder an einen Spieler schreiben), die
+Bannliste (Entbannen, alle entbannen), Speichern und Neustart. In AMP selbst steht der Chat in der Konsole, und die
+Spielerliste hat die Knöpfe Kick und Ban.
 
 **Auf dem Host (Cron, siehe oben):** `bamp-web-sync.sh` stellt die Rangliste jeder Instanz unter
 `https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html` bereit (der Verbindungslink der Instanz) (fusionierte Firmen stehen als „fusioniert mit …“ dabei) und legt
@@ -347,6 +392,7 @@ eingebauten Module sind eigene Umsetzungen nach dem Vorbild dieser Workshop-Mods
 RPG Camera von Chamiks, BAScheduler von Shanpapa, SmartSuite Empire Management (SmartInsights, SmartRent) von
 ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ und Voogle Route mit LIB BA Player Location und LIB BA Unified UI von - Capitaine -. Vielen Dank an ihre
 Autoren. Big Ambitions gehört Hovgaard Games; jeder Spieler und auch der Server brauchen eine eigene Lizenz des Spiels.
+
 
 
 
