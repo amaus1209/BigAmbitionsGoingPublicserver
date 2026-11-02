@@ -347,3 +347,126 @@ eingebauten Module sind eigene Umsetzungen nach dem Vorbild dieser Workshop-Mods
 RPG Camera von Chamiks, BAScheduler von Shanpapa, SmartSuite Empire Management (SmartInsights, SmartRent) von
 ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ und Voogle Route mit LIB BA Player Location und LIB BA Unified UI von - Capitaine -. Vielen Dank an ihre
 Autoren. Big Ambitions gehört Hovgaard Games; jeder Spieler und auch der Server brauchen eine eigene Lizenz des Spiels.
+
+
+
+Going Public Server - Windows
+=============================
+Big-Ambitions-Mehrspieler-Server mit Weboberfläche, ohne AMP. (English below.)
+
+START
+  1. Den Ordner GoingPublicServer an einen festen Ort entpacken, z. B. C:\GoingPublicServer (etwa 10 GB frei).
+  2. GoingPublicServer.exe starten. Windows-SmartScreen: "Weitere Informationen" -> "Trotzdem ausführen".
+     Die Windows-Firewall fragt nach dem Netzwerkzugriff: zulassen.
+  3. Beim ersten Start erscheint ein FENSTER mit den Zugangsdaten zur Weboberfläche (Adresse, Benutzer, Passwort).
+     Das Passwort wird nur dieses eine Mal angezeigt.
+  4. Im Browser http://localhost:8080 öffnen und anmelden.
+  5. Installation: das Spiel laden - mit dem Steam-Konto, das Big Ambitions besitzt (bei Steam Guard den Code eingeben).
+  6. Einstellungen: Welt wählen oder unter "New world" eine neue anlegen. Übersicht: Starten.
+  7. Im Router UDP 7777 (Spiel) zu diesem PC weiterleiten. Spieler treten mit deiner Adresse, Port 7777 und dem
+     Server-Schlüssel bei. TCP 8080 (Weboberfläche) nur freigeben, wenn du sie von außen brauchst.
+
+GUT ZU WISSEN
+  - Das schwarze Fenster ist die Verwaltung. Schließen stoppt den Server (er speichert und beendet sich).
+  - Passwort vergessen: Reset-Password.bat starten - das neue Passwort erscheint wieder in einem Fenster.
+  - Der Server läuft ohne Steam-Client; ein Steam, das auf diesem PC läuft, bleibt dein eigenes.
+  - Mods des Servers: server\mods (nur Going Public Server und was du dazulegst - getrennt von deinen eigenen Mods).
+  - Spielstände: Windows legt sie für jedes Big Ambitions dieses Windows-Kontos in
+    %USERPROFILE%\AppData\LocalLow\Hovgaard Games\Big Ambitions ab, die Server-Welten unter SaveGames\_BAMP_MP.
+    Spielst du selbst auf demselben Windows-Konto, teilen sich Spiel und Server diesen Ordner - am saubersten läuft
+    der Server auf einem eigenen PC oder unter einem eigenen Windows-Konto.
+  - Update: das neue Paket über diesen Ordner entpacken (GoingPublicServer.exe vorher beenden). Server-Dateien allein:
+    Weboberfläche -> Installation -> "Von GitHub aktualisieren".
+
+-------------------------------------------------------------------------------------------------------------------------
+
+START: unpack the folder (e.g. C:\GoingPublicServer, about 10 GB free), run GoingPublicServer.exe (SmartScreen: More
+info -> Run anyway; allow the firewall). The ACCESS DATA appear in a WINDOW at the first start - only once. Open
+http://localhost:8080, log in; Installation: download the game with the Steam account that owns Big Ambitions;
+Settings: choose or create a world; Overview: Start. Forward UDP 7777 to this PC.
+Closing the black window stops the server (it saves). Forgot the password: run Reset-Password.bat.
+
+
+# Going Public Server – Docker-Vorlage
+
+Big-Ambitions-Mehrspieler-Server mit Weboberfläche in einem Container (Debian 13, Proton GE, Xvfb). *(English below.)*
+
+## Start
+
+```sh
+docker compose up -d --build
+docker compose logs goingpublicserver      # die ZUGANGSDATEN stehen hier - nur beim ersten Start
+```
+
+Das Image holt sich das Programm aus `GoingPublicServer-<Version>-Linux.tar.gz` neben dem `Dockerfile` – liegt keine
+Datei da, lädt es das Release von GitHub.
+
+Danach im Browser `http://<dieser Rechner>:8080`:
+
+1. anmelden;
+2. **Installation**: das Spiel laden, mit dem Steam-Konto, das Big Ambitions besitzt (bei Steam Guard den Code eingeben), und
+   **Proton GE** installieren;
+3. **Einstellungen**: eine Welt wählen oder unter „New world“ eine neue anlegen;
+4. **Übersicht**: Starten. Spieler treten mit der Adresse des Rechners, Port 7777 und dem Server-Schlüssel bei.
+
+## Gut zu wissen
+
+| | |
+|---|---|
+| Neues Passwort | `docker compose exec goingpublicserver gps reset-password` – erscheint im Terminal |
+| Daten | `./data` (Spiel ~7 GB, Proton, Spielstände, Einstellungen, Backups) – gehört `PUID`/`PGID` (Standard 1000) |
+| Ports | `8080/tcp` Weboberfläche (von außen nur hinter HTTPS/VPN), `7777/udp` Spiel – muss zur Einstellung „Game Port“ passen |
+| Stoppen | `docker compose stop` – der Server speichert vorher (bis zu 5 min Zeit, `stop_grace_period`) |
+| Update | neues Paket neben das `Dockerfile`, Version in `docker-compose.yml`, dann `docker compose up -d --build` |
+| Sprache | `GPS_LANG: de` oder `en` (Meldungen der Verwaltung); die Weboberfläche schaltet selbst um |
+
+---
+
+**English:** `docker compose up -d --build`, then `docker compose logs goingpublicserver` shows the access data (once).
+Open `http://<this machine>:8080`, log in, download the game under Installation (Steam account that owns Big Ambitions)
+and install Proton GE, choose or create a world under Settings, then Start. New password:
+`docker compose exec goingpublicserver gps reset-password`. Data live in `./data`; ports 8080/tcp (web) and 7777/udp (game).
+
+Going Public Server - Linux
+===========================
+Big-Ambitions-Mehrspieler-Server mit Weboberfläche, ohne AMP. (English below.)
+
+INSTALLATION (Debian / Ubuntu, 64 Bit, systemd)
+  tar -xzf GoingPublicServer-*-Linux.tar.gz
+  cd GoingPublicServer-*-Linux
+  sudo ./install.sh                 Optionen: --port 8080  --lang de|en  --data /var/lib/goingpublicserver
+
+  Das Skript installiert die Pakete (Bibliotheken für Proton GE, Xvfb, python3, 32-Bit-Teile für SteamCMD), den
+  Benutzer "goingpublic", das Programm nach /opt/goingpublicserver und den Dienst "goingpublicserver".
+  Am Ende stehen die ZUGANGSDATEN zur Weboberfläche im Terminal - nur dieses eine Mal.
+
+DANACH (im Browser, http://<Server-IP>:8080)
+  1. Anmelden.
+  2. Installation: Spiel laden - mit dem Steam-Konto, das Big Ambitions besitzt (bei Steam Guard den Code eingeben).
+  3. Installation: Proton GE installieren (führt das Windows-Spiel aus).
+  4. Einstellungen: Welt wählen oder unter "New world" eine neue anlegen.
+  5. Übersicht: Starten. Spieler treten mit Adresse, Port 7777 und dem Server-Schlüssel bei.
+  Freigeben: UDP 7777 (Spiel). TCP 8080 (Weboberfläche) nur, wenn nötig - von außen besser hinter HTTPS/VPN.
+
+BEFEHLE
+  systemctl status goingpublicserver        Zustand        journalctl -u goingpublicserver -f   Log
+  sudo goingpublicserver reset-password     neues Passwort (erscheint im Terminal)
+  sudo ./install.sh                         Update (Programm und Server-Dateien; Daten bleiben)
+  sudo ./install.sh --uninstall [--purge]   entfernen (--purge: auch Spiel, Spielstände, Backups)
+
+ORDNER
+  /opt/goingpublicserver          Programm
+  /var/lib/goingpublicserver      Daten: server/1331550 (Spiel), server/mods (Mods), server/prefix (Spielstände unter
+                                  ...LocalLow/Hovgaard Games/Big Ambitions/SaveGames/_BAMP_MP), backups/, manager/
+
+-------------------------------------------------------------------------------------------------------------------------
+
+INSTALL (Debian / Ubuntu, 64 bit, systemd)
+  sudo ./install.sh  [--port 8080] [--lang de|en] [--data DIR]
+  The ACCESS DATA of the web interface appear at the end, in this terminal - only once.
+THEN, in the browser (http://<server IP>:8080): log in; Installation: download the game with the Steam account that
+  owns Big Ambitions, install Proton GE; Settings: choose or create a world; Overview: Start. Open UDP 7777.
+COMMANDS: systemctl status goingpublicserver · journalctl -u goingpublicserver -f ·
+  sudo goingpublicserver reset-password · sudo ./install.sh (update) · sudo ./install.sh --uninstall [--purge]
+
+
