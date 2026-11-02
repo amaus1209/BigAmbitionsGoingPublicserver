@@ -25,13 +25,16 @@ with the **Going Public Server** mod
 
 ## Important
 
-- **The server runs on AMP only** (Linux, headless, under Proton). There is no other server download yet. Players
-  can no longer host a game themselves: multiplayer means joining a dedicated server.
+- **The server comes in several variants** (Releases on this page): the AMP template described below (Linux,
+  headless, under Proton), and a program of its own with a web interface for **Windows** and **Linux**, and as a
+  **Docker** container (`GoingPublicServer-<version>-Windows.zip`, `-Linux.tar.gz`, `-Docker.zip`). Players can no
+  longer host a game themselves: multiplayer means joining a dedicated server.
 - **Server and players need the same version.** Steam keeps the players' subscription up to date; update the AMP
   instance when a new release is out (the server refuses other versions).
 - **No other mods on the server.** The server runs Going Public Server and nothing else: leave AMP's
   *Steam Workshop Items* empty and put nothing into `bamp-mods-extra/`. The built-in modules replace Immersion,
-  BAScheduler, SmartSuite and VoogleRoute - players should not run those mods at the same time either.
+  BAScheduler, SmartSuite, VoogleRoute, Big Ambitions Radio and Aluna's Phone Pages - players should not run other
+  mods with Going Public Server either.
 - **Linux / Steam Deck (Proton):** play with **GE-Proton** (tested: GE-Proton11-11, the same as the server; install it
   with ProtonUp-Qt, then Properties → Compatibility). With Proton Experimental and Proton 11.0-2 the game crashed now
   and then while loading the world. Windows is not affected.
@@ -42,9 +45,10 @@ with the **Going Public Server** mod
      main menu, newest first. German: the section "Neuigkeiten" in the German part. -->
 
 ### Going Public Server 1.0.16.3
+- **Phone pages**: the BizPhone's apps in pages of eight with arrows, "1 / 2" and dots - the game's on page 1, the mod's on page 2: Chat, Business, Radio, Navigation, Planner, Insights, Camera and Signs open what their keys open. Modelled on Aluna's Phone Pages (our own code). AMP switch "Phone pages"; off = the phone as before.
 - **Steam: only owners of the game** (AMP switch, with a Steam Web API key): the server lets in only players whose Steam account owns Big Ambitions - it has Steam confirm a ticket each player's game sends when joining, and a Steam emulator cannot make one. Family Sharing counts.
 - **Steam: friends can join**: while you play on a server, your Steam friends see "Join Game" on you (and you can invite them) and land on the same server with one click - address and server key included. The admin can switch it off in AMP.
-- **AMP switch "Navigation: sat-nav in the phone"**: whether the sat-nav fills the BizPhone while the self-driving drives (off = it stays on top of the phone).
+- **AMP switch "Navigation: sat-nav in the phone"**: whether the sat-nav fills the BizPhone whenever a destination is set (off = it stands on top of the phone).
 - **Admin page** on the ranking site (sign-in with the AMP account): players online with message, kick and ban (with a reason), the chat to read and write, the ban list with unban, announcements on every player's screen, save, and a restart now or announced in a few minutes (the players are warned). `kick` now only puts a player out; the chat shows in AMP's console, and AMP's player list has Kick and Ban.
 
 ### Going Public Server 1.0.16.2
@@ -53,7 +57,7 @@ with the **Going Public Server** mod
 - **Shop loudspeakers** play internet stations too: in your shop, the Radio tab picks for "Shop loudspeakers", and a loudspeaker's "Next station" goes on into the internet stations. Everybody in the shop hears the same station; the server keeps it with the world.
 - **Radio tab**: favourites with a heart (they stand at the top, and "next station" goes through them), a search field, a clear word when a station sends AAC or HLS instead of MP3.
 - **Passengers** hear the driver's station (internet stations too); after getting out their own radio plays again.
-- **Navigation device**: with a destination set, a small sat-nav in the game's own look on top of the BizPhone (filling its screen while the self-driving drives or you walk there automatically) shows the next turn, the streets around you with the route and the distance left (the map shows the whole route). Routes change lanes where the game's lanes are not linked (no more driving to the end of the road before turning, as at the harbour), turn from the outer lane and keep right. A drive shows in blue, a walk in orange - on the map and in the sat-nav.
+- **Navigation device**: with a destination set, a small sat-nav in the game's own look in the BizPhone's screen (with the mouse over it the phone's apps show through) shows the next turn, the streets around you with the route and the distance left (the map shows the whole route). Routes change lanes where the game's lanes are not linked (no more driving to the end of the road before turning, as at the harbour), turn from the outer lane and keep right. A drive shows in blue, a walk in orange - on the map and in the sat-nav.
 - AMP shows the server key and version again (they vanished from the console once the world was up).
 
 ### Going Public Server 1.0.16.1
@@ -115,6 +119,10 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
 
 - **Steam names and friends**: the Steam name above every player, friends in green and on the city map, friend
   requests on the phone (Business → Friends); a friend's rented and bought buildings show under it there.
+- **Phone pages**: the phone's apps in pages of eight - the mod's apps (Chat, Business, Radio, Navigation, Planner,
+  Insights, Camera, Signs) on page 2.
+- **Internet radio**: the Radio app with the game's stations, the server's list and your own, radio on foot and in
+  your shop's loudspeakers.
 - **Pay taxes by phone**: Contacts → Internal Revenue Service → Call.
 - **F7 Shop signs**: your own pictures on signs, storefront signs and billboards.
 - **F6 RPG camera** (settings F8): third-person camera on foot and in the car.
@@ -137,7 +145,7 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
 3. In the instance: **Update**. AMP downloads the game with SteamCMD (it asks for a Steam login that owns
    Big Ambitions, and the Steam Guard code if the account has one), Proton GE, and the newest
    **Going Public Server** release from this repository.
-4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server password** (the server key players join with), and the server version. Network traffic, server FPS and each player's connection are on the ranking page (see below).
+4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server password** (the server key players join with), and the server version (gone after reloading the page? AMP's page misses them with Websockets on: switch off "Enable Websockets" in the instance's configuration). Network traffic, server FPS and each player's connection are on the ranking page (see below).
 5. Open the game port (UDP, 7777 by default) in your firewall.
 
 ### Updating
@@ -166,8 +174,8 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
   and **friends can join** (the players' Steam friends see Join Game).
 - **New world**: name and difficulty (Easy, Normal, Hard or Custom - the Custom values have their own tab). They only
   count when the server creates that world (it does not exist yet).
-- **Modules**: switch each built-in module on or off for everybody. **RPG camera**, the navigation's route line and
-  whether the sat-nav goes into the phone (while self-driving or walking there by itself) are the same for every player
+- **Modules**: switch each built-in module on or off for everybody (phone pages included). **RPG camera**, the navigation's route line and
+  whether the sat-nav lies in the phone are the same for every player
   on the server. **Radio station list**: the language of the radio stations every player gets
   (the files in `radio/` of this repository - edit one to change that list for everybody; Off = none).
 - **Game rules**: rent from owned buildings, building prices, bank loan limit and business sale.
@@ -220,6 +228,11 @@ The built-in modules are our own implementations, modelled on these Workshop mod
 - Navigation: [Voogle Route](https://steamcommunity.com/sharedfiles/filedetails/?id=3740623471) with
   [LIB BA Player Location](https://steamcommunity.com/sharedfiles/filedetails/?id=3741773276) and
   [LIB BA Unified UI](https://steamcommunity.com/sharedfiles/filedetails/?id=3790426259) by - Capitaine -
+- Internet radio: [Big Ambitions Radio](https://steamcommunity.com/sharedfiles/filedetails/?id=3792403626) by Antegarr
+- Phone pages: [Aluna's Phone Pages](https://steamcommunity.com/sharedfiles/filedetails/?id=3739104140) by aluna
+
+[Claude Code](https://claude.com/claude-code), the AI assistant by Anthropic, helped with the development and with
+finding and fixing bugs - among other things the Steam ownership check, the admin page, the sat-nav and the phone pages.
 
 Big Ambitions belongs to Hovgaard Games; every player and the server need their own copy of the game.
 
@@ -230,9 +243,10 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 ### Neuigkeiten
 
 #### Going Public Server 1.0.16.3
+- **Handy-Seiten**: Die Apps des BizPhones auf Seiten zu acht mit Pfeilen, „1 / 2“ und Punkten - die des Spiels auf Seite 1, die der Mod auf Seite 2: Chat, Spieler, Radio, Navi, Planer, Auswertung, Kamera und Schilder öffnen, was ihre Tasten öffnen. Nachgebaut nach Alunas Phone Pages (eigener Code). AMP-Schalter „Handy-Seiten“; aus = das Handy wie bisher.
 - **Steam: nur mit gekauftem Spiel** (AMP-Schalter, mit Steam-Web-API-Schlüssel): Der Server lässt nur Spieler herein, deren Steam-Konto Big Ambitions besitzt – er lässt sich von Steam ein Ticket bestätigen, das das Spiel jedes Spielers beim Beitreten mitschickt; ein Steam-Emulator kann keines ausstellen. Die Familienbibliothek zählt.
 - **Steam: Freunde können beitreten**: Spielst du auf einem Server, sehen deine Steam-Freunde bei dir „Spiel beitreten“ (und du kannst sie einladen) und landen mit einem Klick auf demselben Server – mit Adresse und Server-Schlüssel. Der Admin kann es in AMP abschalten.
-- **AMP-Schalter „Navigation: Navi im Handy“**: ob das Navi beim Autopiloten den BizPhone-Bildschirm füllt (aus = es bleibt über dem Handy).
+- **AMP-Schalter „Navigation: Navi im Handy“**: ob das Navi den BizPhone-Bildschirm füllt, sobald ein Ziel gesetzt ist (aus = es steht über dem Handy).
 - **Admin-Seite** auf der Rangliste (Anmeldung mit dem AMP-Konto): Spieler online mit Nachricht, Kicken und Bannen (mit Grund), der Chat zum Mitlesen und Schreiben, die Bannliste mit Entbannen, Ankündigungen auf dem Bildschirm aller Spieler, Speichern und ein Neustart sofort oder in ein paar Minuten angekündigt (die Spieler werden gewarnt). `kick` wirft jetzt nur noch hinaus; der Chat steht in der AMP-Konsole, und AMPs Spielerliste hat die Knöpfe Kick und Ban.
 
 #### Going Public Server 1.0.16.2
@@ -241,7 +255,7 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 - **Laden-Lautsprecher** spielen auch Internetsender: Im eigenen Laden wählt der Radio-Tab für „Laden-Lautsprecher“, und „Nächster Sender“ am Lautsprecher geht nach den Sendern des Spiels durch die Internetsender. Alle im Laden hören denselben Sender; der Server merkt ihn sich mit der Welt.
 - **Radio-Tab**: Favoriten mit Herz (stehen oben, „Nächster Sender“ geht durch sie), ein Suchfeld, eine klare Meldung, wenn ein Sender AAC oder HLS statt MP3 sendet.
 - **Mitfahrer** hören den Sender des Fahrers (auch Internetsender); nach dem Aussteigen läuft wieder ihr eigenes Radio.
-- **Navigationsgerät**: Ist ein Ziel gesetzt, zeigt ein kleines Navi im Stil des Spiels über dem BizPhone (beim Autopiloten und beim automatischen Hinlaufen füllt es den BizPhone-Bildschirm) die nächste Abbiegung, die Straßen um dich herum mit der Route und die Restentfernung (die Karte zeigt die ganze Route). Die Route wechselt die Spur auch dort, wo die Spuren im Spiel nicht verbunden sind (kein Fahren mehr bis ans Straßenende vor dem Abbiegen, wie am Hafen), biegt von der äußeren Spur ab und hält sich rechts. Mit dem Auto ist die Route blau, zu Fuß orange - auf der Karte und im Navi.
+- **Navigationsgerät**: Ist ein Ziel gesetzt, zeigt ein kleines Navi im Stil des Spiels im Bildschirm des BizPhones (mit der Maus darüber scheinen die Apps durch) die nächste Abbiegung, die Straßen um dich herum mit der Route und die Restentfernung (die Karte zeigt die ganze Route). Die Route wechselt die Spur auch dort, wo die Spuren im Spiel nicht verbunden sind (kein Fahren mehr bis ans Straßenende vor dem Abbiegen, wie am Hafen), biegt von der äußeren Spur ab und hält sich rechts. Mit dem Auto ist die Route blau, zu Fuß orange - auf der Karte und im Navi.
 - AMP zeigt Serverschlüssel und Version wieder (sie verschwanden aus der Konsole, sobald die Welt geladen war).
 
 #### Going Public Server 1.0.16.1
@@ -294,13 +308,16 @@ Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
 
 ### Wichtig
 
-- **Der Server läuft nur unter AMP** (Linux, ohne Grafik, unter Proton). Einen anderen Server-Download gibt es noch
-  nicht. Spieler können selbst kein Spiel mehr hosten: Mehrspieler heißt, einem dedizierten Server beizutreten.
+- **Den Server gibt es in mehreren Varianten** (Releases auf dieser Seite): die AMP-Vorlage, die unten beschrieben
+  ist (Linux, ohne Grafik, unter Proton), und ein eigenes Programm mit Weboberfläche für **Windows** und **Linux**
+  sowie als **Docker**-Container (`GoingPublicServer-<Version>-Windows.zip`, `-Linux.tar.gz`, `-Docker.zip`). Spieler
+  können selbst kein Spiel mehr hosten: Mehrspieler heißt, einem dedizierten Server beizutreten.
 - **Server und Spieler brauchen dieselbe Version.** Steam hält das Abo der Spieler aktuell; die AMP-Instanz nach einem
   neuen Release aktualisieren (der Server lehnt andere Versionen ab).
 - **Keine anderen Mods auf dem Server.** Der Server läuft nur mit Going Public Server: in AMP die
   *Steam Workshop Items* leer lassen und nichts nach `bamp-mods-extra/` legen. Die eingebauten Module ersetzen
-  Immersion, BAScheduler, SmartSuite und VoogleRoute - auch Spieler sollen diese Mods nicht gleichzeitig nutzen.
+  Immersion, BAScheduler, SmartSuite, VoogleRoute, Big Ambitions Radio und Alunas Phone Pages - auch Spieler sollen
+  keine anderen Mods zusammen mit Going Public Server nutzen.
 - **Linux / Steam Deck (Proton):** mit **GE-Proton** spielen (getestet: GE-Proton11-11, wie der Server; mit
   ProtonUp-Qt installieren, dann Eigenschaften → Kompatibilität). Mit Proton Experimental und Proton 11.0-2 stürzte
   das Spiel gelegentlich beim Laden der Welt ab. Unter Windows tritt das nicht auf.
@@ -317,6 +334,10 @@ Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
 - **Steam-Namen und Freunde**: Steam-Name über jedem Spieler, Freunde in Grün und auf der Stadtkarte,
   Freundschaftsanfragen im Handy (Business → Friends); dort stehen unter jedem Freund seine gemieteten und gekauften
   Gebäude.
+- **Handy-Seiten**: die Apps des Handys auf Seiten zu acht - die Apps der Mod (Chat, Spieler, Radio, Navi, Planer,
+  Auswertung, Kamera, Schilder) auf Seite 2.
+- **Internetradio**: die Radio-App mit den Sendern des Spiels, der Liste des Servers und eigenen Sendern, Radio zu Fuß
+  und in den Lautsprechern des eigenen Ladens.
 - **Steuern per Telefon**: Kontakte → Internal Revenue Service → Anrufen.
 - **F7 Ladenschilder**: eigene Bilder auf Schildern, Ladenschildern und Werbetafeln.
 - **F6 RPG-Kamera** (Einstellungen F8): Kamera hinter der Figur, zu Fuß und im Auto.
@@ -335,7 +356,7 @@ Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
 `amaus1209/BigAmbitionsGoingPublicServer:main` eintragen, **Fetch latest**, eine Instanz aus der Vorlage
 **Big Ambitions (Going Public server)** anlegen, **Update** (lädt das Spiel per SteamCMD mit einem Steam-Konto,
 das Big Ambitions besitzt – bei Steam Guard fragt AMP nach dem Code –, Proton GE und das neueste Release von
-hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Passwort (den Server-Schlüssel) und Server-Version. Netzverkehr, Server-FPS und die Verbindung jedes Spielers stehen auf der Ranglisten-Seite (siehe unten).
+hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Passwort (den Server-Schlüssel) und Server-Version (nach dem Neuladen der Seite weg? Mit Websockets verpasst AMPs Seite sie: in der Konfiguration der Instanz „Websockets aktivieren“ ausschalten). Netzverkehr, Server-FPS und die Verbindung jedes Spielers stehen auf der Ranglisten-Seite (siehe unten).
 Den Spiel-Port freigeben (UDP, standardmäßig 7777).
 
 **Aktualisieren:** **Update** lädt das neueste Release, danach die Instanz neu starten. Die Spieler bekommen die passende
@@ -360,8 +381,8 @@ Server dann (wenige Sekunden).
   und **Freunde können beitreten** (die Steam-Freunde der Spieler sehen „Spiel beitreten“).
 - **Neue Welt**: Name und Schwierigkeit (Einfach, Normal, Schwer oder Benutzerdefiniert – die benutzerdefinierten Werte
   haben einen eigenen Reiter). Sie zählen nur, wenn der Server diese Welt anlegt (es gibt sie noch nicht).
-- **Module**: jedes eingebaute Modul für alle an- oder ausschalten. **RPG-Kamera**, die Routenlinie der Navigation und
-  ob das Navi beim Autopiloten oder automatischen Hinlaufen ins Handy geht, sind auf dem Server für alle Spieler gleich. **Radio-Senderliste**: die Sprache der Radiosender, die alle Spieler
+- **Module**: jedes eingebaute Modul für alle an- oder ausschalten (auch die Handy-Seiten). **RPG-Kamera**, die Routenlinie der Navigation und
+  ob das Navi im Handy steht, sind auf dem Server für alle Spieler gleich. **Radio-Senderliste**: die Sprache der Radiosender, die alle Spieler
   bekommen (die Dateien in `radio/` dieses Repos - wer eine ändert, ändert die Liste für alle; Off = keine).
 - **Spielregeln**: Miete aus eigenen Gebäuden, Gebäudepreise, Kreditrahmen der Bank und Geschäftsverkauf.
 
@@ -390,129 +411,11 @@ in denselben Pfad unter `ModTranslations/` hier hochladen. Die Action *Translati
 Inoffizieller Fork von [Going Public](https://github.com/Melaus123/BigAmbitionMulti) von Melaus (MIT-Lizenz). Die
 eingebauten Module sind eigene Umsetzungen nach dem Vorbild dieser Workshop-Mods (Links oben unter *Credits*): Immersion -
 RPG Camera von Chamiks, BAScheduler von Shanpapa, SmartSuite Empire Management (SmartInsights, SmartRent) von
-ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ und Voogle Route mit LIB BA Player Location und LIB BA Unified UI von - Capitaine -. Vielen Dank an ihre
-Autoren. Big Ambitions gehört Hovgaard Games; jeder Spieler und auch der Server brauchen eine eigene Lizenz des Spiels.
+ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ, Voogle Route mit LIB BA Player Location und LIB BA Unified UI von - Capitaine -, Big Ambitions Radio
+von Antegarr und Aluna's Phone Pages von aluna (die Handy-Seiten sind danach nachgebaut, kein fremder Code). Vielen
+Dank an ihre Autoren.
 
+Bei der Entwicklung und beim Finden und Beheben von Fehlern hat [Claude Code](https://claude.com/claude-code) mitgeholfen,
+der KI-Assistent von Anthropic - unter anderem bei der Steam-Prüfung, der Admin-Seite, dem Navi und den Handy-Seiten.
 
-
-
-Going Public Server - Windows
-=============================
-Big-Ambitions-Mehrspieler-Server mit Weboberfläche, ohne AMP. (English below.)
-
-START
-  1. Den Ordner GoingPublicServer an einen festen Ort entpacken, z. B. C:\GoingPublicServer (etwa 10 GB frei).
-  2. GoingPublicServer.exe starten. Windows-SmartScreen: "Weitere Informationen" -> "Trotzdem ausführen".
-     Die Windows-Firewall fragt nach dem Netzwerkzugriff: zulassen.
-  3. Beim ersten Start erscheint ein FENSTER mit den Zugangsdaten zur Weboberfläche (Adresse, Benutzer, Passwort).
-     Das Passwort wird nur dieses eine Mal angezeigt.
-  4. Im Browser http://localhost:8080 öffnen und anmelden.
-  5. Installation: das Spiel laden - mit dem Steam-Konto, das Big Ambitions besitzt (bei Steam Guard den Code eingeben).
-  6. Einstellungen: Welt wählen oder unter "New world" eine neue anlegen. Übersicht: Starten.
-  7. Im Router UDP 7777 (Spiel) zu diesem PC weiterleiten. Spieler treten mit deiner Adresse, Port 7777 und dem
-     Server-Schlüssel bei. TCP 8080 (Weboberfläche) nur freigeben, wenn du sie von außen brauchst.
-
-GUT ZU WISSEN
-  - Das schwarze Fenster ist die Verwaltung. Schließen stoppt den Server (er speichert und beendet sich).
-  - Passwort vergessen: Reset-Password.bat starten - das neue Passwort erscheint wieder in einem Fenster.
-  - Der Server läuft ohne Steam-Client; ein Steam, das auf diesem PC läuft, bleibt dein eigenes.
-  - Mods des Servers: server\mods (nur Going Public Server und was du dazulegst - getrennt von deinen eigenen Mods).
-  - Spielstände: Windows legt sie für jedes Big Ambitions dieses Windows-Kontos in
-    %USERPROFILE%\AppData\LocalLow\Hovgaard Games\Big Ambitions ab, die Server-Welten unter SaveGames\_BAMP_MP.
-    Spielst du selbst auf demselben Windows-Konto, teilen sich Spiel und Server diesen Ordner - am saubersten läuft
-    der Server auf einem eigenen PC oder unter einem eigenen Windows-Konto.
-  - Update: das neue Paket über diesen Ordner entpacken (GoingPublicServer.exe vorher beenden). Server-Dateien allein:
-    Weboberfläche -> Installation -> "Von GitHub aktualisieren".
-
--------------------------------------------------------------------------------------------------------------------------
-
-START: unpack the folder (e.g. C:\GoingPublicServer, about 10 GB free), run GoingPublicServer.exe (SmartScreen: More
-info -> Run anyway; allow the firewall). The ACCESS DATA appear in a WINDOW at the first start - only once. Open
-http://localhost:8080, log in; Installation: download the game with the Steam account that owns Big Ambitions;
-Settings: choose or create a world; Overview: Start. Forward UDP 7777 to this PC.
-Closing the black window stops the server (it saves). Forgot the password: run Reset-Password.bat.
-
-
-# Going Public Server – Docker-Vorlage
-
-Big-Ambitions-Mehrspieler-Server mit Weboberfläche in einem Container (Debian 13, Proton GE, Xvfb). *(English below.)*
-
-## Start
-
-```sh
-docker compose up -d --build
-docker compose logs goingpublicserver      # die ZUGANGSDATEN stehen hier - nur beim ersten Start
-```
-
-Das Image holt sich das Programm aus `GoingPublicServer-<Version>-Linux.tar.gz` neben dem `Dockerfile` – liegt keine
-Datei da, lädt es das Release von GitHub.
-
-Danach im Browser `http://<dieser Rechner>:8080`:
-
-1. anmelden;
-2. **Installation**: das Spiel laden, mit dem Steam-Konto, das Big Ambitions besitzt (bei Steam Guard den Code eingeben), und
-   **Proton GE** installieren;
-3. **Einstellungen**: eine Welt wählen oder unter „New world“ eine neue anlegen;
-4. **Übersicht**: Starten. Spieler treten mit der Adresse des Rechners, Port 7777 und dem Server-Schlüssel bei.
-
-## Gut zu wissen
-
-| | |
-|---|---|
-| Neues Passwort | `docker compose exec goingpublicserver gps reset-password` – erscheint im Terminal |
-| Daten | `./data` (Spiel ~7 GB, Proton, Spielstände, Einstellungen, Backups) – gehört `PUID`/`PGID` (Standard 1000) |
-| Ports | `8080/tcp` Weboberfläche (von außen nur hinter HTTPS/VPN), `7777/udp` Spiel – muss zur Einstellung „Game Port“ passen |
-| Stoppen | `docker compose stop` – der Server speichert vorher (bis zu 5 min Zeit, `stop_grace_period`) |
-| Update | neues Paket neben das `Dockerfile`, Version in `docker-compose.yml`, dann `docker compose up -d --build` |
-| Sprache | `GPS_LANG: de` oder `en` (Meldungen der Verwaltung); die Weboberfläche schaltet selbst um |
-
----
-
-**English:** `docker compose up -d --build`, then `docker compose logs goingpublicserver` shows the access data (once).
-Open `http://<this machine>:8080`, log in, download the game under Installation (Steam account that owns Big Ambitions)
-and install Proton GE, choose or create a world under Settings, then Start. New password:
-`docker compose exec goingpublicserver gps reset-password`. Data live in `./data`; ports 8080/tcp (web) and 7777/udp (game).
-
-Going Public Server - Linux
-===========================
-Big-Ambitions-Mehrspieler-Server mit Weboberfläche, ohne AMP. (English below.)
-
-INSTALLATION (Debian / Ubuntu, 64 Bit, systemd)
-  tar -xzf GoingPublicServer-*-Linux.tar.gz
-  cd GoingPublicServer-*-Linux
-  sudo ./install.sh                 Optionen: --port 8080  --lang de|en  --data /var/lib/goingpublicserver
-
-  Das Skript installiert die Pakete (Bibliotheken für Proton GE, Xvfb, python3, 32-Bit-Teile für SteamCMD), den
-  Benutzer "goingpublic", das Programm nach /opt/goingpublicserver und den Dienst "goingpublicserver".
-  Am Ende stehen die ZUGANGSDATEN zur Weboberfläche im Terminal - nur dieses eine Mal.
-
-DANACH (im Browser, http://<Server-IP>:8080)
-  1. Anmelden.
-  2. Installation: Spiel laden - mit dem Steam-Konto, das Big Ambitions besitzt (bei Steam Guard den Code eingeben).
-  3. Installation: Proton GE installieren (führt das Windows-Spiel aus).
-  4. Einstellungen: Welt wählen oder unter "New world" eine neue anlegen.
-  5. Übersicht: Starten. Spieler treten mit Adresse, Port 7777 und dem Server-Schlüssel bei.
-  Freigeben: UDP 7777 (Spiel). TCP 8080 (Weboberfläche) nur, wenn nötig - von außen besser hinter HTTPS/VPN.
-
-BEFEHLE
-  systemctl status goingpublicserver        Zustand        journalctl -u goingpublicserver -f   Log
-  sudo goingpublicserver reset-password     neues Passwort (erscheint im Terminal)
-  sudo ./install.sh                         Update (Programm und Server-Dateien; Daten bleiben)
-  sudo ./install.sh --uninstall [--purge]   entfernen (--purge: auch Spiel, Spielstände, Backups)
-
-ORDNER
-  /opt/goingpublicserver          Programm
-  /var/lib/goingpublicserver      Daten: server/1331550 (Spiel), server/mods (Mods), server/prefix (Spielstände unter
-                                  ...LocalLow/Hovgaard Games/Big Ambitions/SaveGames/_BAMP_MP), backups/, manager/
-
--------------------------------------------------------------------------------------------------------------------------
-
-INSTALL (Debian / Ubuntu, 64 bit, systemd)
-  sudo ./install.sh  [--port 8080] [--lang de|en] [--data DIR]
-  The ACCESS DATA of the web interface appear at the end, in this terminal - only once.
-THEN, in the browser (http://<server IP>:8080): log in; Installation: download the game with the Steam account that
-  owns Big Ambitions, install Proton GE; Settings: choose or create a world; Overview: Start. Open UDP 7777.
-COMMANDS: systemctl status goingpublicserver · journalctl -u goingpublicserver -f ·
-  sudo goingpublicserver reset-password · sudo ./install.sh (update) · sudo ./install.sh --uninstall [--purge]
-
-
+Big Ambitions gehört Hovgaard Games; jeder Spieler und auch der Server brauchen eine eigene Lizenz des Spiels.

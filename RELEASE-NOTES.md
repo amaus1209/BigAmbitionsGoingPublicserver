@@ -1,25 +1,46 @@
-## Going Public Server 1.0.16.2
+## Going Public Server 1.0.16.3
 
-**Server and players both need 1.0.16.2.** Please update the Workshop mod and the server together - the server only lets the same version in.
+**Server and players both need 1.0.16.3.** Please update the Workshop mod and the server together. A server that checks game ownership through Steam refuses older versions and tells them which version they need.
 
-Fixes after the test of 1.0.16.1:
+### Steam
+- **Only players who own the game** (AMP, Server tab: "Steam: only players who own the game" and "Steam Web API key"): the server lets in only players whose Steam account owns Big Ambitions. The game sends a ticket from Steam when joining, and the server has Steam confirm it. A Steam emulator cannot make a genuine ticket and stays out; Steam Family Sharing counts. The ticket is bound to this server's key and is spent once the player is in the world. Get the key at steamcommunity.com/dev/apikey (any Steam account that has bought something can make one; any domain name will do). It stays on the server and is in no log. If Steam does not answer (an outage), the player is let in and the console says so.
+- **Friends can join** (AMP: "Steam: friends can join", on by default): a player on the server tells Steam where he plays. His Steam friends see "Join Game" and "Invite to Game" on him and land on the same server with one click, address and server key included. If Steam has to start the game first, it connects by itself on the main menu. Players connected by a local (LAN) address tell nothing. Off = no Join Game for this server.
+- Joining, the server now checks the server key first, then Steam, and only then the player. So nobody without the key can push a player of the same name off the server.
+- **Linux/Proton**: when Steam does not confirm the ticket with this server's identity (error 105 "Identity parameter did not match", seen on Linux/Proton), the server asks Steam once more without it. When Steam then confirms the owner, the player is let in; the console says the binding to this server is missing.
+- After an AMP update the lists under "World" and "Load a save once" stay (before, AMP showed no worlds and saves until the instance had been restarted once more).
 
-### Radio
-- **Internet stations play now**: in 1.0.16.1 every stream stayed silent, whatever the station, in the car too. The game engine cannot play an endless MP3 stream. The mod now downloads and decodes the streams itself (with NLayer, MIT licence, in the `Dependencies/` folder).
-- **http and https**: both kinds of station address play. The "https only" limit of 1.0.16.1 is gone.
-- **Song titles**: the song that plays shows under the station's name when the station sends it (in the Radio tab, in the phone's radio and at a loudspeaker).
-- **Radio on foot**: the Radio tab has a "Radio on foot" switch. When it is on, the radio keeps playing out of the car, also without headphones. Inside buildings it is silent; the loudspeakers play there. The switch applies to your own computer only.
-- **Shop loudspeakers**: a shop's loudspeakers play internet stations too.
-  - In your own shop the Radio tab shows "My radio" and "Shop loudspeakers" at the top; "Shop loudspeakers" is preselected. Tap a station and the loudspeakers play it.
-  - At a loudspeaker itself (mouse on it), "Next station" goes on from the game's stations into the internet stations.
-  - Everybody in the shop hears the same station, and the server keeps it with the world.
-  - The shop's owner, his merger partners and holders of his Business key may choose.
-- **Passengers** hear the driver's station, internet stations too. After getting out their own station plays again, an internet station too. With "Radio on foot" it stays audible.
-- The English station list now includes TruckersFM.
+### Server admin
+- **Admin page**: in AMP on the instance's status page as "Admin Seite" under the Connection Link; on the ranking at the top right ("Admin") and below the table (`…/monitor/<game port>/index.html#admin`). Sign in with your AMP account - in AMP it needs the right to use that instance's console; with two-factor sign-in the code is asked for. There: the server's state, the players online with ping and time played (message, kick, ban - with a reason the player sees), the chat to read along and write (to everyone as the server, or privately to one player), the ban list with the reasons (unban, unban everyone), announcements on every player's screen, save, and a restart - now or announced a few minutes ahead: the players see the warning at 5 min, 1 min, 30 s and 10 s, and it can be called off. The page talks to the server through AMP; players see only the ranking, as before.
+- **A warning when AMP stops the server** (AMP, Server tab: "Warning before AMP stops the server", default 60 s): when AMP stops, restarts or updates the server - with its buttons or from the schedule - while players are on, they see "The server goes down in 1 min (restart or maintenance).", then at 30 and 10 s; the world is saved after. With nobody on it goes at once. Announcements and a longer announced restart also work from AMP through the console (`notice`, `restart <minutes>`) and the schedule (a task "Send console message", e.g. every day at 4:00 `restart 5`).
+- **AMP itself**: every chat message shows in the console and counts as chat for AMP (a trigger in the schedule, for example). The player list has the buttons "Kick" and "Ban".
+- **New console commands**: `kick <player> [reason]` only puts a player out (before, `kick` was a ban), `ban <player> [reason]`, `msg <player> <text>`, `notice <text>` (a message on every screen), `restart <minutes>` and `restart cancel`, `chat [N]`; `players` shows ping and time played, `banlist` the reason. A name with spaces in quotes.
 
-### Server console
-- **Server key and version** show in AMP again. The line used to come only before the world loaded, and AMP cleared it once the world was up. Now it comes once more when the world runs, then every 10 minutes.
+### Phone pages
+- The BizPhone's apps stand in **pages of eight** (two columns, four rows) with arrows, "1 / 2" and a dot per page (a click on a dot opens its page). Page 1 holds the game's apps, page 2 the mod's: **Chat, Business, Radio, Navigation, Planner, Insights, Camera and Signs**. Each opens what its key opens (Radio: the radio page in the full menu). An app whose module is off in AMP stays out.
+- Modelled on **Aluna's Phone Pages** by aluna (Steam Workshop) - our own code, nothing taken over. Please do not load that mod as well.
+- AMP switch "Phone pages" (Modules tab). Off = the phone as before: the game's apps, Chat and Business in five rows.
+
+### Server without AMP
+- The packages `GoingPublicServer-1.0.16.3-Windows.zip`, `-Linux.tar.gz` and `-Docker.zip` are the server with its own web interface, without AMP. Its **Players** tab now has the same admin tools: players online with ping and time played (message, kick, ban with a reason), the chat to read along and write, the ban list with reasons and unban, ban / unban by name for a player who is offline, announcements and an announced restart.
+
+### Since the first 1.0.16.2 download
+
+#### Radio tab
+- **Alphabetical**: a switch in the Radio tab sorts the internet stations by name (your own first, then the server's list); "Next station" then goes in the same order. Off = the list's order (the server's: the most popular first).
+- **Favourites**: every station in the Radio tab has a heart. Marked stations stand at the top under "Favourites", in the order marked, by name with "Alphabetical" - for your own radio and for the shop loudspeakers. With favourites, "Next station" in the car and at a loudspeaker goes through them only.
+- **Search**: a search field in the Radio tab shows only the stations whose name holds what you type (case and accents alike: "o3" finds "Ö3").
+- **A clear word**: a station that sends AAC, Opus, OGG, FLAC or HLS instead of MP3 says so on the radio and in the Radio tab ("... sends AAC - only MP3 streams play") instead of staying silent. It is not retried over and over; tapping it again tries once more.
+
+#### Navigation (Shift+F11)
+- **A navigation device in the game's own style**: with a destination set, a small sat-nav shows, on a slate panel like the game's map filter, the turn arrow on a badge in the route's colour, the distance and the street in caps ("100 m · TOWARDS 5TH AVENUE", the names from the house addresses), in its corner "THEN" with the turn after it; the near-black map like the city map with the route - blue in the car, orange on foot, white chevrons pointing the way -, the street's name at the turn, the destination as a yellow diamond and you as the city map's green marker; at the bottom a progress bar like the music player's, your speed, the time left, the distance and the arrival on the game's clock (a second is a game minute; on foot at your own pace) and an X to end it. It lies in the BizPhone's screen below the music player down to its bottom edge - while the self-driving drives, while your character walks there and with any destination set. With the mouse over it, it turns see-through so the apps stay in reach; a collapsed phone shows no sat-nav. The long line that rose into the sky in the distance is gone; the map (M) still shows the whole route.
+- **Lanes**: the game does not link every lane to its neighbours. A route on such a lane could not change lanes and went on to the next junction it could turn at, or to the end of the road (the harbour, for one). Now it changes to the lane beside it, turns from the outer lane (right from the rightmost, left from the leftmost) and keeps right on roads of several lanes. The self-driving drives the same route.
+- **Parking at the destination**: the self-driving parks only where the car really fits - no hydrant, mailbox, parked car or building in the way (the game itself checks for moving cars and people only; at the harbour a car ended up between a car, a hydrant and a mailbox). A blocked spot: the next one; none: the car stays on the road.
+- **Colours**: a drive shows in blue, a walk in orange - on the map (M) and in the sat-nav. (The map's earlier footpath blue / road piece orange split is gone.)
+- **AMP switch "Navigation: sat-nav in the phone"**: the server's admin decides whether the sat-nav lies in the BizPhone's screen. Off = it stands on top of the phone, the apps stay in sight. On in single player.
 
 ### Other
-- The version line at the bottom left reads "GPS-MM v. 1.0.16.2".
-- Everything from 1.0.16.1 is included (self-driving, passengers, Radio tab, sitting, merger, quieter console).
+- AMP's connection info (server password, version, admin page) goes out every 30 seconds again - after reloading the status page it is back by then at the latest. It stops as soon as the server stops or a stop or restart is announced. With "Enable Websockets" off (the instance's configuration) AMP shows it at once.
+- The version line at the bottom left reads "GPS-MM v. 1.0.16.3 (build)", for example "GPS-MM v. 1.0.16.3 (1a2b3c4d)" - the id is also in the Workshop file's name and in AMP next to the version.
+- Bug reports carry no server or API key any more (only "<configured>").
+- The server's notices to every player (left the game, lost connection, back again, kicked, restart) come in the server's language - on a German server some were English so far.
+- Everything from 1.0.16.2 is included.

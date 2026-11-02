@@ -493,7 +493,7 @@
         "Description": "For the ownership check: a key from steamcommunity.com/dev/apikey (any Steam account that has bought something on Steam can create one; any domain name will do). It stays on this server and never goes to the players.",
         "Keywords": "steam,api,key",
         "FieldName": "SteamWebApiKey",
-        "InputType": "text",
+        "InputType": "password",
         "ParamFieldName": "$.SteamWebApiKey",
         "DefaultValue": "",
         "EnumValues": {}
@@ -794,6 +794,18 @@
         "EnumValues": {}
     },
     {
+        "DisplayName": "Phone pages",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Modules:extension:5",
+        "Description": "Module 7: the BizPhone's apps in pages of eight with arrows and dots - the game's on the first page, the mod's on the next (Chat, Business, Radio, Navigation, Planner, Insights, camera, shop signs). Modelled on Aluna's Phone Pages. Off = the phone as before: the game's apps, Chat and Business.",
+        "Keywords": "phone,pages,apps",
+        "FieldName": "ModulePhonePages",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.ModulePhonePages",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
         "DisplayName": "Navigation: route line",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Modules:extension:5",
@@ -809,7 +821,7 @@
         "DisplayName": "Navigation: sat-nav in the phone",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Modules:extension:5",
-        "Description": "While the self-driving drives or a player's character walks to the destination by itself, the sat-nav fills the BizPhone's screen below the music player. Off = it stays on top of the phone, so the phone's apps stay in sight.",
+        "Description": "While a destination is set, the sat-nav fills the BizPhone's screen below the music player - with the mouse over it the phone's apps show through and can be clicked; a collapsed phone shows no sat-nav. Off = it stands on top of the phone.",
         "Keywords": "navi,phone,bizphone",
         "FieldName": "NavPhone",
         "InputType": "checkbox",
@@ -821,7 +833,7 @@
         "DisplayName": "Radio station list",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Modules:extension:5",
-        "Description": "Internet radio for every player on this server: the station list in this language comes from GitHub (radio/<language>.txt in the template repository) and shows in the phone's Radio app and on the car radio - MP3 streams, http and https. The players' own streams.txt comes first. Off = only their own.",
+        "Description": "Internet radio for every player on this server: the station list in this language comes from GitHub (radio/<language>.txt at github.com/amaus1209/BigAmbitionsGoingPublicServer) and shows in the phone's Radio app and on the car radio - MP3 streams, http and https. The players' own streams.txt comes first. Off = only their own.",
         "Keywords": "radio,stream,music",
         "FieldName": "RadioList",
         "InputType": "enum",
