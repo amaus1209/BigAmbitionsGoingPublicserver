@@ -806,6 +806,54 @@
         "EnumValues": {}
     },
     {
+        "DisplayName": "Going Online (cable provider)",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Modules:extension:5",
+        "Description": "Module 8: every player can found a cable network operator - a business of the game (\"Cable provider\" in a warehouse, \"Cable customer center\" in an office, founded in BizMan), against the competitor Skyline Cable: buy bandwidth, connect buildings, sell internet, TV (cable and IPTV) and phone lines with tariffs, rented or bought devices and number porting. The equipment (CMTS, OLT, satellite head-end ...) is furniture from the furniture store, the devices are goods at wholesalers and importers, the staff in six roles come from the recruitment agencies; permission contracts with the owners, faults and customer satisfaction; DOCSIS 3.0, later 3.1 and fiber with XGS-PON. The app is in the phone and in the full menu (Shift+F12), help under F1; the ranking page lists the players' providers. Each player's provider is kept in that player's save. Off = the app is gone; a provider founded before stays in the saves.",
+        "Keywords": "provider,internet,cable,tv,isp",
+        "FieldName": "ModuleGoingOnline",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.ModuleGoingOnline",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
+        "DisplayName": "IT firm",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Modules:extension:5",
+        "Description": "Module 9: three office businesses of the game - IT Support, Software Development, Cloud Services. The staff (IT support, software developers, cloud engineers from City Workforce Inc.) bill hours at IT workplaces; servers (blade, rack, mainframe) from the furniture store must stand in the office and cost power every day. Prices and shifts in BizMan, help under F1. Modelled on IT Business Expansion by Cow a Bunga (our own code). Off = these businesses earn nothing.",
+        "Keywords": "business,module",
+        "FieldName": "ModuleItFirm",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.ModuleItFirm",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
+        "DisplayName": "Cleaning company",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Modules:extension:5",
+        "Description": "Module 10: a cleaning company (office) of the game. Its cleaners and crew leads clean the player's own other businesses first, then clients of the city pay by the hour; floor scrubbers, carpet extractors and window kits make the crews faster. Prices and shifts in BizMan, help under F1. Modelled on Spotless by We1tall (our own code). Off = the crews do nothing.",
+        "Keywords": "business,module",
+        "FieldName": "ModuleCleaning",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.ModuleCleaning",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
+        "DisplayName": "Laundromat",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Modules:extension:5",
+        "Description": "Module 11: a laundromat (shop) of the game: washers (8, 12 and 27 kg) and dryers (15 and 30 kg) from the appliance store, people of the neighbourhood wash and dry, with an attendant they leave their laundry for wash and fold. Water, power and detergent cost a little per load. Prices and shifts in BizMan, help under F1. Modelled on Spotless by We1tall (our own code). Off = nobody washes.",
+        "Keywords": "business,module",
+        "FieldName": "ModuleLaundromat",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.ModuleLaundromat",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
         "DisplayName": "Navigation: route line",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Modules:extension:5",
@@ -1106,6 +1154,18 @@
             "3": "3x",
             "5": "5x"
         }
+    },
+    {
+        "DisplayName": "Merger: dissolve after days away",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Game rules:gavel:7",
+        "Description": "A member of a merged company who has not been on the server for this many days (counted only while the server runs, from this update on) leaves the company by themselves - without the vote and the sale: everybody keeps their own property, the company's money is split equally, and a merger of two ends. Only while another member was there in that time. 0 = never.",
+        "Keywords": "merger,dissolve,absent",
+        "FieldName": "MergerAutoDissolveDays",
+        "InputType": "number",
+        "ParamFieldName": "$.MergerAutoDissolveDays",
+        "DefaultValue": "0",
+        "EnumValues": {}
     },
     {
         "DisplayName": "Proton GE Release Version (Linux)",

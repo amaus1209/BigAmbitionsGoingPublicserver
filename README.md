@@ -28,13 +28,13 @@ Docker; the game runs headless with the **Going Public Server** mod
 - **Please do not use other mods.** Going Public Server brings everything listed below. Other mods can break the
   multiplayer - do not load them in the game or on the server (AMP: leave *Steam Workshop Items* empty and put nothing
   into `bamp-mods-extra/`). The built-in modules replace Immersion, BAScheduler, SmartSuite (SmartInsights),
-  VoogleRoute, Big Ambitions Radio and Aluna's Phone Pages.
+  VoogleRoute, Big Ambitions Radio, Aluna's Phone Pages, IT Business Expansion with Skill Kit, and Spotless.
 - **The server comes in several variants** ([Releases](https://github.com/amaus1209/BigAmbitionsGoingPublicServer/releases)): the template for the CubeCoders AMP game server panel
   (Linux, see *Server owners: AMP*), and a program of its own with a web interface for **Windows** and **Linux** and as
   a **Docker** container (see *Server owners: Windows, Linux, Docker*). Players can no longer host a game themselves:
   multiplayer means joining a dedicated server.
 - **Please report bugs** under [Issues](https://github.com/amaus1209/BigAmbitionsGoingPublicServer/issues) or in the comments on the [Steam Workshop page](https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182): with the
-  version (bottom left in the game, e.g. "1.0.16.3 (6ec84249)"), what happened and, if you can, the Player.log
+  version (bottom left in the game, e.g. "1.0.17 (9956f581)"), what happened and, if you can, the Player.log
   (Windows: `%USERPROFILE%\AppData\LocalLow\Hovgaard Games\Big Ambitions\Player.log`).
 - **Server and players need the same version.** Steam keeps the players' subscription up to date; update the server
   when a new release is out.
@@ -60,18 +60,26 @@ Docker; the game runs headless with the **Going Public Server** mod
 - **Mergers**: several players' companies become one; it is dissolved only when everybody agrees (then everything is
   sold and the money shared).
 - **Phone pages**: the BizPhone's apps in pages of eight with arrows, "1 / 2" and dots - the game's on page 1, the
-  mod's on page 2: Chat, Business, Radio, Navigation, Planner, Insights, Camera, Signs. Modelled on Aluna's Phone Pages.
+  mod's on page 2: Chat, Business, Radio, Navigation, Planner, Insights, Camera, Signs; drag an app to move it, to
+  another page too. Modelled on Aluna's Phone Pages.
+- **New businesses** (modules 9-11): **IT firm** (IT Support, Software Development, Cloud Services: staff bill hours at
+  IT workplaces, servers with blinking lights must stand in the office and cost power), **cleaning company** (the crews
+  clean your own businesses first, then clients of the city pay) and **laundromat** (washers, dryers, wash and fold).
+  Founded in BizMan, staff from the recruitment agencies, prices and shifts in BizMan, help under F1. Modelled on IT
+  Business Expansion and Skill Kit by Cow a Bunga and Spotless by We1tall.
 - **Chat** on the phone, with a sign for unread messages.
 - **Internet radio**: a Radio app with the game's stations, the server's station list in its language and your own
   stations (http and https, with the song title), favourites, search and an alphabetical order. Radio on foot, shop
   loudspeakers with internet stations; passengers hear the driver's station.
 - **Navigation** (Shift+F11 or the Navigation app): search a destination or click it on the city map; a sat-nav in the
   game's own look in the BizPhone with the streets, the next turn, street names, time left and arrival. The route is
-  blue by car and orange on foot, with the right lane before a turn. A short right click into the world (map closed)
-  deletes the route.
+  blue by car and orange on foot, with the right lane before a turn. A destination set on the map asks right there:
+  walk there, drive there or the route only. A short right click into the world (map closed) deletes the route.
 - **Self-driving**: in your own car "Drive there" takes you to the destination - indicating, stopping at red lights and
-  for cars and people, keeping the speed limit, into car parks too - and parks there; it can follow a friend. On foot
-  your character can walk there by itself.
+  for cars and people, keeping the speed limit, into car parks too - and parks there ("park automatically" on the bar
+  at the bottom); it can follow a friend. On foot your character can walk there by itself.
+- **Fast-forward time**: the button at the bottom left (or the window while sitting, sleeping, working out ...) asks
+  everybody; once all agree, time runs faster up to the chosen time.
 - **F6 RPG camera** (settings F8 or the Camera app): a third-person camera on foot and in the car.
 - **F7 Shop signs** (the Signs app): your own pictures on signs, storefront signs and billboards; the other players see
   them.
@@ -95,13 +103,15 @@ Docker; the game runs headless with the **Going Public Server** mod
 - Worlds: choose a world, a new world with name and difficulty (custom values too), load a save once.
 - Every module on or off on its own: taxes by phone, shop signs, RPG camera, planner, insights, navigation, phone pages;
   and the sat-nav in the phone, the route line and the camera settings for everybody.
-- Game rules: rent from owned buildings, building prices, the bank's loan limit, business sale.
+- Game rules: rent from owned buildings, building prices, the bank's loan limit, business sale, and a merger that ends
+  by itself once a member has been away for a set number of days.
 - A radio station list per language for every player (the files in `radio/`, e.g. 250 German stations).
 - **Administration**: an admin page in the browser (sign-in with the AMP account) with the players online (message,
   kick, ban with a reason), the chat to read and write, the ban list with unban, announcements on every screen, save,
   and a restart now or announced. In AMP: the chat in the console, Kick and Ban in the player list, a warning to the
   players before AMP stops the server. The server without AMP has the same in its *Players* tab.
-- A ranking page in the browser with the server's numbers: network traffic, server FPS, each player's ping and loss.
+- A ranking page in the browser with the players' buildings (who bought or rents which, with the business) and the
+  server's numbers: network traffic, server FPS, each player's ping and loss.
 - Save backups; AMP in German, the settings in the server's language.
 
 ## News
@@ -109,8 +119,22 @@ Docker; the game runs headless with the **Going Public Server** mod
 <!-- Going Public Server 1.0.13+ shows every heading of this section as a card in the game's News panel on the
      main menu, newest first. German: the section "Neuigkeiten" in the German part. -->
 
-### Going Public Server 1.0.16.3
+### Going Public Server 1.0.17
+- **Going Online (module 8)**: everybody can found a cable provider of their own (the app "Going Online" in the phone and in the full menu, Shift+F12): connect buildings, sell internet, TV and phone lines, staff in six roles, DOCSIS 3.0 up to fiber, against the competitor Skyline Cable. A real business of the game ("Cable provider" in a warehouse, "Cable customer center" in an office, founded in BizMan), the equipment as furniture from the furniture store, devices from wholesalers and importers, staff from the recruitment agencies, help under F1. AMP switch "Going Online (cable provider)" (Modules tab), on by default.
+- **Ranking page: cable providers** - "Cable provider: ..." under the name and a section of their own with company, customers, buildings and founding; new ones are marked.
+- **Merger ends by itself** (AMP: "Merger: dissolve after days away", off by default): a member away for that many days leaves the company - everybody keeps their own property, the money is split equally.
+- **Ranking page: Players' buildings** - which player bought or rents which building, with the address and the business, updated every 20 s.
+- The save notices ("Saving the game on the server...", "Game saved on the server.") show at the top right with the game's notifications instead of in the middle of the screen.
+- **Moving apps**: drag an app on the phone to another place - over an arrow to another page. The order is kept.
+- **Walk or drive there**: the button at the top of the screen is gone. A destination set on the map asks right there: walk there, drive there (in the car) or the route only. In the car the vehicle panel's button row has "drive there" ("stop self-driving" while it drives); whether the car parks at the destination is set in the map's question.
+- **Self-driving**: it parks in the free spot closest to the destination's door, and it no longer stops at posts and hydrants beside the lane (the car's width was measured too wide).
+- **New businesses** (modules 9-11): IT firm (IT Support, Software Development, Cloud Services), cleaning company and laundromat - businesses of the game with their own staff, furniture and help. AMP switches "IT firm", "Cleaning company", "Laundromat" (Modules tab), on by default.
+- **Ranking page**: the players' buildings follow each player's own report (sold buildings and old names are gone).
+- **The lobby** follows the game's language; on a dedicated server it reads "Connected to the server". As a local mod, the game's mod list shows the mod's picture.
+- **Fast-forward time**: a new icon (bottom left), the window and the vote line in the player's language, larger and on a dark plate.
 - **Phone pages**: the BizPhone's apps in pages of eight with arrows, "1 / 2" and dots - the game's on page 1, the mod's on page 2: Chat, Business, Radio, Navigation, Planner, Insights, Camera and Signs open what their keys open. Modelled on Aluna's Phone Pages (our own code). AMP switch "Phone pages"; off = the phone as before.
+
+### Going Public Server 1.0.16.3
 - **Steam: only owners of the game** (AMP switch, with a Steam Web API key): the server lets in only players whose Steam account owns Big Ambitions - it has Steam confirm a ticket each player's game sends when joining, and a Steam emulator cannot make one. Family Sharing counts.
 - **Steam: friends can join**: while you play on a server, your Steam friends see "Join Game" on you (and you can invite them) and land on the same server with one click - address and server key included. The admin can switch it off in AMP.
 - **AMP switch "Navigation: sat-nav in the phone"**: whether the sat-nav fills the BizPhone whenever a destination is set (off = it stands on top of the phone).
@@ -216,7 +240,10 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
   whether the sat-nav lies in the phone are the same for every player
   on the server. **Radio station list**: the language of the radio stations every player gets
   (the files in `radio/` of this repository - edit one to change that list for everybody; Off = none).
-- **Game rules**: rent from owned buildings, building prices, bank loan limit and business sale.
+- **Game rules**: rent from owned buildings, building prices, bank loan limit and business sale. **Merger: dissolve
+  after days away**: a member who has not been on the server for that many days (counted while the server runs) leaves the company by themselves,
+  without the vote and the sale - everybody keeps their own property, the company's money is split equally, a merger of
+  two ends (only while another member was there; 0 = never).
 
 ### On the host: ranking page, save backups, AMP in German
 
@@ -235,7 +262,9 @@ Instances run in containers and cannot reach AMP's web folder, so small jobs run
   (unban, unban everyone), save and restart. In AMP itself the chat shows in the console, and the player list has Kick
   and Ban.
 - `bamp-web-sync.sh` serves each instance's ranking at `https://<your AMP address>/monitor/<game port>/index.html`
-  (the instance's Connection Link); players open it with their server's key. Merged companies show as "merged with ...". Below the ranking, **Server**
+  (the instance's Connection Link); players open it with their server's key. Merged companies show as "merged with ...". Below the ranking,
+  **Players' buildings** lists every building a player bought or rents or runs, with the business (updated every 20 s, sortable
+  by each column), and **Server**
   shows the last hour: network traffic in and out, messages, server FPS, the network rate, throttled players and each
   player's ping, packet loss and rate (the server writes it every 15 s). It also copies a German
   translation of AMP's own interface into AMP's web folder: open AMP once with `https://<your AMP address>/?lang=de`
@@ -286,8 +315,12 @@ The built-in modules are our own implementations, modelled on these Workshop mod
   [LIB BA Unified UI](https://steamcommunity.com/sharedfiles/filedetails/?id=3790426259) by - Capitaine -
 - Internet radio: [Big Ambitions Radio](https://steamcommunity.com/sharedfiles/filedetails/?id=3792403626) by Antegarr
 - Phone pages: [Aluna's Phone Pages](https://steamcommunity.com/sharedfiles/filedetails/?id=3739104140) by aluna
+- IT firm: [IT Business Expansion](https://steamcommunity.com/sharedfiles/filedetails/?id=3741969623) and
+  [Skill Kit](https://steamcommunity.com/sharedfiles/filedetails/?id=3795855100) by Cow a Bunga
+- Cleaning company and laundromat: [Spotless: Cleaning Company & Laundromat](https://steamcommunity.com/sharedfiles/filedetails/?id=3833316897) by We1tall
 
-[Claude Code](https://claude.com/claude-code), the AI assistant by Anthropic, helped with finding and fixing bugs.
+[Claude Code](https://claude.com/claude-code), the AI assistant by Anthropic, helped with the development and with
+finding and fixing bugs - among other things the Steam ownership check, the admin page, the sat-nav and the phone pages.
 
 Big Ambitions belongs to Hovgaard Games; every player and the server need their own copy of the game.
 
@@ -300,13 +333,13 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 - **Bitte keine anderen Mods benutzen.** Going Public Server bringt alles mit, was unten steht. Andere Mods können den
   Mehrspieler stören - weder im Spiel noch auf dem Server zusätzlich laden (AMP: *Steam Workshop Items* leer lassen und
   nichts nach `bamp-mods-extra/` legen). Die eingebauten Module ersetzen Immersion, BAScheduler, SmartSuite
-  (SmartInsights), VoogleRoute, Big Ambitions Radio und Alunas Phone Pages.
+  (SmartInsights), VoogleRoute, Big Ambitions Radio, Alunas Phone Pages, IT Business Expansion mit Skill Kit und Spotless.
 - **Den Server gibt es in mehreren Varianten** ([Releases](https://github.com/amaus1209/BigAmbitionsGoingPublicServer/releases)): die Vorlage für das Gameserver-Panel CubeCoders AMP
   (Linux, siehe *Server-Betreiber: AMP*) und ein eigenes Programm mit Weboberfläche für **Windows** und **Linux** sowie
   als **Docker**-Container (siehe *Server-Betreiber: Windows, Linux, Docker*). Spieler können selbst kein Spiel mehr
   hosten: Mehrspieler heißt, einem dedizierten Server beizutreten.
 - **Fehler bitte melden** unter [Issues](https://github.com/amaus1209/BigAmbitionsGoingPublicServer/issues) oder in den Kommentaren der [Steam-Workshop-Seite](https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182): mit der
-  Version (unten links im Spiel, z. B. „1.0.16.3 (6ec84249)“), was passiert ist und, wenn möglich, der Player.log
+  Version (unten links im Spiel, z. B. „1.0.17 (9956f581)“), was passiert ist und, wenn möglich, der Player.log
   (Windows: `%USERPROFILE%\AppData\LocalLow\Hovgaard Games\Big Ambitions\Player.log`).
 - **Server und Spieler brauchen dieselbe Version.** Steam hält das Abo der Spieler aktuell; den Server nach einem neuen
   Release aktualisieren.
@@ -332,18 +365,27 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 - **Fusion**: Firmen mehrerer Spieler zu einer zusammenlegen; Auflösen nur, wenn alle zustimmen (dann wird alles
   verkauft und das Geld geteilt).
 - **Handy-Seiten**: die Apps des BizPhones auf Seiten zu acht mit Pfeilen, „1 / 2“ und Punkten - die des Spiels auf
-  Seite 1, die der Mod auf Seite 2: Chat, Spieler, Radio, Navi, Planer, Auswertung, Kamera, Schilder. Nachgebaut nach
-  Alunas Phone Pages.
+  Seite 1, die der Mod auf Seite 2: Chat, Spieler, Radio, Navi, Planer, Auswertung, Kamera, Schilder; eine App mit der
+  Maus an eine andere Stelle ziehen, auch auf eine andere Seite. Nachgebaut nach Alunas Phone Pages.
+- **Neue Unternehmen** (Module 9-11): **IT-Firma** (IT-Support, Softwareentwicklung, Cloud-Dienste: das Personal rechnet
+  Stunden an IT-Arbeitsplätzen ab, Server mit blinkenden Lämpchen müssen im Büro stehen und kosten Strom),
+  **Reinigungsfirma** (die Kräfte putzen zuerst die eigenen Geschäfte, dann zahlt Kundschaft der Stadt) und
+  **Waschsalon** (Waschmaschinen, Trockner, Waschen & Falten). Gegründet in BizMan, Personal von den Personalagenturen,
+  Preise und Schichten in BizMan, Hilfe unter F1. Nachgebaut nach IT Business Expansion und Skill Kit von Cow a Bunga
+  und Spotless von We1tall.
 - **Chat** im Handy, mit Hinweis auf ungelesene Nachrichten.
 - **Internetradio**: Radio-App mit den Sendern des Spiels, der Senderliste des Servers in seiner Sprache und eigenen
   Sendern (http und https, mit Liedtitel), Favoriten, Suche und alphabetischer Sortierung. Radio zu Fuß,
   Laden-Lautsprecher mit Internetsendern; Mitfahrer hören den Sender des Fahrers.
 - **Navigation** (Umschalt+F11 oder App „Navi“): Ziel suchen oder auf der Stadtkarte anklicken; ein Navi im Stil des
   Spiels im BizPhone mit Kartenausschnitt, nächster Abbiegung, Straßennamen, Restzeit und Ankunft. Route im Auto blau,
-  zu Fuß orange, mit Spurwahl vor dem Abbiegen. Ein kurzer Rechtsklick in die Welt (Karte zu) löscht die Route.
+  zu Fuß orange, mit Spurwahl vor dem Abbiegen. Wer auf der Karte ein Ziel setzt, wird gleich gefragt: Hinlaufen,
+  Hinfahren oder nur Navi. Ein kurzer Rechtsklick in die Welt (Karte zu) löscht die Route.
 - **Autopilot**: Im eigenen Auto fährt „Hinfahren“ zum Ziel - mit Blinker, Halt an Ampeln und vor Autos und Personen,
-  Tempolimit, auch in Parkhäuser - und parkt dort; er kann einem Freund folgen. Zu Fuß läuft die Figur auf Wunsch selbst
-  hin.
+  Tempolimit, auch in Parkhäuser - und parkt dort („Automatisch parken“ in der Leiste unten); er kann einem Freund
+  folgen. Zu Fuß läuft die Figur auf Wunsch selbst hin.
+- **Zeit vorspulen**: Der Knopf unten links (oder das Fenster beim Sitzen, Schlafen, Trainieren …) fragt alle; stimmen
+  alle zu, läuft die Zeit bis zur gewählten Uhrzeit schneller.
 - **F6 RPG-Kamera** (Einstellungen F8 oder App „Kamera“): Kamera hinter der Figur, zu Fuß und im Auto.
 - **F7 Ladenschilder** (App „Schilder“): eigene Bilder auf Schildern, Ladenschildern und Werbetafeln; die anderen
   Spieler sehen sie.
@@ -367,20 +409,42 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
   beitreten.
 - Welten: Welt wählen, neue Welt mit Name und Schwierigkeit (auch eigene Werte), einen Spielstand einmal laden.
 - Jedes Modul einzeln an oder aus: Steuern per Telefon, Ladenschilder, RPG-Kamera, Planer, Auswertung, Navigation,
-  Handy-Seiten; dazu Navi im Handy, Routenlinie und Kamera-Einstellungen für alle.
-- Spielregeln: Miete aus eigenen Gebäuden, Gebäudepreise, Kreditrahmen der Bank, Geschäftsverkauf.
+  Handy-Seiten, Going Online (Kabelanbieter); dazu Navi im Handy, Routenlinie und Kamera-Einstellungen für alle.
+- Spielregeln: Miete aus eigenen Gebäuden, Gebäudepreise, Kreditrahmen der Bank, Geschäftsverkauf, und eine Fusion, die
+  sich von selbst auflöst, wenn ein Mitglied eine einstellbare Zahl von Tagen weg ist.
 - Radio-Senderliste je Sprache für alle Spieler (die Dateien in `radio/`, z. B. 250 deutsche Sender).
 - **Verwaltung**: Admin-Seite im Browser (Anmeldung mit dem AMP-Konto) mit den Spielern online (Nachricht, Kicken,
   Bannen mit Grund), Chat zum Mitlesen und Schreiben, Bannliste mit Entbannen, Ankündigungen auf jedem Bildschirm,
   Speichern und Neustart sofort oder angekündigt. In AMP: Chat in der Konsole, Kick und Ban in der Spielerliste, Warnung
   an die Spieler, bevor AMP den Server stoppt. Der Server ohne AMP hat dasselbe im Reiter *Spieler*.
-- Rangliste im Browser mit Serverwerten: Netzverkehr, Server-FPS, Ping und Verlust je Spieler.
+- Rangliste im Browser mit den Gebäuden der Spieler (wer welches gekauft oder gemietet hat, mit dem Geschäft), den
+  Kabelanbietern der Spieler und den Serverwerten: Netzverkehr, Server-FPS, Ping und Verlust je Spieler.
 - Sicherungen der Spielstände; AMP auf Deutsch, die Einstellungen in der Server-Sprache.
 
 ### Neuigkeiten
 
-#### Going Public Server 1.0.16.3
+#### Going Public Server 1.0.17
+- **Going Online (Modul 8)**: Jede Person kann einen eigenen Kabelanbieter gründen (App „Going Online“ im Handy und im
+  großen Menü, Umschalt+F12): Häuser anschließen, Internet, Fernsehen und Telefon verkaufen, Personal in sechs Rollen,
+  DOCSIS 3.0 bis Glasfaser, gegen den Konkurrenten Skyline Cable. Ein echtes Unternehmen des Spiels („Kabelanbieter“ im
+  Lagerhaus, „Kabel-Kundencenter“ im Büro, gegründet in BizMan), Technik als Möbel aus dem Möbelladen, Geräte von Großhändlern
+  und Importeuren, Personal von den Personalagenturen, Hilfe unter F1. AMP-Schalter „Going Online (Kabelanbieter)“ (Reiter
+  Module), ab Werk an.
+- **Rangliste: Kabelanbieter** – unter dem Namen „Kabelanbieter: …“ und ein eigener Abschnitt mit Firma, Anschlüssen,
+  Häusern und Gründung; neue Gründungen sind markiert.
+- **Fusion löst sich von selbst auf** (AMP: „Fusion: auflösen nach Tagen Abwesenheit“, ab Werk aus): Ein Mitglied, das so viele Tage weg ist, scheidet aus - alle behalten ihr Eigentum, das Geld wird gleichmäßig geteilt.
+- **Rangliste: Gebäude der Spieler** - welcher Spieler welches Gebäude gekauft oder gemietet hat, mit Adresse und Geschäft, alle 20 s neu.
+- Die Speicher-Meldungen („Spielstand wird auf dem Server gespeichert …“, „… gespeichert“) erscheinen oben rechts bei den Benachrichtigungen des Spiels statt in der Bildmitte.
+- **Apps verschieben**: Eine App im Handy mit der Maus an eine andere Stelle ziehen - über einem Pfeil auf eine andere Seite. Die Reihenfolge bleibt.
+- **Hinlaufen oder hinfahren**: Der Knopf oben im Bild ist weg. Wer auf der Karte ein Ziel setzt, wird gleich dort gefragt: Hinlaufen, Hinfahren (im Auto) oder nur Navi. Im Auto steht in der Knopfleiste der Fahrzeuganzeige „Hinfahren“ (während der Fahrt „Autofahrt stoppen“); ob das Auto am Ziel einparkt, stellt man bei der Frage auf der Karte ein.
+- **Autofahrt**: Sie parkt auf dem freien Platz, der der Tür des Ziels am nächsten ist, und bleibt nicht mehr an Pfosten und Hydranten neben der Spur stehen (die Breite des Autos war zu groß gemessen).
+- **Neue Unternehmen** (Module 9-11): IT-Firma (IT-Support, Softwareentwicklung, Cloud-Dienste), Reinigungsfirma und Waschsalon - Unternehmen des Spiels mit eigenem Personal, eigenen Möbeln und Hilfe. AMP-Schalter „IT-Firma“, „Reinigungsfirma“, „Waschsalon“ (Reiter Module), ab Werk an.
+- **Rangliste**: Die Gebäude der Spieler folgen der Meldung jedes Spielers (verkaufte Gebäude und alte Namen sind weg).
+- **Die Lobby** folgt der Sprache des Spiels; auf einem dedizierten Server steht dort „Mit dem Server verbunden“. Als lokaler Mod zeigt die Mod-Liste des Spiels das Bild der Mod.
+- **Zeit vorspulen**: ein neues Symbol (unten links), Fenster und Abstimmungszeile in der Sprache des Spielers, größer und auf dunklem Grund.
 - **Handy-Seiten**: Die Apps des BizPhones auf Seiten zu acht mit Pfeilen, „1 / 2“ und Punkten - die des Spiels auf Seite 1, die der Mod auf Seite 2: Chat, Spieler, Radio, Navi, Planer, Auswertung, Kamera und Schilder öffnen, was ihre Tasten öffnen. Nachgebaut nach Alunas Phone Pages (eigener Code). AMP-Schalter „Handy-Seiten“; aus = das Handy wie bisher.
+
+#### Going Public Server 1.0.16.3
 - **Steam: nur mit gekauftem Spiel** (AMP-Schalter, mit Steam-Web-API-Schlüssel): Der Server lässt nur Spieler herein, deren Steam-Konto Big Ambitions besitzt – er lässt sich von Steam ein Ticket bestätigen, das das Spiel jedes Spielers beim Beitreten mitschickt; ein Steam-Emulator kann keines ausstellen. Die Familienbibliothek zählt.
 - **Steam: Freunde können beitreten**: Spielst du auf einem Server, sehen deine Steam-Freunde bei dir „Spiel beitreten“ (und du kannst sie einladen) und landen mit einem Klick auf demselben Server – mit Adresse und Server-Schlüssel. Der Admin kann es in AMP abschalten.
 - **AMP-Schalter „Navigation: Navi im Handy“**: ob das Navi den BizPhone-Bildschirm füllt, sobald ein Ziel gesetzt ist (aus = es steht über dem Handy).
@@ -463,7 +527,7 @@ Server dann (wenige Sekunden).
   Pausenmenü), Server-Schlüssel, automatisches Speichern, **Bildrate im Betrieb** (60, 120 oder 200 FPS) und ohne
   Spieler sowie **Netzwerk-Takt** (Normal 10 / 5 Hz, Hoch 20 / 10 Hz, Sehr hoch 30 / 15 Hz, Maximal 60 / 30 Hz – wie
   oft Positionen, Autos und Verkehr über das Netz gehen; höher fährt sich flüssiger, und weil der Strom jedes Spielers
-  an jeden anderen geht, wächst die Datenmenge mit mehr Spielern schnell).KB
+  an jeden anderen geht, wächst die Datenmenge mit mehr Spielern schnell).
 - **Vorwarnung, bevor AMP den Server stoppt** (Reiter Server): Stoppt, startet oder aktualisiert AMP den Server, während
   Spieler da sind, werden sie erst gewarnt (Standard 60 s, bei 60, 30 und 10 s), dann wird gespeichert. Ankündigungen und
   einen länger angekündigten Neustart aus AMP selbst: in der Konsole `notice <Text>` und `restart <Minuten>`
@@ -477,7 +541,10 @@ Server dann (wenige Sekunden).
 - **Module**: jedes eingebaute Modul für alle an- oder ausschalten (auch die Handy-Seiten). **RPG-Kamera**, die Routenlinie der Navigation und
   ob das Navi im Handy steht, sind auf dem Server für alle Spieler gleich. **Radio-Senderliste**: die Sprache der Radiosender, die alle Spieler
   bekommen (die Dateien in `radio/` dieses Repos - wer eine ändert, ändert die Liste für alle; Off = keine).
-- **Spielregeln**: Miete aus eigenen Gebäuden, Gebäudepreise, Kreditrahmen der Bank und Geschäftsverkauf.
+- **Spielregeln**: Miete aus eigenen Gebäuden, Gebäudepreise, Kreditrahmen der Bank und Geschäftsverkauf. **Fusion:
+  auflösen nach Tagen Abwesenheit**: Ein Mitglied, das so viele Tage nicht auf dem Server war (gezählt, solange der Server läuft),
+  scheidet von selbst aus, ohne Abstimmung und Verkauf - alle behalten ihr Eigentum, das Geld der Firma wird gleichmäßig geteilt, eine Fusion
+  aus zwei endet (nur solange ein anderes Mitglied da war; 0 = nie).
 
 **Admin-Seite:** `https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html#admin` – in AMP auf der Statusseite der Instanz
 als „Admin-Seite“ unter dem Verbindungslink, auf der Rangliste oben rechts („Admin“) und unter der Tabelle – Anmeldung mit dem AMP-Konto; es braucht in AMP das Recht, die Konsole dieser Instanz zu benutzen. Spieler
@@ -488,7 +555,8 @@ Spielerliste hat die Knöpfe Kick und Ban.
 **Auf dem Host (Cron, siehe oben):** `bamp-web-sync.sh` stellt die Rangliste jeder Instanz unter
 `https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html` bereit (der Verbindungslink der Instanz) (fusionierte Firmen stehen als „fusioniert mit …“ dabei) und legt
 die deutsche Übersetzung der AMP-Oberfläche ab: AMP einmal mit `https://<AMP-Adresse>/?lang=de` öffnen (pro Browser).
-Unter der Rangliste zeigt **Server** die letzte Stunde: Netzverkehr rein und raus, Nachrichten, Server-FPS, Netzwerk-Takt,
+Unter der Rangliste stehen die **Gebäude der Spieler**: jedes Gebäude, das ein Spieler gekauft, gemietet oder betrieben hat,
+mit dem Geschäft (alle 20 s neu, nach jeder Spalte sortierbar). Darunter zeigt **Server** die letzte Stunde: Netzverkehr rein und raus, Nachrichten, Server-FPS, Netzwerk-Takt,
 gedrosselte Spieler sowie Ping, Paketverlust und Takt je Spieler (der Server schreibt das alle 15 s).
 `backup-saves.sh --all` sichert die Mehrspieler-Spielstände aller Instanzen nach `~/backups/saves/` (14 pro Instanz).
 
@@ -523,10 +591,10 @@ Inoffizieller Fork von [Going Public](https://github.com/Melaus123/BigAmbitionMu
 eingebauten Module sind eigene Umsetzungen nach dem Vorbild dieser Workshop-Mods (Links oben unter *Credits*): Immersion -
 RPG Camera von Chamiks, BAScheduler von Shanpapa, SmartSuite Empire Management (SmartInsights, SmartRent) von
 ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ, Voogle Route mit LIB BA Player Location und LIB BA Unified UI von - Capitaine -, Big Ambitions Radio
-von Antegarr und Aluna's Phone Pages von aluna (die Handy-Seiten sind danach nachgebaut, kein fremder Code). Vielen
-Dank an ihre Autoren.
+von Antegarr, Aluna's Phone Pages von aluna, IT Business Expansion und Skill Kit von Cow a Bunga sowie Spotless:
+Cleaning Company & Laundromat von We1tall (alles danach nachgebaut, kein fremder Code). Vielen Dank an ihre Autoren.
 
-Beim Finden und Beheben von Fehlern hat [Claude Code](https://claude.com/claude-code) mitgeholfen,
-der KI-Assistent von Anthropic.
+Bei der Entwicklung und beim Finden und Beheben von Fehlern hat [Claude Code](https://claude.com/claude-code) mitgeholfen,
+der KI-Assistent von Anthropic - unter anderem bei der Steam-Prüfung, der Admin-Seite, dem Navi und den Handy-Seiten.
 
 Big Ambitions gehört Hovgaard Games; jeder Spieler und auch der Server brauchen eine eigene Lizenz des Spiels.
