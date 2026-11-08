@@ -1,0 +1,198 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- EA 0.11+ (Mono backend).  The IL2CPP/BepInEx project lives on the
+         'main' branch for EA 0.10. -->
+    <TargetFramework>net48</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>BigAmbitionsMP</AssemblyName>
+    <RootNamespace>BigAmbitionsMP</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Build configs.  The shipped mod is built Release (or Debug) and does NOT define BAMP_DEV.
+       CORRECTED 2026-08-26 (release audit): the old wording here claimed MPPerf / MPLoadProfiler /
+       MPAudit are all "inert — nothing runs on a player's machine". Only MPLoadProfiler is gated
+       (Enabled=false outside Dev). MPPerf is Enabled=true on purpose — it is why bug reports carry
+       perf data — and MPAudit has NO gate at all: it hashes the business table plus up to 40 interiors
+       every 30s on every player. Both are deliberate; the comment was not, and a maintainer reading it
+       at release time would skip the diagnostics sweep. (MPAutopilot removed.)
+       Build `-c Dev` to turn the dev-only scaffolding back on for local testing. -->
+  <PropertyGroup>
+    <Configurations>Debug;Release;Dev</Configurations>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Dev'">
+    <DefineConstants>$(DefineConstants);BAMP_DEV</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="!$([MSBuild]::IsOSPlatform('OSX'))">
+    <GameDir>C:\Program Files (x86)\Steam\steamapps\common\Big Ambitions\</GameDir>
+    <!-- EnsureTrailingSlash at the point of USE, not on GameDir itself: a
+         `-p:GameDir=...` passed without a trailing slash broke the path, and a
+         global property (one set on the command line) cannot be re-assigned. -->
+    <ManagedDir>$([MSBuild]::EnsureTrailingSlash('$(GameDir)'))Big Ambitions_Data\Managed\</ManagedDir>
+    <!-- Official mod loader: <persistentDataPath>\ModsLocal\<ModName>\ with
+         EXACTLY ONE top-level dll; dependencies in Dependencies\ subfolder.
+         persistentDataPath is per-user, so BOTH game instances load the same
+         deployed mod — one deploy serves host and client. -->
+    <ModDeployDir>$(LOCALAPPDATA)Low\Hovgaard Games\Big Ambitions\ModsLocal\GoingPublicServer\</ModDeployDir>
+  </PropertyGroup>
+
+  <!-- macOS paths from the Unity conventions and a Mac user's report (2026-09-16),
+       unverified here; the shipped DLL is the Windows build — it binds Steamworks at
+       run time (see ModEntry's resolver). -->
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <GameDir>$(HOME)/Library/Application Support/Steam/steamapps/common/Big Ambitions/</GameDir>
+    <ManagedDir>$([MSBuild]::EnsureTrailingSlash('$(GameDir)'))Big Ambitions.app/Contents/Resources/Data/Managed/</ManagedDir>
+    <ModDeployDir>$(HOME)/Library/Application Support/Hovgaard Games/Big Ambitions/ModsLocal/GoingPublicServer/</ModDeployDir>
+  </PropertyGroup>
+
+  <!-- Keep standalone tooling out of the game mod assembly (telemetry\ = the Python Desktop Monitor;
+       the Telemetry API itself is built in: src\TelemetryApi.cs). -->
+  <ItemGroup>
+    <Compile Remove="tools\**\*.cs" />
+    <EmbeddedResource Remove="tools\**\*" />
+    <None Remove="tools\**\*" />
+    <Compile Remove="telemetry\**\*.cs" />
+    <EmbeddedResource Remove="telemetry\**\*" />
+    <None Remove="telemetry\**\*" />
+    <!-- headless\preloader\ = the server-only Doorstop preloader (its own project). -->
+    <Compile Remove="headless\**\*.cs" />
+    <EmbeddedResource Remove="headless\**\*" />
+    <None Remove="headless\**\*" />
+    <!-- standalone\ = the server without AMP (its own .NET 8 project, STANDALONE-1). -->
+    <Compile Remove="standalone\**\*.cs" />
+    <EmbeddedResource Remove="standalone\**\*" />
+    <None Remove="standalone\**\*" />
+    <Content Remove="standalone\**\*" />
+    <!-- goingonline\ = the cable provider (GOING-ONLINE-1): its core\ is compiled in as module 8; its own entry (src\),
+         tools and build output belong to the stand-alone Going Online mod (goingonline\GoingOnline.csproj). -->
+    <Compile Remove="goingonline\src\**\*.cs" />
+    <Compile Remove="goingonline\obj\**\*.cs" />
+    <Compile Remove="goingonline\bin\**\*.cs" />
+    <Compile Remove="goingonline\tools\**\*.cs" />
+    <EmbeddedResource Remove="goingonline\**\*" />
+    <None Remove="goingonline\**\*" />
+    <Content Remove="goingonline\**\*" />
+  </ItemGroup>
+
+  <!-- NuGet -->
+  <ItemGroup>
+    <PackageReference Include="Lib.Harmony" Version="2.4.2" />
+    <PackageReference Include="LiteNetLib" Version="1.3.1" />
+    <!-- RADIO-STREAMS-3: MP3 decoder for internet radio (MIT, naudio/NLayer; netstandard2.0, no dependencies) -->
+    <PackageReference Include="NLayer" Version="3.0.0" />
+    <PackageReference Include="Krafs.Publicizer" Version="2.2.1" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Framework zip support (bug-report bundle, 2026-07-08). Resolves from the .NET Framework
+       reference assemblies at build; at runtime Unity's Mono ships System.IO.Compression.dll in
+       the game's Managed folder (verified present). -->
+  <ItemGroup>
+    <Reference Include="System.IO.Compression" />
+  </ItemGroup>
+
+  <!-- Publicize the game assemblies: the IL2CPP interop layer used to expose
+       private members publicly; on Mono the publicizer restores that access
+       (compile-time refs with IgnoresAccessChecksTo at runtime). -->
+  <ItemGroup>
+    <Publicize Include="BigAmbitions" />
+    <Publicize Include="BigAmbitions.Items" />
+    <Publicize Include="BigAmbitions.Characters" />
+    <Publicize Include="BigAmbitions.InteriorDesigner" />
+    <Publicize Include="BigAmbitions.PlacementSystem" />
+    <Publicize Include="BigAmbitions.AI" />
+    <Publicize Include="BigAmbitions.Neighborhoods" />
+    <Publicize Include="DayNightCycle" />
+    <Publicize Include="HGExtensions" />
+    <Publicize Include="ExternalPlugins" />
+  </ItemGroup>
+
+  <!-- Game + Unity assemblies (Private=false: never shipped, the game has them) -->
+  <ItemGroup>
+    <Reference Include="BigAmbitions"><HintPath>$(ManagedDir)BigAmbitions.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.Items"><HintPath>$(ManagedDir)BigAmbitions.Items.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.Factories"><HintPath>$(ManagedDir)BigAmbitions.Factories.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.Characters"><HintPath>$(ManagedDir)BigAmbitions.Characters.dll</HintPath><Private>false</Private></Reference>
+    <!-- Round-119 serve mirror: the follower performs the job, so it needs the game's own animation/audio calls. -->
+    <Reference Include="BigAmbitions.SoundSystem"><HintPath>$(ManagedDir)BigAmbitions.SoundSystem.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AudioModule"><HintPath>$(ManagedDir)UnityEngine.AudioModule.dll</HintPath><Private>false</Private></Reference>
+    <!-- RADIO-STREAMS-1: internet radio streams in the game's radio -->
+    <Reference Include="UnityEngine.UnityWebRequestModule"><HintPath>$(ManagedDir)UnityEngine.UnityWebRequestModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UnityWebRequestAudioModule"><HintPath>$(ManagedDir)UnityEngine.UnityWebRequestAudioModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="DOTween"><HintPath>$(ManagedDir)DOTween.dll</HintPath><Private>false</Private></Reference>
+    <!-- Round-130 queue probe: CustomerJoinQueue is a BehaviorDesigner task. -->
+    <Reference Include="BehaviorDesigner.Runtime"><HintPath>$(ManagedDir)BehaviorDesigner.Runtime.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.InteriorDesigner"><HintPath>$(ManagedDir)BigAmbitions.InteriorDesigner.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.PlacementSystem"><HintPath>$(ManagedDir)BigAmbitions.PlacementSystem.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.AI"><HintPath>$(ManagedDir)BigAmbitions.AI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.Neighborhoods"><HintPath>$(ManagedDir)BigAmbitions.Neighborhoods.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.ModAPI"><HintPath>$(ManagedDir)BigAmbitions.ModAPI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.ModsInternal"><HintPath>$(ManagedDir)BigAmbitions.ModsInternal.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="HGPlugins"><HintPath>$(ManagedDir)HGPlugins.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="DayNightCycle"><HintPath>$(ManagedDir)DayNightCycle.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="HGExtensions"><HintPath>$(ManagedDir)HGExtensions.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="ExternalPlugins"><HintPath>$(ManagedDir)ExternalPlugins.dll</HintPath><Private>false</Private></Reference>
+    <!-- Steam-connect campaign: the game ships + initializes Facepunch.Steamworks
+         (2.5.2) — we piggyback for relay networking, invites, rich presence.
+         The game ships Win64 on Windows and Posix on Mac (same namespaces, same
+         types), so exactly one of these two resolves at compile time; ModEntry's
+         run-time resolver then serves whichever one is loaded to code compiled
+         against the other. -->
+    <Reference Include="Facepunch.Steamworks.Win64" Condition="Exists('$(ManagedDir)Facepunch.Steamworks.Win64.dll')"><HintPath>$(ManagedDir)Facepunch.Steamworks.Win64.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Facepunch.Steamworks.Posix" Condition="!Exists('$(ManagedDir)Facepunch.Steamworks.Win64.dll') And Exists('$(ManagedDir)Facepunch.Steamworks.Posix.dll')"><HintPath>$(ManagedDir)Facepunch.Steamworks.Posix.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>$(ManagedDir)Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine"><HintPath>$(ManagedDir)UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(ManagedDir)UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AIModule"><HintPath>$(ManagedDir)UnityEngine.AIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(ManagedDir)UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AnimationModule"><HintPath>$(ManagedDir)UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(ManagedDir)UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.ImageConversionModule"><HintPath>$(ManagedDir)UnityEngine.ImageConversionModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(ManagedDir)UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(ManagedDir)UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UIModule"><HintPath>$(ManagedDir)UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UI"><HintPath>$(ManagedDir)UnityEngine.UI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Unity.TextMeshPro"><HintPath>$(ManagedDir)Unity.TextMeshPro.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Cinemachine"><HintPath>$(ManagedDir)Cinemachine.dll</HintPath><Private>false</Private></Reference>
+    <!-- TRAFFIC-GRID-1: GridManager.activeCameraPositions is a NativeArray<float3> — the
+         array Gley's GetCell(int) indexes — so the guard needs both of these to read it. -->
+    <Reference Include="Unity.Collections"><HintPath>$(ManagedDir)Unity.Collections.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Unity.Mathematics"><HintPath>$(ManagedDir)Unity.Mathematics.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <!-- Deploy to the official loader's local-mods folder (shared by both
+       instances).  Layout: ModsLocal\GoingPublicServer\BigAmbitionsMP.dll
+       + Dependencies\{0Harmony,LiteNetLib}.dll + assets\ icons.
+       preview.png is the ONLY top-level image: the game's Workshop upload
+       panel auto-picks the first top-level png/jpg as the item thumbnail. -->
+  <Target Name="DeployToModsLocal" AfterTargets="Build">
+    <MakeDir Directories="$(ModDeployDir);$(ModDeployDir)Dependencies;$(ModDeployDir)assets" />
+    <Copy SourceFiles="$(TargetDir)$(AssemblyName).dll" DestinationFolder="$(ModDeployDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)0Harmony.dll" DestinationFolder="$(ModDeployDir)Dependencies\" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)LiteNetLib.dll" DestinationFolder="$(ModDeployDir)Dependencies\" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)NLayer.dll" DestinationFolder="$(ModDeployDir)Dependencies\" ContinueOnError="true" />
+    <Copy Condition="Exists('$(ProjectDir)assets\BAMP_ChatIcon.png')" SourceFiles="$(ProjectDir)assets\BAMP_ChatIcon.png" DestinationFolder="$(ModDeployDir)assets\" ContinueOnError="true" />
+    <Copy Condition="Exists('$(ProjectDir)assets\BAMP_HubIcon.png')" SourceFiles="$(ProjectDir)assets\BAMP_HubIcon.png" DestinationFolder="$(ModDeployDir)assets\" ContinueOnError="true" />
+    <Copy Condition="Exists('$(ProjectDir)assets\BAMP_RadioIcon.png')" SourceFiles="$(ProjectDir)assets\BAMP_RadioIcon.png" DestinationFolder="$(ModDeployDir)assets\" ContinueOnError="true" />
+    <!-- PHONE-PAGES-1: the apps of the phone's further pages -->
+    <Copy SourceFiles="$(ProjectDir)assets\BAMP_NavIcon.png;$(ProjectDir)assets\BAMP_PlannerIcon.png;$(ProjectDir)assets\BAMP_InsightsIcon.png;$(ProjectDir)assets\BAMP_CameraIcon.png;$(ProjectDir)assets\BAMP_SignsIcon.png" DestinationFolder="$(ModDeployDir)assets\" ContinueOnError="true" />
+    <Copy Condition="Exists('$(ProjectDir)assets\BAMP_LoiterIcon.png')" SourceFiles="$(ProjectDir)assets\BAMP_LoiterIcon.png" DestinationFolder="$(ModDeployDir)assets\" ContinueOnError="true" />
+    <!-- GOING-ONLINE-1: the cable provider's app icon -->
+    <Copy Condition="Exists('$(ProjectDir)assets\GO_AppIcon.png')" SourceFiles="$(ProjectDir)assets\GO_AppIcon.png" DestinationFolder="$(ModDeployDir)assets\" ContinueOnError="true" />
+    <Copy Condition="Exists('$(ProjectDir)assets\preview.png')" SourceFiles="$(ProjectDir)assets\preview.png" DestinationFolder="$(ModDeployDir)" ContinueOnError="true" />
+    <!-- MIT notices must travel with the bundled Harmony/LiteNetLib binaries —
+         the deployed folder is also the Workshop upload source. -->
+    <Copy SourceFiles="$(ProjectDir)THIRD-PARTY-NOTICES.txt;$(ProjectDir)LICENSE" DestinationFolder="$(ModDeployDir)" ContinueOnError="true" />
+    <!-- MULTILANG-1: the game's mod loader registers <mod>\Locales\<lang>.json (LocalizorManager) -->
+    <ItemGroup><GpsLocales Include="$(ProjectDir)Locales\*.json" /></ItemGroup>
+    <Copy SourceFiles="@(GpsLocales)" DestinationFolder="$(ModDeployDir)Locales\" ContinueOnError="true" />
+    <!-- LOGO-SHAPES-1: black-and-white logo shapes for our business types (tools/make_logos.py draws them) -->
+    <ItemGroup><GpsLogos Include="$(ProjectDir)assets\logos\*.png" /></ItemGroup>
+    <MakeDir Directories="$(ModDeployDir)assets\logos" />
+    <Copy SourceFiles="@(GpsLogos)" DestinationFolder="$(ModDeployDir)assets\logos\" ContinueOnError="true" />
+    <!-- Pre-0.1.11 deploys left the icons at the mod root — remove them so the
+         Workshop thumbnail auto-pick can't grab a phone icon. -->
+    <Delete Files="$(ModDeployDir)BAMP_ChatIcon.png;$(ModDeployDir)BAMP_HubIcon.png" ContinueOnError="true" />
+  </Target>
+</Project>
