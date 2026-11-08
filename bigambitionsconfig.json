@@ -666,6 +666,30 @@
         }
     },
     {
+        "DisplayName": "Player error reports",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "The players' games send this server their errors, warnings and the mod's check lines while they play - only after each player agreed once (asked when joining, changeable under Options, tab Mods), without Windows user names, IP addresses, Steam IDs and keys. After a crash, or asked with the console command playerlog <player>, the whole Player.log too. Files in bigambitions/player-reports (summary.json, one file per player and day, logs/), kept 14 days; every 10 minutes one line in the console, the console command reports lists the most frequent errors. Off = nothing is sent.",
+        "Keywords": "telemetry,log,errors,reports",
+        "FieldName": "PlayerReports",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.PlayerReports",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
+        "DisplayName": "Chat translation",
+        "Category": "Big Ambitions:storefront",
+        "Subcategory": "Server:dns:1",
+        "Description": "Translates the players' chat between German and English, on this server itself: no account, no service on the internet - the chat never leaves the server. Each player reads foreign-language lines in the language of their game, with the original small below; each player can switch it off under Options, tab Mods. The first start sets the translator up once in bigambitions/bamp-translate (about 550 MB download, outside the game folder, so not in the backups) - the game starts at once, the translation follows within minutes. About 400 MB of memory while the server runs. Console command translate <text> for a test. Off = chat as written, nothing is set up or started.",
+        "Keywords": "chat,translation,language,german,english",
+        "FieldName": "ChatTranslate",
+        "InputType": "checkbox",
+        "ParamFieldName": "$.ChatTranslate",
+        "DefaultValue": "true",
+        "EnumValues": {}
+    },
+    {
         "DisplayName": "Headless",
         "Category": "Big Ambitions:storefront",
         "Subcategory": "Server:dns:1",
