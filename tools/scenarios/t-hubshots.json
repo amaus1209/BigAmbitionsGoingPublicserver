@@ -1,0 +1,1041 @@
+{
+  "id": "T-HUBSHOTS",
+  "title": "DEV screenshot capture (2026-09-28, redesign reference: 'make sure visually it matches more closely with the other screens from the same phone'): the game's own phone apps (BizMan, MyEmployees, Contacts + two conversations, Rivals, EconoView, Persona) opened through SmartphoneUI.OpenApp like their icons; then the REBUILT Business page (2026-09-28: Offers to you / Your offers / Loans / Access / Company) empty and with 12 LOCAL sample rows per list (9 player cards), a merger proposal row (the client's real proposal, withdrawn after) and the merger popup (DEV lever, sends nothing); then the floating chat window empty, with 40 LOCAL lines (two long wrapped ones), scrolled back, and at a small size. 'screenshot hub-<view>' captures each on the host. Host + 1 client on save1 (a real second player exists). Sample rows are display-only (never sent, never saved) and cleared at the end. Run at two sizes: normal, and BAMP_RIG_WINDOW=1280x720.",
+  "preconditions": "Dev build with the phoneapp / hubview (offers|yours|loans|access|company|mergerpopup|popupclose|mergetip|mergetipstate|mergetipoff) / chatview / contactopen / uifill levers (TestDrive.cs). Fixture save1 (host melaus, client Client1). Keep the host window unfocused but NOT minimised (a minimised window does not render).",
+  "instances": 2,
+  "vars": {
+    "clientPid": "Client1",
+    "hostPid": "melaus",
+    "session": "save1"
+  },
+  "oracles_absent": [
+    "\\[TestDrive\\] screenshot: ",
+    "\\[TestDrive\\] Dev(SetHubTab|AppendLocal|Remove): ",
+    "\\[Hub\\] ShowHubNative: ",
+    "active loan\\(s\\) but none match my id",
+    "upload SKIPPED"
+  ],
+  "oracles_report": [
+    "\\[TestDrive\\] screenshot ",
+    "\\[Hub\\] ",
+    "NullReferenceException"
+  ],
+  "steps": [
+    {
+      "role": "h",
+      "cmd": "host",
+      "expect_result": "^OK",
+      "seq": 1
+    },
+    {
+      "role": "c",
+      "cmd": "join",
+      "expect_result": "^OK",
+      "seq": 2
+    },
+    {
+      "role": "h",
+      "cmd": "hostload ${session}",
+      "expect_result": "^OK",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[BAMP\\] \\[LoadProf\\].*HOST ReleaseStartupHold \\(all players world-ready\\)",
+          "within_s": 240
+        },
+        {
+          "role": "h",
+          "regex": "\\[BAMP\\] \\[Lifecycle\\] WorldReady",
+          "within_s": 60
+        }
+      ],
+      "seq": 3
+    },
+    {
+      "role": "both",
+      "cmd": "mark TEST HUBSHOTS START",
+      "expect_result": "OK MARK",
+      "seq": 4
+    },
+    {
+      "role": "h",
+      "sleep_s": 30,
+      "note": "the world settles; the Business page injects 4 s after the loading overlay goes",
+      "seq": 5
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=False ",
+      "note": "PREMISE: our Business page is injected into the phone's full menu and closed",
+      "seq": 6
+    },
+    {
+      "role": "h",
+      "cmd": "chatview state",
+      "expect_result": "^OK chatview state: visible=False ",
+      "note": "PREMISE: the chat window starts closed",
+      "seq": 7
+    },
+    {
+      "role": "h",
+      "cmd": "phoneapp BizMan",
+      "expect_result": "^OK phoneapp BizMan: ",
+      "seq": 8
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-native-bizman view settle",
+      "seq": 9
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-native-bizman",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-native-bizman\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 10
+    },
+    {
+      "role": "h",
+      "cmd": "phoneapp MyEmployees",
+      "expect_result": "^OK phoneapp MyEmployees: ",
+      "seq": 11
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-native-myemployees view settle",
+      "seq": 12
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-native-myemployees",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-native-myemployees\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 13
+    },
+    {
+      "role": "h",
+      "cmd": "phoneapp Contacts",
+      "expect_result": "^OK phoneapp Contacts: ",
+      "seq": 14
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-native-contacts view settle",
+      "seq": 15
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-native-contacts",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-native-contacts\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 16
+    },
+    {
+      "role": "h",
+      "cmd": "contactopen 0",
+      "expect_result": "^OK contactopen 0: ",
+      "note": "the first contact's conversation (the game's own chat-like screen)",
+      "seq": 17
+    },
+    {
+      "role": "h",
+      "sleep_s": 3,
+      "note": "let the hub-native-contact0 view settle",
+      "seq": 18
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-native-contact0",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-native-contact0\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 19
+    },
+    {
+      "role": "h",
+      "cmd": "contactopen busiest",
+      "expect_result": "^OK contactopen \\d+: ",
+      "note": "the contact with the most messages (a full conversation)",
+      "seq": 20
+    },
+    {
+      "role": "h",
+      "sleep_s": 3,
+      "note": "let the hub-native-contactbusy view settle",
+      "seq": 21
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-native-contactbusy",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-native-contactbusy\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 22
+    },
+    {
+      "role": "h",
+      "cmd": "phoneapp Rivals",
+      "expect_result": "^OK phoneapp Rivals: ",
+      "seq": 23
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-native-rivals view settle",
+      "seq": 24
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-native-rivals",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-native-rivals\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 25
+    },
+    {
+      "role": "h",
+      "cmd": "phoneapp EconoView",
+      "expect_result": "^OK phoneapp EconoView: ",
+      "seq": 26
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-native-econoview view settle",
+      "seq": 27
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-native-econoview",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-native-econoview\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 28
+    },
+    {
+      "role": "h",
+      "cmd": "phoneapp Persona",
+      "expect_result": "^OK phoneapp Persona: ",
+      "seq": 29
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-native-persona view settle",
+      "seq": 30
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-native-persona",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-native-persona\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 31
+    },
+    {
+      "role": "h",
+      "cmd": "hubview offers",
+      "expect_result": "^OK hubview offers: ",
+      "seq": 32
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 33
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=0 ",
+      "seq": 34
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-offers-empty view settle",
+      "seq": 35
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-offers-empty",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-offers-empty\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 36
+    },
+    {
+      "role": "h",
+      "cmd": "hubview yours",
+      "expect_result": "^OK hubview yours: ",
+      "seq": 37
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 38
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=1 ",
+      "seq": 39
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-yours-empty view settle",
+      "seq": 40
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-yours-empty",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-yours-empty\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 41
+    },
+    {
+      "role": "h",
+      "cmd": "hubview loans",
+      "expect_result": "^OK hubview loans: ",
+      "seq": 42
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 43
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=2 ",
+      "seq": 44
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-loans-empty view settle",
+      "seq": 45
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-loans-empty",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-loans-empty\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 46
+    },
+    {
+      "role": "h",
+      "cmd": "hubview access",
+      "expect_result": "^OK hubview access: ",
+      "seq": 47
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 48
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=3 ",
+      "seq": 49
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-access-empty view settle",
+      "seq": 50
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-access-empty",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-access-empty\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 51
+    },
+    {
+      "role": "h",
+      "cmd": "hubview company",
+      "expect_result": "^OK hubview company: ",
+      "seq": 52
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 53
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=4 ",
+      "seq": 54
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-company-empty view settle",
+      "seq": 55
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-company-empty",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-company-empty\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 56
+    },
+    {
+      "role": "h",
+      "cmd": "uifill hub 12",
+      "expect_result": "^OK uifill hub: added=12 per list realOthers=1 ",
+      "note": "LOCAL display-only rows (never sent, never saved); realOthers=1 = the real client is the first counterpart; 8 sample counterparts + the client = 9 player cards (8 fit: the card list scrolls)",
+      "seq": 57
+    },
+    {
+      "role": "h",
+      "cmd": "hubview offers",
+      "expect_result": "^OK hubview offers: ",
+      "seq": 58
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 59
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=0 ",
+      "seq": 60
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-offers-fill view settle",
+      "seq": 61
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-offers-fill",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-offers-fill\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 62
+    },
+    {
+      "role": "h",
+      "cmd": "hubview yours",
+      "expect_result": "^OK hubview yours: ",
+      "seq": 63
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 64
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=1 ",
+      "seq": 65
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-yours-fill view settle",
+      "seq": 66
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-yours-fill",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-yours-fill\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 67
+    },
+    {
+      "role": "h",
+      "cmd": "hubview loans",
+      "expect_result": "^OK hubview loans: ",
+      "seq": 68
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 69
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=2 ",
+      "seq": 70
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-loans-fill view settle",
+      "seq": 71
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-loans-fill",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-loans-fill\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 72
+    },
+    {
+      "role": "h",
+      "cmd": "hubview paydouble",
+      "expect_result": "^OK hubview paydouble: armed='[^']+' tooSoon=True paid=False",
+      "note": "DEV: the 'Pay all' click arms the first loan owed to the online client; a second click in the same instant meets the 0.5 s guard (the lever never requests a repayment)",
+      "seq": 73
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-loans-armed view settle",
+      "seq": 74
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-loans-armed",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-loans-armed\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 75
+    },
+    {
+      "role": "h",
+      "sleep_s": 6,
+      "note": "the 6 s confirm window runs out",
+      "seq": 76
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: .* tab=2 .* arm='' ",
+      "note": "the row went back to 'Pay all' by itself (0.5 s check)",
+      "seq": 77
+    },
+    {
+      "role": "h",
+      "cmd": "hubview access",
+      "expect_result": "^OK hubview access: ",
+      "seq": 78
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 79
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=3 ",
+      "seq": 80
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-access-fill view settle",
+      "seq": 81
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-access-fill",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-access-fill\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 82
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "abort_on_fail": false,
+      "expect_result": "^OK hubview state: .* tab=3 .* rows=3 .* unknownCards=1 ",
+      "note": "the online client + BOTH offline sample grantees (one unnamed, one sharing a sample player's name) each have an Access row; the unnamed sample player and grantee read 'Unknown player'",
+      "seq": 83
+    },
+    {
+      "role": "h",
+      "cmd": "hubview company",
+      "expect_result": "^OK hubview company: ",
+      "seq": 84
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 85
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=True native=True pageActive=True tab=4 ",
+      "seq": 86
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-company-fill view settle",
+      "seq": 87
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-company-fill",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-company-fill\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 88
+    },
+    {
+      "role": "c",
+      "cmd": "merge propose ${hostPid}",
+      "abort_on_fail": false,
+      "expect_result": "^OK merge propose sent",
+      "note": "a REAL proposal from the client (the chip's own call) so the host's Company tab shows the proposal row; withdrawn below",
+      "seq": 89
+    },
+    {
+      "role": "h",
+      "sleep_s": 6,
+      "note": "the host's offer table updates; its notice fades",
+      "seq": 90
+    },
+    {
+      "role": "h",
+      "cmd": "hubview company",
+      "expect_result": "^OK hubview company: ",
+      "seq": 91
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 92
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "abort_on_fail": false,
+      "expect_result": "^OK hubview state: .* incomingMerger='[^']+' ",
+      "note": "report: the proposal reached the host",
+      "seq": 93
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-company-proposal view settle",
+      "seq": 94
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-company-proposal",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-company-proposal\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 95
+    },
+    {
+      "role": "h",
+      "cmd": "hubview mergerpopup",
+      "expect_result": "^OK hubview mergerpopup: open=True ",
+      "note": "DEV: opens the merger confirmation popup for the selected player; sends nothing (Confirm is never pressed)",
+      "seq": 96
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "note": "let the hub-biz-mergerpopup view settle",
+      "seq": 97
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-mergerpopup",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-mergerpopup\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 98
+    },
+    {
+      "role": "h",
+      "cmd": "hubview popupclose",
+      "expect_result": "^OK hubview popupclose: open=False",
+      "seq": 99
+    },
+    {
+      "role": "c",
+      "cmd": "merge unpropose",
+      "abort_on_fail": false,
+      "expect_result": "^OK merge unpropose sent",
+      "note": "withdraw the proposal again",
+      "seq": 100
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 101
+    },
+    {
+      "role": "h",
+      "cmd": "hubview mergetip",
+      "expect_result": "^OK hubview mergetip: hold=True ",
+      "note": "DEV (MERGE-TOOLTIP-1): the page's own hover path with the pointer treated as resting on 'Propose merger' (a card for an online non-member is selected if needed); sends nothing",
+      "seq": 102
+    },
+    {
+      "role": "h",
+      "sleep_s": 1.5,
+      "note": "0.1 s hover delay + one frame for the tooltip's layout",
+      "seq": 103
+    },
+    {
+      "role": "h",
+      "cmd": "hubview mergetipstate",
+      "expect_result": "^OK hubview mergetipstate: visible=True shown=True hold=True btn=True label='Propose merger' .* above=True inScreen=True ",
+      "note": "the game's tooltip is up, its canvas sorts above the page's canvas and the merger popup's, and its box is on screen (orders logged)",
+      "seq": 104
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-biz-mergetooltip",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-biz-mergetooltip\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 105
+    },
+    {
+      "role": "h",
+      "cmd": "hubview mergetipoff",
+      "expect_result": "^OK hubview mergetipoff: visible=False shown=False hold=False ",
+      "note": "pointer leaves: the tooltip hides",
+      "seq": 106
+    },
+    {
+      "role": "h",
+      "cmd": "hubview escbox",
+      "expect_result": "^OK hubview escbox: selBefore=True focus=0 amount=25000 menuOpen=True",
+      "note": "DEV: focus the Amount box with a draft, then one Esc (ours + the game's CancelButtonHandler): the box is left, the draft kept, the menu stays open",
+      "seq": 107
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "seq": 108
+    },
+    {
+      "role": "h",
+      "cmd": "hubview escmenu",
+      "expect_result": "^OK hubview escmenu: selBefore=False focus=0 amount=25000 menuOpen=False",
+      "note": "the second Esc closes the menu as the game does",
+      "seq": 109
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 110
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=False ",
+      "note": "closed by Esc",
+      "seq": 111
+    },
+    {
+      "role": "h",
+      "cmd": "hubview offers",
+      "expect_result": "^OK hubview offers: ",
+      "note": "reopen for the icon-toggle close below",
+      "seq": 112
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 113
+    },
+    {
+      "role": "h",
+      "cmd": "hubview close",
+      "expect_result": "^OK hubview close: requested ",
+      "seq": 114
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "seq": 115
+    },
+    {
+      "role": "h",
+      "cmd": "hubview state",
+      "expect_result": "^OK hubview state: ready=True visible=False ",
+      "note": "closed through the Business icon's toggle",
+      "seq": 116
+    },
+    {
+      "role": "h",
+      "cmd": "chatview open",
+      "expect_result": "^OK chatview open: requested ",
+      "seq": 117
+    },
+    {
+      "role": "h",
+      "sleep_s": 1,
+      "seq": 118
+    },
+    {
+      "role": "h",
+      "cmd": "chatview state",
+      "expect_result": "^OK chatview state: visible=True active=True ",
+      "seq": 119
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-chat-empty view settle",
+      "seq": 120
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-chat-empty",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-chat-empty\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 121
+    },
+    {
+      "role": "h",
+      "cmd": "uifill chat 40",
+      "expect_result": "^OK uifill chat: added=40 realOthers=1 ",
+      "note": "40 LOCAL lines, two long ones that wrap, a few private ones",
+      "seq": 122
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-chat-fill view settle",
+      "seq": 123
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-chat-fill",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-chat-fill\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 124
+    },
+    {
+      "role": "h",
+      "cmd": "chatview scroll 300",
+      "expect_result": "^OK chatview scroll: visible=True ",
+      "note": "300 px back from the bottom (the list scrolls by rendered height, as the wheel does)",
+      "seq": 125
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-chat-scrolled view settle",
+      "seq": 126
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-chat-scrolled",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-chat-scrolled\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 127
+    },
+    {
+      "role": "h",
+      "cmd": "chatview scroll 0",
+      "expect_result": "^OK chatview scroll: ",
+      "seq": 128
+    },
+    {
+      "role": "h",
+      "cmd": "chatview size 320 220",
+      "expect_result": "^OK chatview size: visible=True active=True size=320x220 ",
+      "note": "a small window (the grip's own clamp)",
+      "seq": 129
+    },
+    {
+      "role": "h",
+      "sleep_s": 2,
+      "note": "let the hub-chat-small view settle",
+      "seq": 130
+    },
+    {
+      "role": "h",
+      "cmd": "screenshot hub-chat-small",
+      "expect_result": "^OK screenshot queued",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[TestDrive\\] screenshot .*shot-hub-chat-small\\.png",
+          "within_s": 10
+        }
+      ],
+      "seq": 131
+    },
+    {
+      "role": "h",
+      "cmd": "chatview state",
+      "abort_on_fail": false,
+      "expect_result": "^OK chatview state: ",
+      "note": "report: lines visible at the small size",
+      "seq": 132
+    },
+    {
+      "role": "h",
+      "cmd": "uifill clear",
+      "expect_result": "^OK uifill clear: chat=40 hub=36 grantees=2$",
+      "seq": 133
+    },
+    {
+      "role": "h",
+      "cmd": "chatview close",
+      "expect_result": "^OK chatview close: requested ",
+      "seq": 134
+    },
+    {
+      "role": "both",
+      "cmd": "mark TEST HUBSHOTS END",
+      "expect_result": "OK MARK",
+      "seq": 135
+    }
+  ]
+}
