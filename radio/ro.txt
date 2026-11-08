@@ -1,0 +1,46 @@
+# Going Public Server - station list: Română (ro)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# MP3 streams, each one checked (http and https - Going Public Server 1.0.16.2 plays both).
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+Pescobar Radio = https://listen.radioking.com/radio/701141/stream/766385
+Radio Impuls Romania = https://live.radio-impuls.ro/stream
+Dance FM = https://edge126.rcs-rds.ro/profm/dancefm.mp3
+Balcan Radio Manele -Brăila = https://radio.sonicpanel.ro/8112/stream
+RADIO MANELE PETRECERE = https://ssl.servereradio.ro/8123/stream
+Radio Manele Vechi = https://mars.streamerr.co/radiomanelevechi
+Digi24FM = https://edge76.rcs-rds.ro/digifm/digi24fm.mp3
+Radio Boom House Music = https://stream.radioboom.ro/listen/boom_house_music/radio.mp3
+Radio Disco Mix = https://play.discomix.ro/8002/stream
+Clasic Radio_Chopin -București = https://live.radioclasic.com/listen/radio_clasic_chopin/live.mp3
+Vibe FM Romania = https://radiotrucker.com/en/play/vibe-fm-romania
+DJ Radio Romania = https://stream.djradio.ro/radio/8000/stream.mp3
+Digi FM = https://edge76.rcs-rds.ro/digifm/digifm.mp3
+Clasic Radio_Mozart -București = https://live.radioclasic.com/listen/radio_clasic_mozart/live.mp3
+Radio Tequila Manele Romania = https://petrecere.radiotequila.ro/7000/stream
+Radio Vacanța - Gold = https://stream4.srr.ro:8443/gold_rv
+Super Fm Manele Prahova = https://asculta.superfmradio.ro/9720/stream
+Clasic Radio_90 -București = https://live.radioclasic.com/listen/radio_clasic_90/live.mp3
+Clasic Radio_Bach -București = https://live.radioclasic.com/listen/radio_clasic_bach/live.mp3
+Clasic Radio_Vivaldi -București = https://live.radioclasic.com/listen/radio_clasic_vivaldi/live.mp3
+Realitatea FM = https://shout.realitatea.net:8001/rfmweb
+Clasic Radio_Blues -București = https://live.radioclasic.com/listen/radio_clasic_blues/live.mp3
+Anișoara Radio = https://live.radioanisoara.ro:8080/stream
+Clasic Radio_Opera -București = https://live.radioclasic.com/listen/radio_clasic_opera/live.mp3
+FMV FIT Radio Focus = https://radio.webicdp.com/listen/fmvfitradiofocus/radio.mp3
+Mind Fuel Radio · Ambient = https://141-144-200-199.nip.io/radio.mp3
+Tranquila Manele România = https://live.radiotranquila.net:8032/stream
+Clasic Radio_80 -București = https://live.radioclasic.com/listen/radio_clasic_80/live.mp3
+Clasic Radio_Greek Music -București = https://live.radioclasic.com/listen/radio_clasic_greek/live.mp3
+Radio GMusic Colinde = https://s9.webradio-hosting.com/proxy/rgmcolinde/stream
+Clasic Radio_Relax -București = https://live.radioclasic.com/listen/radio_clasic_relax/live.mp3
+Stil România -Radio Stil Manele = https://mp3.radiostill.ro:8888/stream
+Vibe FM România = https://live.radiovibefm.eu/8052/stream
+Clasic Radio_Folk -București = https://live.radioclasic.com/listen/radio_clasic_folk/live.mp3
+Radio Folclor = https://ssl.omegahost.ro/8092/stream
+RadioPlay Dance Romania -Cluj Napoca = https://mscp1.gazduireradio.ro:1130/stream
+Mind Fuel Radio · Lo-fi = https://141-144-200-199.nip.io/lofi.mp3
+Radio Balkan Romania = https://live.radiobalkan.ro:8102/stream
+Baraka radio = https://ice.streams.ovh:1165/stream
+Extravaganza Radio = https://s3.radio.co/s1492c0564/listen

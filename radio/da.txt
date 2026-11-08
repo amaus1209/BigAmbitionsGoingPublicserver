@@ -1,0 +1,46 @@
+# Going Public Server - station list: Dansk (da)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# MP3 streams, each one checked (http and https - Going Public Server 1.0.16.2 plays both).
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+DR P4 Midt & Vest = https://live-icy.dr.dk/A/A09L.mp3
+Nova FM = https://live-bauerdk.sharp-stream.com/nova_dk_mp3
+Radio Alfa = https://radioserver.dk/alfa
+Classic Rock Danmark = https://netradio.classicfm.dk/classicrock
+myROCK = https://live-bauerdk.sharp-stream.com/myrock_dk_mp3
+The Voice = https://live-bauerdk.sharp-stream.com/thevoice_dk_mp3
+Alfa Gold = https://radioserver.dk/alfaevent
+Radio Globus = https://stream.probroadcast.dk/radioglobus
+Radio ABC = https://radioserver.dk/abc
+POP FM 80er = https://live-bauerdk.sharp-stream.com//popfm80.mp3
+Tango Copenhagen = https://tangocopenhagen.stream.laut.fm/tangocopenhagen
+Radio Solo = https://radioserver.dk/solo
+Radio Sydhavsoerne Lolland = https://radio1.jfmtech.dk/sydhavlolland
+Historyradio.org low bandwidth = https://cast1.asurahosting.com/proxy/historyr/stream.mp3
+Country 108 = https://icepool.silvacast.com/COUNTRY108.mp3
+DLF aktuelle Presseschau = https://ondemand-mp3.dradio.de/file/dradio/presseschau/presseschau.mp3
+Dansktop Kanalen = https://netradio.classicfm.dk/dansktop
+Skala FM = https://netradio.skala.fm/ska8d
+Globus Guld Jul = https://stream.probroadcast.dk/guldjul
+Radio 100 = https://live-bauerdk.sharp-stream.com/radio100_dk_mp3
+Retro Radio = https://tx-2.retro-radio.dk/TX-2
+Tango Copenhagen Radio = https://tangocopenhagen.stream.laut.fm/tangocopenhagen?t302=2021-01-15_18-47-40&uuid=64db9a91-4a6e-4bc8-ba24-26a2fa7f24d0
+Radio IIII = https://netradio.radio4.dk/radio4
+go!FM = https://radioserver.dk/gofm
+Classic FM (Fyn) = https://netradio.classicfm.dk/cla12a
+Radio Victoria Esbjerg = https://stream.probroadcast.dk/victoria
+Radio VLR = https://netradio.vlr.dk/vlr8d
+Radio Alfa Skive = https://radioserver.dk/alfaskive
+Radio Alfa Midtjylland = https://radioserver.dk/alfamidt
+Always ELVIS Radio = https://radioserver.dk/alwayselvisradio
+DR P5 Midt/Vest = https://live-icy.dr.dk/A/A17H.mp3
+Radio Soft = https://live-bauerdk.sharp-stream.com/radiosoft_dk_tunein_mp3
+Plantland Radio = https://radio.plantlandradio.com/listen/plantland_radio/radio.mp3
+Charlie Tourist (Sydvest) = https://ec6.yesstreaming.net:4385/stream
+Charlie Classical = https://ec6.yesstreaming.net:4365/stream
+Radio Alfa Silkeborg = https://radioserver.dk/alfasilk
+Danmarks Radio p2 = https://live-icy.dr.dk/A/A04L.mp3
+Partyradio.pro = https://stream.partyradio.pro/listen/partyradio/stream
+Radio Alfa Viborg = https://radioserver.dk/alfaviborg
+Radio Viborg = https://webradio.radioviborg.dk/viborg

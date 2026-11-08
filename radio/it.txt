@@ -1,0 +1,46 @@
+# Going Public Server - station list: Italiano (it)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# MP3 streams, each one checked (http and https - Going Public Server 1.0.16.2 plays both).
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+Radio Armisa = https://onair.armisa.it/listen/armisa/radio.mp3
+Radio RaiSport = https://icecdn-19d24861e90342cc8decb03c24c8a419.msvdn.net/icecastRelay/S74167340/mmNY37FME5Zl/icecast
+70 80 90 = https://rblive.it:8170/radio.mp3
+Virgin Radio Italy = https://icy.unitedradio.it/Virgin.mp3
+70 80 Hits = https://nr8.newradio.it:19574/stream
+m2o originals radio = https://stream.laut.fm/m2o-originals-radio
+Lattemiele = https://sr15.inmystream.it:8000/stream
+Radio Cuore = https://stream10.xdevel.com/audio32s975552-1839/stream/icecast.audio
+MC2 Cafè Del Mar Collection = https://n13a-eu.rcs.revma.com/a2n83wxayk3vv?rj-ttl=5&rj-tok=AAABndIfXksAiTXrqw2SmfAauA
+RADIO SUBASIO = https://icy.unitedradio.it/Subasio.mp3
+RADIO DIMENSIONE RELAX = https://az1.mediacp.eu/listen/radiodimensionerelax/radio.mp3
+Babboleo Suono = https://stream.rcs.revma.com/sv2hu8qqv6bwv
+Venice Classic Radio = https://uk2.streamingpulse.com/ssl/vcr1
+Funky Radio = https://funkyradio.streamingmedia.it/play.mp3
+ITALIA Italia 80 = https://icy.unitedradio.it/um016.mp3
+Radio 105 = https://icecast.unitedradio.it/Radio105.mp3
+FOREVER 90 = https://stream.laut.fm/forever90
+RTL 102.5 = https://stream.rcast.net/210096
+NATURE RADIO SLEEP = https://az1.mediacp.eu/listen/natureradiosleep/radio.mp3
+Virgin Radio Classic Rock = https://icy.unitedradio.it/VirginRockClassics.mp3
+Radio 70 80 90 Marche = https://rblive.it:8020/radio.mp3
+EDM RADIO Electronic Dance Music = https://edm.streamingmedia.it/play
+Radio Classica = https://stream10.xdevel.com/audio0s978096-2470/stream/icecast.audio
+Rai Radio 1 = https://icecdn-19d24861e90342cc8decb03c24c8a419.msvdn.net/icecastRelay/S16355530/Q4zh3NTu28Rx/icecast
+Dj Osso Radio = https://stream.rcs.revma.com/x3ab37sgn7uvv
+Virgin Radio Rock ’90 = https://icy.unitedradio.it/Virgin_03.mp3
+ITALIA Italia 70 = https://icy.unitedradio.it/um020.mp3
+105 Miami = https://icy.unitedradio.it/105Miami.mp3
+Cafè Del Mar Collection = https://stream.rcs.revma.com/bn68enmp81uvv.xspf
+ITALIA Hits Italia = https://icy.unitedradio.it/um011.mp3
+MC2 Buddha Bar Collection = https://stream.rcs.revma.com/m5819rrayk3vv
+Controradio = https://s4.yesstreaming.net:17199/stream
+Virgin Radio Rock Hits = https://icy.unitedradio.it/VirginRockHits.mp3
+Virgin Radio Rock ’80 = https://icy.unitedradio.it/VirginRock80.mp3
+70-80.it = https://onair18.xdevel.com/proxy/7080it?mp=/stream
+RTR 99 Canale Pooh = https://rtr99.fluidstream.eu/rtr99_pooh.mp3
+Rai 1 Friuli Venezia Giulia = https://icestreaming.rai.it/1.mp3
+Radio Marte = https://stream1.xdevel.com/audio0s975753-313/stream/icecast.audio
+Radio Onda D'Urto = https://hochimin.urtostream.org:8443/radiondadurto.mp3
+Easy Network Jazz & Soul = https://sphera.fluidstream.eu/easy_jazz.mp3

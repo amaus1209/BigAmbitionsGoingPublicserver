@@ -1,0 +1,46 @@
+# Going Public Server - station list: Türkçe (tr)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# MP3 streams, each one checked (http and https - Going Public Server 1.0.16.2 plays both).
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+KRAL TÜRK FM = https://live.radyositesihazir.com/8032/stream
+Super Fm = https://playerservices.streamtheworld.com/api/livestream-redirect/SUPER_FM_SC
+JOY TÜRK TURKEY = https://playerservices.streamtheworld.com/api/livestream-redirect/JOY_TURK_SC?/
+Radyo Şiran = https://live.radyositesihazir.com/8078/stream
+Metro fm turkey = https://playerservices.streamtheworld.com/api/livestream-redirect/METRO_FM_SC?
+VİRGİN RADYO = https://playerservices.streamtheworld.com/api/livestream-redirect/VIRGIN_RADIO_ITUNES.mp3
+Kurd1 = https://listen.radioking.com/radio/119251/stream/158701
+TürküRadyo = https://yayin.turkhosted.com/4591/stream
+Azadi Fm = https://amed.ozelip.com/8040/;
+101.4 HATAY TEMPO FM = https://sslyayin.netyayin.net:1215/stream
+SUPER FM 2 TURKEY = https://playerservices.streamtheworld.com/api/livestream-redirect/SUPER2_SC?/
+GENÇ KRAL FM = https://anadolu.liderhost.com.tr:10853/;
+Radyo Sputnik = https://icecast-rian.cdnvideo.ru/voicestm
+Radyo Karadeniz = https://radyomar.80.yayin.com.tr/;
+Türkiyem FM = https://server7.streamserver24.com/proxy/turkiyemfm?mp=/stream
+KIYI Muzik = https://kiyi.radioca.st/stream
+JOY TÜRK ROCK TURKEY = https://playerservices.streamtheworld.com/api/livestream-redirect/JOYTURK_ROCK_SC?/
+Power Dance = https://listen.powerapp.com.tr/powerdance/mpeg/icecast.audio
+Radyo İlahi = https://anadolu.liderhost.com.tr:10994/;
+Barış Radyo 104.8 = https://yayin2.canliyayin.org:9350/stream?/;stream.mp3
+HEY RADYO = https://usa4.fastcast4u.com/proxy/radyoizmirfm/mp3stream128
+Radio 44 = https://radyo44.80.yayin.com.tr/stream
+Radyo Nida = https://anadolu.liderhost.com.tr/8106/stream
+TGRT FM = https://icecasttgrt.ihlasdigitalassets.com/tgrtfm
+Radyo Sarıkamış = https://live.radyositesihazir.com:8004/stream
+Gül Fm = https://yayin2.canliyayin.org:10989/;*.mp3
+İhya Fm = https://radyo.yayin.com.tr:2727/stream
+ANTAKYA RENK FM HATAY = https://radyo.yayindakiler.com:3016/renk
+Yaren FM = https://yarenfmn.80.yayin.com.tr//stream
+JOY TÜRK FM = https://playerservices.streamtheworld.com/api/livestream-redirect/JOY_TURK_ITUNES.mp3
+LALEGÜL FM = https://icecast.netmedya.net/lalegulfm
+Karadut Fm = https://yayin5.radyohizmeti.com/9982/stream
+HAYATMİX ARABESK = https://radyo.yayin.com.tr:4078/mp3
+Mayday Records = https://stream.maydayrecords.net/radio/8000/maydayrecords.mp3
+95.1 TEMPO RADYO HATAY = https://sslyayin.netyayin.net/tempo/stream
+Kiss Türk = https://kiss.radyotvonline.net/kissturk
+Fakir Fm = https://live.radyositesihazir.com/1025/stream/
+Konya İsra FM = https://yayin2.canliyayin.org:8210/;stream
+HAYATMİX = https://hayatmix.yayin.com.tr/mp3
+24 Radyo = https://radyo24.radyotvonline.net/radyo24

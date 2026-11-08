@@ -1,0 +1,46 @@
+# Going Public Server - station list: Nederlands (nl)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# MP3 streams, each one checked (http and https - Going Public Server 1.0.16.2 plays both).
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+Intense Radio = https://secure.live-streams.nl/main
+Qmusic = https://icecast-qmusicnl-cdp.triple-it.nl/Qmusic_nl_live_96.mp3
+Sky Radio = https://www.mp3streams.nl/zender/skyradio/stream/8-mp3-128
+KINK = https://playerservices.streamtheworld.com/api/livestream-redirect/KINK.mp3
+NPO Radio 5 = https://icecast.omroep.nl/radio5-bb-mp3
+BNR Nieuwsradio = https://stream.bnr.nl/bnr_mp3_128_20
+538 Radio = https://playerservices.streamtheworld.com/api/livestream-redirect/RADIO538.mp3
+Arrow Classic Rock = https://stream.player.arrow.nl/arrowcr
+Radio Rijnmond = https://d2e9xgjjdd9cr5.cloudfront.net/icecast/rijnmond/radio-mp3
+NPO Klassiek = https://icecast.omroep.nl/radio4-bb-mp3
+Radio 10 = https://playerservices.streamtheworld.com/api/livestream-redirect/RADIO10.mp3?dist=radio10_web&amp;ttag=talpa_consent:0&amp;gdpr=1&amp;gdpr_consent=CPR8CQMPR8CRCADABCNLB7CgAAAAAEJAAAAAAAAMEgKgAVAAuACAAGQARAAmgBPADEAH4AQAAjABXADvAIQARYAjgBOwCsgIpAXmAwQAsJAJAAqACAAGQARAAmABPAHeARwBeY6AWABUAEAAMgAiABMACeAGIAd4BFgCOALzHAAwALgCuAIQUgFgAVABAADIAIgATAAngBiAHeARYAjgC8ygAIAC4BOyQAEAC5KAMAEQAJgAYgB3gEcAXmQgCABMADEAO8AjgYACAK4VADACYARwBeYyAGAEwAjgC8w.YAAAAAAAA4AA
+Fantasy Italo Dance 90s radio = https://mscp2.live-streams.nl:8152/italodance
+Classic NL = https://classic.nl/streams/?s=main
+NPO 3FM = https://icecast.omroep.nl/3fm-bb-mp3
+Qmusic Het Foute Uur = https://icecast-qmusicnl-cdp.triple-it.nl/Qmusic_nl_fouteuur_96.mp3
+Qmusic Non-Stop = https://icecast-qmusicnl-cdp.triple-it.nl/Qmusic_nl_nonstop_96.mp3
+Radio 10 non-stop = https://playerservices.streamtheworld.com/api/livestream-redirect/TLPSTR15.mp3
+QMUSIC NEDERLAND = https://stream.qmusic.nl/qmusic/mp3
+Radio Veronica = https://19993.live.streamtheworld.com/VERONICA_SC
+JOE non-stop = https://stream.joe.nl/nonstop/mp3
+Real Hardstyle Radio = https://stream.realhardstyle.nl/
+538 Classics = https://playerservices.streamtheworld.com/api/livestream-redirect/TLPSTR08.mp3
+Synthwave City FM - New = https://synthwave-rex.radioca.st/stream
+Cream = https://playerservices.streamtheworld.com/api/livestream-redirect/CREAM.mp3
+Hardcore Power Radio = https://hardcorepower.beheerstream.nl/8012/stream
+Alternative Rock Radio = https://25243.live.streamtheworld.com/KINK_SC
+Groot Nieuws Radio Non-Stop = https://playerservices.streamtheworld.com/api/livestream-redirect/GNRNONSTOP.mp3
+90s Alive = https://stream.90sa.live/90s-alive.mp3
+After Hours – Melodic House & DnB = https://r.bgp.rodeo/listen/after_hours/radio.mp3
+Groot Nieuws Radio = https://playerservices.streamtheworld.com/api/livestream-redirect/GNR.mp3
+Tukker FM = https://stream.tukkerfm.nl/tukkerfm
+Alleen Klassiek = https://playerservices.streamtheworld.com/api/livestream-redirect/SERVICE06.mp3
+PerfectMoods – 24/7 Quality Lounge = https://www.radioking.com/play/perfectmoods/104227
+JOE = https://icecast-qmusicnl-cdp.triple-it.nl/Joe_nl.mp3
+Piratenpower = https://stream.piratenpower.nl:8010/stream
+Classicnl Opera = https://classic.nl/streams/?s=opera
+Sublime = https://playerservices.streamtheworld.com/api/livestream-redirect/SUBLIME.mp3?dist=sublime_website
+100% NL Non-Stop = https://stream.100p.nl/web02_mp3
+538 Tomorrowland = https://playerservices.streamtheworld.com/api/livestream-redirect/OWR_WORLD_RADIO_NL.mp3
+Q-Dance Radio = https://playerservices.streamtheworld.com/api/livestream-redirect/Q_DANCE.mp3

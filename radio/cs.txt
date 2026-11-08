@@ -1,0 +1,46 @@
+# Going Public Server - station list: Čeština (cs)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# MP3 streams, each one checked (http and https - Going Public Server 1.0.16.2 plays both).
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+Kiss Radio - 128MP3 = https://icecast1.play.cz/kissdelta128.mp3
+Evropa 2 - Radio = https://ice.actve.net/fm-evropa2-128
+FREKVENCE 1 = https://playerservices.streamtheworld.com/api/livestream-redirect/FREKVENCE1.mp3
+Rock Radio = https://playerservices.streamtheworld.com/api/livestream-redirect/ROCK_RADIO_128.mp3
+povídka = https://ice3.abradio.cz/povidka128.mp3
+Comedy Club R@dio DIANA = https://westradio.cz/radio/8010/radio.mp3
+Český Impuls = https://stream.sepia.sk/ceskyimpuls128.mp3
+Evropa2 Youradio Flashbacky = https://ice.actve.net/web-e2-flashback
+Radio Svoboda (ru) (official = https://stream.radiojar.com/hcrb063nn3quv
+Český rozhlas Brno = https://rozhlas.stream/brno.mp3
+Rádio Blaník = https://playerservices.streamtheworld.com/api/livestream-redirect/RADIO_BLANIK_128.mp3
+Rádio Blaník Oldies = https://ice.radia.cz/oldiesradio128.mp3
+Sunrise Radio (Czechia) = https://stream.laut.fm/radio-dance-eu
+Radio Fonlord = https://a5.asurahosting.com:6530/radio.mp3
+ČRo Plus = https://rozhlas.stream/plus_mp3_128.mp3
+Rádio Písnička = https://stream.slagr-radio.cz/pisnicka
+Phonk Nation Radio = https://radio.mxnticek.eu/listen/phonk/128.mp3
+HARDCORERADIO.CZ = https://radio.hardcoreradio.cz/listen/hardcore_radio/radio.mp3
+WeHouseRadio = https://stream.zunradio.cz/zun3.mp3
+Dance Club Radio = https://ice4.abradio.cz/dance128.mp3
+Impuls Ráááádio = https://stream.sepia.sk:8000/impuls128.mp3
+Funkstar Radio = https://funkstar.radioca.st/stream
+Šlágr Rádio = https://stream.slagr-radio.cz/mp3
+Hitrádio Faktor = https://ice.abradio.cz/faktor128.mp3
+BIKERS RADIO DOUPE = https://icecast7.play.cz/bikersradiodoupe128.mp3
+BojlerRoom = https://ice4.abradio.cz/bojler_room_128.aac
+Deecibel One Radio = https://stream.deecibel.com/one
+Rádio Čas Rock = https://icecast9.play.cz/casrock192.mp3
+Крым Реалии (rus = https://stream.radiojar.com/wm9sntcpn3quv
+CrazyRadio.cz = https://stream.rcast.net/72851
+ČRo Wave = https://rozhlas.stream/wave_mp3_128.mp3
+Hitradio Zlín = https://ice.radia.cz/radiozlin128.mp3
+Čas Rock Natvrdo = https://stream.sepia.sk:8000/rnt128.mp3
+Evropa 2 = https://playerservices.streamtheworld.com/api/livestream-redirect/EVROPA2.mp3
+Radio Blaník Morava a Slezsko = https://ice.abradio.cz/blanikmorava128.mp3?gdpr=1&gdpr_consent=Q084aEUyaE84aEUyaEFjQUJCRU5BX0NnQVBfQUFIX0FBQVlnRjVvQmhEeEVCU0ZDQUdKb1lOa2dBQUFXeHdBQUFDQUNBQUFBb0FBQUFCb0FBQVFBQUFBQUFBQWdCQUFBQUJJQUlBSUFBQUJBR0VBQUFBQUFBQUFBQUFBQUFFQUFBQUFBSVFBQUFBQUFBQ0JBQUFBQUFBQUFBQUFBQUFBQVFBQUFnWG5BZUFBV0FCVUFDNEFIQUFRQUFxQUJvQURrQUlnQVRBQW5nQlZBQzRBRjhBTVFBaElCRUFFVUFLVUFXSUF5d0Jtd0R1QU84QWhBQkZnQzBnRjFBTUNBYXdCTm9DOHdBQUFBLllBQUFBQUFBQUFBQQ==
+Známka Punku = https://ice.abradio.cz/znamkapunku128.mp3
+Rádio Diana – Retro Club = https://westradio.cz/radio/8000/radio.mp3
+čro radiožurnál sport Stream AdHoc 2 = https://rozhlas.stream/radiozurnal_sport_adhoc_2_high.mp3
+RockZone = https://icecast5.play.cz/rockzone.mp3
+Gold Impuls = https://stream.sepia.sk/gold128.mp3

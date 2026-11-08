@@ -1,0 +1,46 @@
+# Going Public Server - station list: Lietuvių (lt)
+# Source: radio-browser.info (a free station database), 2026-11-01: the country's most popular stations,
+# MP3 streams, each one checked (http and https - Going Public Server 1.0.16.2 plays both).
+# One line per station:  Name = address   - to change or add: edit this file on GitHub;
+# players load it at their next game start. The list is chosen in AMP (Modules, Radio station list).
+
+RELAX FM Lietuva = https://stream1.relaxfm.lt/relaxfm128.mp3
+ZIP FM = https://stream1.zipfm.lt/zipfm128.mp3
+Radiocentras = https://stream2.rc.lt/rc128.mp3
+Radio R = https://stream1.relaxfm.lt/rrb128.mp3
+Easy FM = https://netradio.ziniur.lt/easyfm.mp3
+Power Hit Radio LT = https://ice.leviracloud.eu/phr192-mp3
+Radio Lietus = https://stream.m-1.fm/lietus/mp3
+Radio 3 = https://n23-eu.rcs.revma.com/8cwskd80zxcwv?rj-ttl=5&rj-tok=AAABoLM9aPsAjNpxlJ9phX3bxg
+Радио Лента = https://stream1.unknownclient.com/radio-lenta.mp3
+M-1 Radio = https://stream.m-1.fm/m1/mp3
+Relax FM Sentimentai = https://klausyk.radijas.lt/listen/sentimentai/live
+Zip FM is Kasetes = https://klausyk.radijas.lt/listen/is-kasetes/live
+Truckers Rave = https://myradio24.org/eugenijus
+Радио RDTK = https://rdtk.out.airtime.pro/rdtk_a
+TOPFM = https://radio.topfm.lt/listen/topfm/topfm-320
+Rock FM = https://stream2.rockfm.lt/crf128.mp3
+Tavo Balsas LT = https://c18.radioboss.fm:8529/stream
+Radijo Stotis Kelyje = https://solid55.streamupsolutions.com/proxy/ugeiluxh/stream
+COOL RADIO = https://c34.radioboss.fm:9058/stream
+Fred Film Radio-24 lietuvių kalba = https://s10.webradio-hosting.com/proxy/fredradiolt/stream
+Радио Свободынх Народов = https://radio.freenations.online/listen/radio_free_nations/radio.mp3?refresh=1768495046250
+Taktas FM = https://c20.radioboss.fm:8752/stream
+Pulsas = https://pulsas.lt/stream
+Gold FM = https://stream.goldfm.lt/goldfm.mp3
+European Hit Radio = https://stream.ehr.lt:8443/ehr
+Relax FM 100 Hitu = https://klausyk.radijas.lt/listen/100hitu/live
+Radijo Musikii = https://stream.radijo-musikii.net/radio/8000/radio.mp3
+Palanga Street Radio = https://stream.palanga.live:8443/palanga128.mp3
+Radijo stotis Radio3 = https://stream.rcs.revma.com/8cwskd80zxcwv
+Radijo stotis FM99 = https://securestream.casthost.net:8617/fm99
+Life Chill Music = https://usa6.fastcast4u.com/proxy/wsjfhd?mp=/1
+Patejago Radijas = https://radio.patejago.lt/stream
+Marso Radijas = https://radijas.marsas.me/live
+Fréquence Protestante = https://freqpro.streamakaci.com/frequenceprotestante.mp3
+PoWeR = https://cast1.my-control-panel.com/proxy/eventas/stream
+Radio Fiesta = https://stream2.radiofiesta.lt/rfs128.mp3
+Upso Radijas = https://klausyk.upsoradijas.lt/upsas_320
+Relax FM = https://stream4.radijas.lt/relaxfm
+RADIOR ENERGY = https://klausyk.radijas.lt/listen/energy/live
+zzz-rock-zzz = https://play.radioking.io/zzz-rock-zzz
