@@ -1,0 +1,35 @@
+Going Public Server - Windows
+=============================
+Big-Ambitions-Mehrspieler-Server mit Weboberfläche, ohne AMP. (English below.)
+
+START
+  1. Den Ordner GoingPublicServer an einen festen Ort entpacken, z. B. C:\GoingPublicServer (etwa 10 GB frei).
+  2. GoingPublicServer.exe starten. Windows-SmartScreen: "Weitere Informationen" -> "Trotzdem ausführen".
+     Die Windows-Firewall fragt nach dem Netzwerkzugriff: zulassen.
+  3. Beim ersten Start erscheint ein FENSTER mit den Zugangsdaten zur Weboberfläche (Adresse, Benutzer, Passwort).
+     Das Passwort wird nur dieses eine Mal angezeigt.
+  4. Im Browser http://localhost:8080 öffnen und anmelden.
+  5. Installation: das Spiel laden - mit dem Steam-Konto, das Big Ambitions besitzt (bei Steam Guard den Code eingeben).
+  6. Einstellungen: Welt wählen oder unter "New world" eine neue anlegen. Übersicht: Starten.
+  7. Im Router UDP 7777 (Spiel) zu diesem PC weiterleiten. Spieler treten mit deiner Adresse, Port 7777 und dem
+     Server-Schlüssel bei. TCP 8080 (Weboberfläche) nur freigeben, wenn du sie von außen brauchst.
+
+GUT ZU WISSEN
+  - Das schwarze Fenster ist die Verwaltung. Schließen stoppt den Server (er speichert und beendet sich).
+  - Passwort vergessen: Reset-Password.bat starten - das neue Passwort erscheint wieder in einem Fenster.
+  - Der Server läuft ohne Steam-Client; ein Steam, das auf diesem PC läuft, bleibt dein eigenes.
+  - Mods des Servers: server\mods (nur Going Public Server und was du dazulegst - getrennt von deinen eigenen Mods).
+  - Spielstände: Windows legt sie für jedes Big Ambitions dieses Windows-Kontos in
+    %USERPROFILE%\AppData\LocalLow\Hovgaard Games\Big Ambitions ab, die Server-Welten unter SaveGames\_BAMP_MP.
+    Spielst du selbst auf demselben Windows-Konto, teilen sich Spiel und Server diesen Ordner - am saubersten läuft
+    der Server auf einem eigenen PC oder unter einem eigenen Windows-Konto.
+  - Update: das neue Paket über diesen Ordner entpacken (GoingPublicServer.exe vorher beenden). Server-Dateien allein:
+    Weboberfläche -> Installation -> "Von GitHub aktualisieren".
+
+-------------------------------------------------------------------------------------------------------------------------
+
+START: unpack the folder (e.g. C:\GoingPublicServer, about 10 GB free), run GoingPublicServer.exe (SmartScreen: More
+info -> Run anyway; allow the firewall). The ACCESS DATA appear in a WINDOW at the first start - only once. Open
+http://localhost:8080, log in; Installation: download the game with the Steam account that owns Big Ambitions;
+Settings: choose or create a world; Overview: Start. Forward UDP 7777 to this PC.
+Closing the black window stops the server (it saves). Forgot the password: run Reset-Password.bat.

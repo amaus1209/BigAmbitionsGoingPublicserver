@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Going Public Server – Ranking</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --axis:#3d4350; --text:#e8e8ea; --muted:#9aa0ab; --gold:#e3b34a; --ok:#4cc38a;
+          --s-in:#3987e5; --s-out:#d95926; --s-fps:#199e70; --warn:#fab219; }
+  [hidden] { display:none !important; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width:1000px; margin:0 auto; padding:28px 16px 48px; }
+  h1 { font-size:26px; margin:0 0 4px; } h1 span { color:var(--gold); }
+  .sub { color:var(--muted); margin:0 0 18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; }
+  #tbl table { min-width:720px; }
+  th, td { padding:10px 12px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--line); }
+  #tbl th:nth-child(-n+2), #tbl td:nth-child(-n+2) { text-align:left; }
+  th { color:var(--muted); font-weight:600; font-size:13px; }
+  #tbl th { cursor:pointer; user-select:none; }
+  th.on { color:var(--gold); } th.on::after { content:" ▾"; } th.on.asc::after { content:" ▴"; }
+  tr:last-child td { border-bottom:none; }
+  td.rank { color:var(--muted); width:36px; } tr:nth-child(1) td.rank, tr:nth-child(2) td.rank, tr:nth-child(3) td.rank { color:var(--gold); font-weight:700; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--ok); margin-right:6px; }
+  .links { margin:14px 0 0; color:var(--muted); font-size:14px; } .links a { color:var(--gold); margin-right:14px; }
+  .lang { float:right; color:var(--muted); font-size:14px; cursor:pointer; text-decoration:underline; }
+  .empty { padding:24px; color:var(--muted); }
+  .merged { display:block; color:var(--muted); font-size:12px; }
+  /* GOING-ONLINE-RANK-1: the players' cable providers (module 8) */
+  .prov { display:block; color:var(--gold); font-size:12px; }
+  .badge { display:inline-block; margin-left:6px; padding:0 6px; border-radius:8px; background:var(--gold); color:#111; font-size:11px; font-weight:700; }
+  /* NET-PAGE-1: the server's numbers (net.json) */
+  h2 { font-size:20px; margin:36px 0 2px; }
+  .tiles { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; margin:0 0 12px; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .tile .lbl { color:var(--muted); font-size:13px; }
+  .tile .val { font-size:24px; font-weight:600; line-height:1.35; }
+  .tile .note { color:var(--muted); font-size:12px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px 8px; margin:0 0 12px; min-width:0; }
+  .pair { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; margin:0 0 12px; } .pair .panel { margin:0; }
+  .ph { display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
+  .ph h3 { margin:0; font-size:15px; } .ph .unit { color:var(--muted); font-size:13px; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 18px; color:var(--muted); font-size:13px; margin:4px 0 0; }
+  .legend b { color:var(--text); font-weight:600; margin-left:4px; }
+  .key { display:inline-block; width:14px; height:2px; border-radius:1px; vertical-align:middle; margin-right:6px; }
+  .plot { position:relative; margin-top:6px; }
+  .plot svg { display:block; width:100%; height:auto; overflow:visible; }
+  .plot svg:focus { outline:none; } .plot svg:focus-visible { outline:2px solid var(--gold); outline-offset:3px; border-radius:4px; }
+  .plot text { fill:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  .plot text.lbl { fill:var(--text); font-weight:600; }
+  .tip { position:absolute; top:8px; pointer-events:none; background:#0b0d11; border:1px solid var(--line); border-radius:8px;
+         padding:8px 10px; font-size:13px; line-height:1.5; white-space:nowrap; z-index:2; }
+  .tip .tt { color:var(--muted); font-size:12px; } .tip b { font-weight:600; margin-right:4px; } .tip span { color:var(--muted); }
+  .srv h3.cap { margin:0; padding:14px 12px 2px; font-size:15px; }
+  .srv th { cursor:default; }
+  .srv th:first-child, .srv td:first-child { text-align:left; }
+  .srv td { font-variant-numeric:tabular-nums; }
+  #mTbl table { min-width:640px; }
+  .fine { color:var(--muted); font-size:12px; margin:0; padding:10px 12px 14px; }
+  .thr { margin-left:8px; white-space:nowrap; } .thr svg { vertical-align:-1px; margin-right:4px; }
+  .tblBtn { background:none; border:1px solid var(--line); color:var(--gold); border-radius:6px; padding:7px 12px; font:inherit; font-size:14px; cursor:pointer; margin:0 0 12px; }
+  /* BUILDING-LIST-1: the players' buildings (buildings.json) */
+  #bTbl table { min-width:560px; } #bTbl th, #bTbl td { text-align:left; } #bTbl th { cursor:pointer; user-select:none; }
+  /* ADMIN-1: the admin part (AMP login) */
+  main.adminView > :not(#admin):not(.lang):not(img) { display:none !important; }
+  main:not(.adminView) #admin { display:none !important; }
+  #admin .panel { padding:14px 16px; }
+  #admin h3 { margin:0 0 8px; font-size:15px; }
+  #admin input, #admin select { padding:8px 10px; border-radius:6px; border:1px solid var(--line); background:#0b0d11; color:var(--text); font:inherit; font-size:14px; }
+  .abtn { background:none; border:1px solid var(--line); color:var(--gold); border-radius:6px; padding:5px 10px; font:inherit; font-size:13px; cursor:pointer; margin:2px 0 2px 6px; }
+  .abtn.main { background:var(--gold); color:#111; border-color:var(--gold); font-weight:700; padding:8px 14px; margin-left:0; }
+  .abtn.bad { color:#e57373; }
+  #admin td, #admin th { text-align:left; white-space:normal; }
+  #admin td.act { text-align:right; white-space:nowrap; }
+  .chatlog { height:260px; overflow-y:auto; background:#0b0d11; border:1px solid var(--line); border-radius:6px; padding:8px 10px; margin:0 0 8px; font-size:14px; }
+  .chatlog div { margin:0 0 2px; overflow-wrap:anywhere; } .chatlog .tm { color:var(--muted); margin-right:6px; } .chatlog .who { color:var(--gold); margin-right:4px; }
+  .chatrow { display:flex; gap:6px; flex-wrap:wrap; } .chatrow input { flex:1 1 200px; min-width:0; }
+  .replies { color:var(--muted); font-size:12px; max-height:90px; overflow-y:auto; margin:6px 0 0; overflow-wrap:anywhere; }
+  .aerr { color:#e57373; margin-top:8px; min-height:1em; }
+  @media (max-width:760px) { .pair { grid-template-columns:minmax(0, 1fr); } .tiles { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
+  @media (max-width:520px) { .srv td { padding:10px 6px; font-size:14px; } .srv th { padding:10px 6px; font-size:12px; } .srv th:first-child, .srv td:first-child { padding-left:12px; }
+    .srv th:last-child, .srv td:last-child { padding-right:12px; } .thr { display:block; margin:0; font-size:12px; } }
+</style>
+</head>
+<body>
+<main>
+  <span class="lang" id="lang"></span>
+  <span class="lang" id="adm" style="margin-right:16px" hidden></span>
+  <img src="logo-640.jpg?v=1" alt="Going Public Server" style="display:block;width:100%;max-width:420px;height:auto;margin:6px auto 18px;border-radius:12px">
+  <h1 data-t="title"></h1>
+  <p class="sub" id="sub"></p>
+  <form id="login" class="card" style="padding:18px 20px;margin:0 0 16px" hidden>
+    <label for="keyIn" data-t="k_label"></label><br>
+    <input id="keyIn" autocomplete="off" style="margin:8px 8px 0 0;padding:8px 10px;border-radius:6px;border:1px solid var(--line);background:#0b0d11;color:var(--text)">
+    <button style="padding:8px 14px;border-radius:6px;border:0;background:var(--gold);font-weight:700" data-t="k_btn"></button>
+    <div id="keyErr" style="color:#e57373;margin-top:8px"></div>
+  </form>
+  <div class="card" id="tbl" hidden><table>
+    <thead><tr>
+      <th data-k="rank">#</th><th data-k="name" data-t="c_name"></th><th data-k="hours" data-t="c_hours"></th>
+      <th data-k="sessions" data-t="c_sessions"></th><th data-k="cash" data-t="c_cash"></th>
+      <th data-k="businesses" data-t="c_biz"></th><th data-k="buildings" data-t="c_bld"></th>
+      <th data-k="firstSeen" data-t="c_first"></th><th data-k="lastSeen" data-t="c_last"></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table></div>
+  <p class="links" data-t="l_join"></p>
+  <p class="links" id="admRow" hidden><a href="#admin" id="admLink" data-t="a_link_long"></a></p>
+  <section id="provs" hidden>
+    <h2 data-t="pv_title"></h2>
+    <p class="sub" id="pvSub"></p>
+    <div class="card" id="pvTbl"></div>
+  </section>
+  <section id="blds" hidden>
+    <h2 data-t="b_title"></h2>
+    <p class="sub" id="bSub"></p>
+    <div class="card" id="bTbl"></div>
+  </section>
+  <section class="srv" id="srv" hidden>
+    <h2 data-t="s_title"></h2>
+    <p class="sub" id="srvSub"></p>
+    <div class="tiles">
+      <div class="tile"><div class="lbl" data-t="t_rate"></div><div class="val" id="vRate"></div><div class="note" id="nRate"></div></div>
+      <div class="tile"><div class="lbl" data-t="t_conn"></div><div class="val" id="vConn"></div><div class="note" id="nConn"></div></div>
+      <div class="tile"><div class="lbl" data-t="t_thr"></div><div class="val" id="vThr"></div><div class="note" id="nThr"></div></div>
+      <div class="tile"><div class="lbl" data-t="t_fps"></div><div class="val" id="vFps"></div><div class="note" id="nFps"></div></div>
+    </div>
+    <div class="panel" id="cNet"></div>
+    <div class="pair"><div class="panel" id="cMsg"></div><div class="panel" id="cFps"></div></div>
+    <div class="card" id="pTbl" style="margin:0 0 12px"></div>
+    <button class="tblBtn" id="tblBtn" type="button"></button>
+    <div class="card" id="mTbl" hidden></div>
+  </section>
+  <section id="admin">
+    <h1 data-t="a_title"></h1>
+    <form id="aLogin" class="panel" style="margin:0 0 16px">
+      <p class="sub" style="margin:0 0 10px" data-t="a_note"></p>
+      <input id="aUser" autocomplete="username" style="margin:0 6px 6px 0">
+      <input id="aPass" type="password" autocomplete="current-password" style="margin:0 6px 6px 0">
+      <input id="aCode" autocomplete="one-time-code" inputmode="numeric" style="margin:0 6px 6px 0;width:110px" hidden>
+      <button class="abtn main" data-t="a_in"></button>
+      <div class="aerr" id="aErr"></div>
+    </form>
+    <div id="aPanel" hidden>
+      <div class="panel" style="margin:0 0 12px">
+        <div class="ph"><h3 data-t="a_server"></h3><span>
+          <button class="abtn" type="button" id="aSave" data-t="a_save"></button>
+          <button class="abtn bad" type="button" id="aRestart" data-t="a_restart"></button>
+          <button class="abtn" type="button" id="aRestartOff" data-t="a_restart_off" hidden></button>
+          <button class="abtn" type="button" id="aOut" data-t="a_out"></button></span></div>
+        <div id="aStatus" class="sub" style="margin:0"></div>
+        <form class="chatrow" id="aNoticeForm" style="margin-top:8px"><input id="aNotice" maxlength="300" autocomplete="off"><button class="abtn main" data-t="a_notice"></button></form>
+        <div class="replies" id="aReplies"></div>
+      </div>
+      <div class="card" style="margin:0 0 12px"><div style="padding:14px 16px 4px"><h3 data-t="a_players"></h3></div><table><tbody id="aPlayers"></tbody></table></div>
+      <div class="panel" style="margin:0 0 12px">
+        <h3 data-t="a_chat"></h3>
+        <div class="chatlog" id="aChat"></div>
+        <form class="chatrow" id="aChatForm"><select id="aTo"></select><input id="aText" maxlength="500" autocomplete="off"><button class="abtn main" data-t="a_send"></button></form>
+      </div>
+      <div class="card" style="margin:0 0 12px"><div class="ph" style="padding:14px 16px 4px"><h3 data-t="a_bans"></h3><button class="abtn bad" type="button" id="aUnbanAll" data-t="a_unban_all"></button></div>
+        <table><thead><tr><th data-t="c_name"></th><th data-t="a_since"></th><th data-t="a_reason"></th><th data-t="a_how"></th><th></th></tr></thead><tbody id="aBans"></tbody></table></div>
+    </div>
+    <p class="links"><a href="#" id="aBack" data-t="a_back"></a></p>
+  </section>
+</main>
+<script>
+const T = {
+  en: { title:"Ranking", c_name:"Player", c_hours:"Hours played", c_sessions:"Sessions", c_cash:"Cash", c_biz:"Businesses", c_bld:"Buildings owned",
+        c_first:"First visit", c_last:"Last visit", sub:"{n} players have played here · {o} online now · updated {u}", empty:"Nobody has played here yet.",
+        l_join:"Join: subscribe to Going Public Server in the Steam Workshop of Big Ambitions, then Multiplayer → Join a Game with this server's address and server key.", other:"Deutsch", loc:"en-GB",
+        k_label:"The ranking needs the server key (the same key you join with).", k_btn:"Show", k_bad:"Wrong key.", k_need:"Enter the server key.", merged:"merged with {0}",
+        s_title:"Server", s_sub:"Last hour, one reading every {e} s · updated {u}", s_stale:"the server is not reporting", s_wait:"The first reading comes within a minute.",
+        t_rate:"Network rate", t_conn:"Players connected", t_thr:"Throttled", t_fps:"Server FPS",
+        n_rate:"positions {a} Hz · traffic {b} Hz", n_conn:"on the server now", n_thr0:"everyone gets the full rate", n_thr:"weak connection – fewer updates", n_fps:"target {0}",
+        lv:["Normal", "High", "Very high", "Maximum"],
+        c_net:"Network traffic", c_msg:"Messages", c_fps:"Server FPS", u_net:"KB/s", u_msg:"per second", u_fps:"frames per second",
+        in:"In", out:"Out", now:"now", tt_pl:"{0} players", tt_thr:"{0} throttled",
+        p_title:"Players' connections", p_name:"Player", p_ping:"Ping", p_loss:"Loss", p_lvl:"Rate", p_thr:"throttled", p_none:"Nobody is connected right now.",
+        p_note:"From 3 % packet loss or 200 ms ping a player gets at most “High”, from 8 % or 350 ms “Normal” – only that player, the others keep the server's rate. After 30 s of good readings it goes up one step again.",
+        tb_show:"Show as table", tb_hide:"Hide table", tb_note:"Average per minute (players: most at once).",
+        th_time:"Time", th_netin:"KB/s in", th_netout:"KB/s out", th_msgin:"Msg/s in", th_msgout:"Msg/s out", th_fps:"FPS", th_pl:"Players", th_thr:"Throttled" },
+  de: { title:"Rangliste", c_name:"Spieler", c_hours:"Spielstunden", c_sessions:"Sitzungen", c_cash:"Bargeld", c_biz:"Geschäfte", c_bld:"Gekaufte Gebäude",
+        c_first:"Erster Besuch", c_last:"Letzter Besuch", sub:"{n} Spieler haben hier gespielt · {o} gerade online · Stand {u}", empty:"Hier hat noch niemand gespielt.",
+        l_join:"Beitreten: Going Public Server im Steam Workshop von Big Ambitions abonnieren, dann Multiplayer → Join a Game mit der Adresse dieses Servers und dem Server-Schlüssel.", other:"English", loc:"de-DE",
+        k_label:"Die Rangliste braucht den Server-Schlüssel (denselben, mit dem du beitrittst).", k_btn:"Anzeigen", k_bad:"Falscher Schlüssel.", k_need:"Server-Schlüssel eingeben.", merged:"fusioniert mit {0}",
+        s_title:"Server", s_sub:"Letzte Stunde, alle {e} s ein Messwert · Stand {u}", s_stale:"der Server meldet sich nicht", s_wait:"Der erste Messwert kommt innerhalb einer Minute.",
+        t_rate:"Netzwerk-Takt", t_conn:"Spieler verbunden", t_thr:"Gedrosselt", t_fps:"Server-FPS",
+        n_rate:"Positionen {a} Hz · Verkehr {b} Hz", n_conn:"gerade auf dem Server", n_thr0:"alle bekommen den vollen Takt", n_thr:"schwache Leitung – weniger Updates", n_fps:"Ziel {0}",
+        lv:["Normal", "Hoch", "Sehr hoch", "Maximal"],
+        c_net:"Netzverkehr", c_msg:"Nachrichten", c_fps:"Server-FPS", u_net:"KB/s", u_msg:"pro Sekunde", u_fps:"Bilder pro Sekunde",
+        in:"Rein", out:"Raus", now:"aktuell", tt_pl:"{0} Spieler", tt_thr:"{0} gedrosselt",
+        p_title:"Verbindung der Spieler", p_name:"Spieler", p_ping:"Ping", p_loss:"Verlust", p_lvl:"Takt", p_thr:"gedrosselt", p_none:"Gerade ist niemand verbunden.",
+        p_note:"Ab 3 % Paketverlust oder 200 ms Ping bekommt ein Spieler höchstens „Hoch“, ab 8 % oder 350 ms „Normal“ – nur er, die anderen behalten den Takt des Servers. Nach 30 s guter Werte geht es wieder eine Stufe hoch.",
+        tb_show:"Als Tabelle zeigen", tb_hide:"Tabelle ausblenden", tb_note:"Mittelwert je Minute (Spieler: Höchstwert).",
+        th_time:"Zeit", th_netin:"KB/s rein", th_netout:"KB/s raus", th_msgin:"Nachr./s rein", th_msgout:"Nachr./s raus", th_fps:"FPS", th_pl:"Spieler", th_thr:"Gedrosselt" }
+};
+// GOING-ONLINE-RANK-1: the cable providers' texts
+Object.assign(T.en, { pv_title:"Cable providers (Going Online)", pv_sub:"{n} players run a cable provider · most customers first · new = founded in the last three days",
+  pv_line:"Cable provider: {0}", pv_new:"new", pv_company:"Company", pv_player:"Player", pv_cust:"Customers", pv_bld:"Buildings", pv_hoods:"Neighbourhoods",
+  pv_rep:"Reputation", pv_since:"Founded", pv_day:"game day {0}" });
+Object.assign(T.de, { pv_title:"Kabelanbieter (Going Online)", pv_sub:"{n} Spieler führen einen Kabelanbieter · die meisten Anschlüsse zuerst · neu = in den letzten drei Tagen gegründet",
+  pv_line:"Kabelanbieter: {0}", pv_new:"neu", pv_company:"Firma", pv_player:"Spieler", pv_cust:"Anschlüsse", pv_bld:"Häuser", pv_hoods:"Viertel",
+  pv_rep:"Ruf", pv_since:"Gegründet", pv_day:"Spieltag {0}" });
+// BUILDING-LIST-1: the list's texts
+Object.assign(T.en, { b_title:"Players' buildings", b_sub:"{b} bought · {r} rented or run · updated {u}", b_none:"No player has bought or rented a building yet.",
+  b_addr:"Address", b_biz:"Business", b_buy:"Bought by", b_rent:"Rented by" });
+Object.assign(T.de, { b_title:"Gebäude der Spieler", b_sub:"{b} gekauft · {r} gemietet oder betrieben · Stand {u}", b_none:"Noch hat kein Spieler ein Gebäude gekauft oder gemietet.",
+  b_addr:"Adresse", b_biz:"Geschäft", b_buy:"Gekauft von", b_rent:"Gemietet von" });
+// ADMIN-1: the admin part's texts
+Object.assign(T.en, { a_link:"Admin", a_link_long:"Server admin - sign in with your AMP account", a_title:"Server admin", a_note:"Sign in with your AMP account. In AMP it needs the right to use this instance's console.",
+  a_user:"AMP user", a_pass:"Password", a_code:"2FA code", a_in:"Sign in", a_out:"Sign out", a_back:"Back to the ranking", a_bad:"Sign-in failed.",
+  a_2fa:"Enter the code of your authenticator app.", a_neterr:"AMP does not answer.", a_noperm:"This AMP account may not use this instance's console.",
+  a_players:"Players online", a_none:"Nobody is on the server.", a_msg:"Message", a_kick:"Kick", a_ban:"Ban",
+  a_reason_kick:"Kick {0} - reason (optional, the player sees it):", a_reason_ban:"Ban {0} - reason (optional, the player sees it):", a_msg_to:"Message to {0}:",
+  a_chat:"Chat", a_all:"To everyone", a_send:"Send", a_chat_none:"No chat yet.", a_bans:"Ban list", a_bans_none:"Nobody is banned.",
+  a_since:"Banned", a_reason:"Reason", a_how:"Recognised by", a_unban:"Unban", a_unban_all:"Unban everyone", a_unban_q:"Lift the ban of {0}?",
+  a_unban_all_q:"Unban every player?", a_how_steam:"Steam account", a_how_ip:"IP address", a_day:"day {0}", a_server:"Server", a_save:"Save",
+  a_restart:"Restart", a_restart_q:"Restart the server now? Everybody is out for about a minute.", a_status:"{s} · world {w} · day {d} · {p} players · version {v}",
+  a_ping:"{0} ms", a_on:"on for {0}", a_notice:"Announce", a_notice_ph:"Announcement on every player's screen", a_restart_off:"Call off the restart",
+  a_restart_min:"Restart in how many minutes? (0 = now; the players are warned at 5 min, 1 min, 30 s and 10 s)", a_restart_in:"restart in {0}", a_stop_in:"AMP stops the server in {0}",
+  a_state:{ running:"running", idle:"waiting for players", loading:"loading", lobby:"lobby", menu:"main menu", stopping:"stopping" } });
+Object.assign(T.de, { a_link:"Admin", a_link_long:"Server-Verwaltung - Anmeldung mit dem AMP-Konto", a_title:"Server-Verwaltung", a_note:"Anmelden mit deinem AMP-Konto. Es braucht in AMP das Recht, die Konsole dieser Instanz zu benutzen.",
+  a_user:"AMP-Benutzer", a_pass:"Passwort", a_code:"2FA-Code", a_in:"Anmelden", a_out:"Abmelden", a_back:"Zur Rangliste", a_bad:"Anmeldung fehlgeschlagen.",
+  a_2fa:"Gib den Code aus deiner Authenticator-App ein.", a_neterr:"AMP antwortet nicht.", a_noperm:"Dieses AMP-Konto darf die Konsole dieser Instanz nicht benutzen.",
+  a_players:"Spieler online", a_none:"Niemand ist auf dem Server.", a_msg:"Nachricht", a_kick:"Kicken", a_ban:"Bannen",
+  a_reason_kick:"{0} kicken – Grund (optional, der Spieler sieht ihn):", a_reason_ban:"{0} bannen – Grund (optional, der Spieler sieht ihn):", a_msg_to:"Nachricht an {0}:",
+  a_chat:"Chat", a_all:"An alle", a_send:"Senden", a_chat_none:"Noch kein Chat.", a_bans:"Bannliste", a_bans_none:"Niemand ist gebannt.",
+  a_since:"Gebannt am", a_reason:"Grund", a_how:"Erkannt über", a_unban:"Entbannen", a_unban_all:"Alle entbannen", a_unban_q:"Bann von {0} aufheben?",
+  a_unban_all_q:"Alle Spieler entbannen?", a_how_steam:"Steam-Konto", a_how_ip:"IP-Adresse", a_day:"Tag {0}", a_server:"Server", a_save:"Speichern",
+  a_restart:"Neu starten", a_restart_q:"Server jetzt neu starten? Alle sind für etwa eine Minute draußen.", a_status:"{s} · Welt {w} · Tag {d} · {p} Spieler · Version {v}",
+  a_ping:"{0} ms", a_on:"seit {0}", a_notice:"Ankündigen", a_notice_ph:"Ankündigung auf dem Bildschirm aller Spieler", a_restart_off:"Neustart absagen",
+  a_restart_min:"In wie vielen Minuten neu starten? (0 = sofort; die Spieler werden bei 5 min, 1 min, 30 s und 10 s gewarnt)", a_restart_in:"Neustart in {0}", a_stop_in:"AMP stoppt den Server in {0}",
+  a_state:{ running:"läuft", idle:"wartet auf Spieler", loading:"lädt", lobby:"Lobby", menu:"Hauptmenü", stopping:"fährt herunter" } });
+let lang = (navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en";
+let data = null, key = "hours", asc = false, KEY = "";
+const SK = "gpsKey" + location.pathname.replace(/[^/]*$/, "");   // one key per server address (RANK-URL-1)
+try { KEY = sessionStorage.getItem(SK) || ""; } catch (e) {}
+const hk = new URLSearchParams(location.hash.slice(1)).get("key");
+if (hk) { KEY = hk; history.replaceState(null, "", location.pathname); }
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const date = u => u ? new Date(u * 1000).toLocaleDateString(T[lang].loc) : "—";
+const num = (v, d) => v == null ? "—" : Number(v).toLocaleString(T[lang].loc, { maximumFractionDigits: d });
+function render() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll("[data-t]").forEach(e => e.textContent = T[lang][e.dataset.t]);
+  document.getElementById("lang").textContent = T[lang].other;
+  document.querySelectorAll("#tbl th").forEach(th => { th.classList.toggle("on", th.dataset.k === key); th.classList.toggle("asc", th.dataset.k === key && asc); });
+  if (!data) return;
+  const ps = data.players.slice();
+  const k = key === "rank" ? "hours" : key;
+  ps.sort((a, b) => { const x = a[k] ?? -1, y = b[k] ?? -1; const r = typeof x === "string" ? x.localeCompare(y) : x - y; return asc ? r : -r; });
+  document.getElementById("sub").textContent = T[lang].sub.replace("{n}", ps.length).replace("{o}", ps.filter(p => p.online).length)
+    .replace("{u}", new Date(data.updatedUnix * 1000).toLocaleString(T[lang].loc));
+  document.getElementById("rows").innerHTML = ps.length ? ps.map((p, i) => `<tr>
+      <td class="rank">${i + 1}</td><td>${p.online ? '<span class="dot"></span>' : ""}${esc(p.name)}${p.merged ? `<span class="merged">${esc(T[lang].merged.replace("{0}", p.merged))}</span>` : ""}${p.provider ? `<span class="prov">${esc(T[lang].pv_line.replace("{0}", p.provider.name))}${provNew(p.provider) ? `<b class="badge">${esc(T[lang].pv_new)}</b>` : ""}</span>` : ""}</td>
+      <td>${num(p.hours, 1)}</td><td>${num(p.sessions, 0)}</td><td>${p.cash == null ? "—" : "$" + num(p.cash, 0)}</td>
+      <td>${num(p.businesses, 0)}</td><td>${num(p.buildings, 0)}</td><td>${date(p.firstSeen)}</td><td>${date(p.lastSeen)}</td></tr>`).join("")
+    : `<tr><td colspan="9" class="empty">${T[lang].empty}</td></tr>`;
+  renderProvs();
+}
+// GOING-ONLINE-RANK-1: the players who run a cable provider of module 8 (from ranking.json: players[].provider, reported by
+// each player once a minute; PlayerLedger.cs). New = the server first saw it in the last three days.
+const provNew = v => v && v.since && Date.now() / 1000 - v.since < 3 * 86400;
+function renderProvs() {
+  const sec = document.getElementById("provs"), L = T[lang];
+  const ps = (data && Array.isArray(data.players) ? data.players : []).filter(p => p.provider && p.provider.name);
+  if (!ps.length) { sec.hidden = true; return; }
+  sec.hidden = false;
+  ps.sort((a, b) => (b.provider.customers || 0) - (a.provider.customers || 0) || String(a.provider.name).localeCompare(String(b.provider.name), L.loc));
+  setText("pvSub", L.pv_sub.replace("{n}", ps.length));
+  const head = [L.pv_company, L.pv_player, L.pv_cust, L.pv_bld, L.pv_hoods, L.pv_rep, L.pv_since].map(h => `<th>${esc(h)}</th>`).join("");
+  document.getElementById("pvTbl").innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>` + ps.map(p => {
+    const v = p.provider;
+    return `<tr><td>${esc(v.name)}${provNew(v) ? `<b class="badge">${esc(L.pv_new)}</b>` : ""}</td><td>${p.online ? '<span class="dot"></span>' : ""}${esc(p.name)}</td>`
+      + `<td>${num(v.customers, 0)}</td><td>${num(v.buildings, 0)}</td><td>${num(v.hoods, 0)}</td><td>${num(v.reputation, 0)}</td>`
+      + `<td>${v.since ? date(v.since) : "—"}${v.day ? ` <span class="merged">${esc(L.pv_day.replace("{0}", v.day))}</span>` : ""}</td></tr>`;
+  }).join("") + `</tbody></table>`;
+}
+// the data folder is named after SHA-256(lower-case key), never the key itself (DedicatedHost.KeyFolder)
+async function keyFolder(k) {
+  const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(k.trim().toLowerCase()));
+  return Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+function showLogin(msg) {
+  document.getElementById("login").hidden = false; document.getElementById("tbl").hidden = true; document.getElementById("srv").hidden = true;
+  document.getElementById("blds").hidden = true; document.getElementById("provs").hidden = true;
+  document.getElementById("sub").textContent = ""; document.getElementById("keyErr").textContent = msg || "";
+}
+async function load() {
+  if (!KEY) { render(); return showLogin(""); }
+  let r = null;
+  try { r = await fetch((await keyFolder(KEY)) + "/ranking.json?t=" + Date.now(), { cache: "no-store" }); } catch (e) {}
+  if (!r || !r.ok || !(r.headers.get("content-type") || "").includes("json")) {
+    data = null; net = null; render(); return showLogin(r && r.status === 404 ? T[lang].k_bad : T[lang].empty);
+  }
+  const first = !data;
+  data = await r.json();
+  try { sessionStorage.setItem(SK, KEY); } catch (e) {}
+  document.getElementById("login").hidden = true; document.getElementById("tbl").hidden = false;
+  render();
+  if (first) { loadNet(); loadBlds(); }
+}
+
+// NET-PAGE-1: the server's numbers of the last hour (net.json, written by the server every 15 s; ServerStats.cs).
+// One sample: [unix time, KB/s in, KB/s out, messages/s in, messages/s out, frames/s, players connected, of them throttled]
+let net = null, showTbl = false;
+const charts = {};
+const MOVE_HZ = [10, 20, 30, 60], TRAFFIC_HZ = [5, 10, 15, 30];
+const WARN = '<svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 1 11.5 11h-11z" fill="var(--warn)"/></svg>';
+const fix = (v, d) => v == null ? "—" : Number(v).toLocaleString(T[lang].loc, { minimumFractionDigits: d, maximumFractionDigits: d });
+const clock = (u, sec) => new Date(u * 1000).toLocaleTimeString(T[lang].loc, sec ? { hour: "2-digit", minute: "2-digit", second: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
+const lvOf = v => Math.max(0, Math.min(3, v | 0));
+const setText = (id, v) => { document.getElementById(id).textContent = v; };
+async function loadNet() {
+  if (!KEY || !data) return;
+  let r = null;
+  try { r = await fetch((await keyFolder(KEY)) + "/net.json?t=" + Date.now(), { cache: "no-store" }); } catch (e) {}
+  if (r && r.status === 404) { net = null; document.getElementById("srv").hidden = true; return; }   // a server before 1.0.16
+  if (!r || !r.ok || !(r.headers.get("content-type") || "").includes("json")) return;              // keep the last picture
+  try { net = await r.json(); } catch (e) { return; }
+  renderNet();
+}
+// a round top for the y axis and its step (about four steps)
+function nice(max, whole) {
+  const raw = max / 4, p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = (whole ? [1, 2, 5, 10] : [1, 2, 2.5, 5, 10]).map(k => k * p).find(s => s >= raw * 0.999);
+  const st = whole ? Math.max(1, step) : step;
+  return [Math.ceil(max / st - 1e-9) * st, st];
+}
+function renderNet() {
+  const sec = document.getElementById("srv");
+  if (!net || !Array.isArray(net.samples) || !data) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const L = T[lang], lv = lvOf(net.level), every = net.every || 15;
+  const stale = Date.now() / 1000 - net.updatedUnix > 4 * every;
+  setText("srvSub", L.s_sub.replace("{e}", every).replace("{u}", clock(net.updatedUnix, true)) + (stale ? " · " + L.s_stale : ""));
+  const ps = net.players || [], thr = ps.filter(p => p.level < lv).length;
+  const last = net.samples.length ? net.samples[net.samples.length - 1] : null;
+  setText("vRate", L.lv[lv]); setText("nRate", L.n_rate.replace("{a}", MOVE_HZ[lv]).replace("{b}", TRAFFIC_HZ[lv]));
+  setText("vConn", ps.length); setText("nConn", L.n_conn);
+  setText("vThr", thr); setText("nThr", thr ? L.n_thr : L.n_thr0);
+  setText("vFps", last ? fix(last[5], 0) : "—"); setText("nFps", net.fpsTarget ? L.n_fps.replace("{0}", net.fpsTarget) : "");
+  drawChart("cNet", L.c_net, L.u_net, " KB/s", 1, [[1, "in", "--s-in"], [2, "out", "--s-out"]], 2, false, 200);
+  drawChart("cMsg", L.c_msg, L.u_msg, "/s", 0, [[3, "in", "--s-in"], [4, "out", "--s-out"]], 4, true, 160);
+  drawChart("cFps", L.c_fps, L.u_fps, " FPS", 0, [[5, "c_fps", "--s-fps"]], 10, true, 160);
+  document.getElementById("pTbl").innerHTML = `<h3 class="cap">${esc(L.p_title)}</h3><table><thead><tr><th>${esc(L.p_name)}</th><th>${esc(L.p_ping)}</th>`
+    + `<th>${esc(L.p_loss)}</th><th>${esc(L.p_lvl)}</th></tr></thead><tbody>`
+    + (ps.length ? ps.map(p => `<tr><td>${esc(p.name)}</td><td>${p.ping == null ? "—" : fix(p.ping, 0) + " ms"}</td>`
+        + `<td>${p.loss == null ? "—" : fix(p.loss, 1) + " %"}</td><td>${esc(L.lv[lvOf(p.level)])}`
+        + `${p.level < lv ? `<span class="thr">${WARN}${esc(L.p_thr)}</span>` : ""}</td></tr>`).join("")
+      : `<tr><td colspan="4" class="empty">${esc(L.p_none)}</td></tr>`)
+    + `</tbody></table><p class="fine">${esc(L.p_note)}</p>`;
+  setText("tblBtn", showTbl ? L.tb_hide : L.tb_show);
+  const mt = document.getElementById("mTbl");
+  mt.hidden = !showTbl;
+  if (showTbl) {
+    const mins = new Map();
+    for (const s of net.samples) { const k = Math.floor(s[0] / 60) * 60; if (!mins.has(k)) mins.set(k, []); mins.get(k).push(s); }
+    const rows = [...mins.entries()].sort((a, b) => b[0] - a[0]).map(([k, ss]) => {
+      const avg = i => ss.reduce((a, s) => a + s[i], 0) / ss.length, most = i => Math.max(...ss.map(s => s[i]));
+      return `<tr><td>${clock(k)}</td><td>${fix(avg(1), 1)}</td><td>${fix(avg(2), 1)}</td><td>${fix(avg(3), 0)}</td><td>${fix(avg(4), 0)}</td>`
+        + `<td>${fix(avg(5), 0)}</td><td>${most(6)}</td><td>${most(7)}</td></tr>`;
+    });
+    mt.innerHTML = `<p class="fine" style="padding-bottom:4px">${esc(L.tb_note)}</p><table><thead><tr>`
+      + ["th_time", "th_netin", "th_netout", "th_msgin", "th_msgout", "th_fps", "th_pl", "th_thr"].map(k => `<th>${esc(L[k])}</th>`).join("")
+      + `</tr></thead><tbody>${rows.join("") || `<tr><td colspan="8" class="empty">${esc(L.s_wait)}</td></tr>`}</tbody></table>`;
+  }
+}
+// One line chart of the last hour. series: [sample index, name key, colour token]; a gap of more than 2.5 readings
+// breaks the line (the server was off). Two series: a legend with the current values and names at the line ends;
+// one series: its current value in the legend's place.
+function drawChart(id, title, unit, short, digits, series, minTop, whole, H) {
+  const box = document.getElementById(id), L = T[lang], prev = charts[id];
+  if (!box.firstChild) {
+    box.innerHTML = '<div class="ph"><h3></h3><span class="unit"></span></div><div class="legend"></div>'
+      + '<div class="plot"><svg tabindex="0" role="img"></svg><div class="tip" hidden></div></div>';
+    hookChart(id);
+  }
+  box.querySelector("h3").textContent = title;
+  box.querySelector(".unit").textContent = unit;
+  const svg = box.querySelector("svg"), two = series.length > 1;
+  const W = Math.max(240, Math.round(box.querySelector(".plot").clientWidth));
+  const m = { l: 44, r: two ? 42 : 14, t: 10, b: 24 }, pw = W - m.l - m.r, ph = H - m.t - m.b;
+  const t1 = net.updatedUnix, t0 = t1 - 3600, gap = (net.every || 15) * 2.5;
+  const pts = net.samples.filter(s => s[0] >= t0 && s[0] <= t1 + 5);
+  let max = 0;
+  for (const s of pts) for (const [i] of series) max = Math.max(max, s[i] || 0);
+  const [top, step] = nice(Math.max(max, minTop), whole);
+  const X = t => m.l + (t - t0) / 3600 * pw, Y = v => m.t + ph - Math.min(Math.max(v || 0, 0), top) / top * ph;
+  const tickDigits = step < 0.5 ? 2 : step < 1 ? 1 : 0;
+  let g = "";
+  for (let v = 0; v <= top + step / 2; v += step) {
+    const y = Math.round(Y(v)) + 0.5;
+    g += `<line x1="${m.l}" x2="${W - m.r}" y1="${y}" y2="${y}" style="stroke:var(${v === 0 ? "--axis" : "--line"});stroke-width:1"/>`
+      + `<text x="${m.l - 8}" y="${y + 4}" text-anchor="end">${fix(v, tickDigits)}</text>`;
+  }
+  for (let t = Math.ceil(t0 / 900) * 900; t <= t1; t += 900) {
+    const x = X(t);
+    if (x >= m.l + 16 && x <= W - m.r - 16) g += `<text x="${x.toFixed(1)}" y="${H - 6}" text-anchor="middle">${clock(t)}</text>`;
+  }
+  const runs = []; let run = [];
+  for (const s of pts) { if (run.length && s[0] - run[run.length - 1][0] > gap) { runs.push(run); run = []; } run.push(s); }
+  if (run.length) runs.push(run);
+  const base = Y(0).toFixed(1);
+  const pathOf = (r, i) => r.map((s, k) => `${k ? "L" : "M"}${X(s[0]).toFixed(1)},${Y(s[i]).toFixed(1)}`).join("");
+  for (const [i, , c] of series)   // the washes first, so no line lies under another series' wash
+    for (const r of runs) if (r.length > 1)
+      g += `<path d="${pathOf(r, i)}L${X(r[r.length - 1][0]).toFixed(1)},${base}L${X(r[0][0]).toFixed(1)},${base}Z" style="fill:var(${c});opacity:.1"/>`;
+  for (const [i, , c] of series)
+    for (const r of runs)
+      g += r.length === 1 ? `<circle cx="${X(r[0][0]).toFixed(1)}" cy="${Y(r[0][i]).toFixed(1)}" r="2.5" style="fill:var(${c})"/>`
+        : `<path d="${pathOf(r, i)}" style="fill:none;stroke:var(${c});stroke-width:2;stroke-linejoin:round;stroke-linecap:round"/>`;
+  const end = pts[pts.length - 1];
+  if (end) {
+    const ys = series.map(([i]) => Y(end[i]));
+    series.forEach(([, , c], n) => { g += `<circle cx="${X(end[0]).toFixed(1)}" cy="${ys[n].toFixed(1)}" r="4" style="fill:var(${c});stroke:var(--card);stroke-width:2"/>`; });
+    if (two && Math.abs(ys[0] - ys[1]) >= 14)
+      series.forEach(([, k], n) => { g += `<text class="lbl" x="${(X(end[0]) + 9).toFixed(1)}" y="${(ys[n] + 4).toFixed(1)}">${esc(L[k])}</text>`; });
+  } else g += `<text x="${(m.l + pw / 2).toFixed(1)}" y="${(m.t + ph / 2).toFixed(1)}" text-anchor="middle">${esc(L.s_wait)}</text>`;
+  g += '<g class="hover"></g>';
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.setAttribute("aria-label", `${title} (${unit})`);
+  svg.innerHTML = g;
+  box.querySelector(".legend").innerHTML = two
+    ? series.map(([i, k, c]) => `<span><i class="key" style="background:var(${c})"></i>${esc(L[k])}<b>${end ? fix(end[i], digits) : "—"}</b>${end ? esc(short) : ""}</span>`).join("")
+    : `<span>${esc(L.now)}<b>${end ? fix(end[series[0][0]], digits) : "—"}</b>${end ? esc(short) : ""}</span>`;
+  charts[id] = { pts, X, Y, series, m, W, ph, digits, short, idx: -1 };
+  if (prev && prev.idx >= 0 && pts.length) {   // a refresh keeps the crosshair on the same moment
+    const t = prev.pts[prev.idx][0];
+    let k = 0; pts.forEach((s, n) => { if (Math.abs(s[0] - t) < Math.abs(pts[k][0] - t)) k = n; });
+    showAt(id, k);
+  } else box.querySelector(".tip").hidden = true;
+}
+function hookChart(id) {
+  const box = document.getElementById(id), svg = box.querySelector("svg");
+  const nearest = ev => {
+    const st = charts[id]; if (!st || !st.pts.length) return -1;
+    const r = svg.getBoundingClientRect(), x = (ev.clientX - r.left) * st.W / r.width;
+    let k = 0; st.pts.forEach((s, n) => { if (Math.abs(st.X(s[0]) - x) < Math.abs(st.X(st.pts[k][0]) - x)) k = n; });
+    return k;
+  };
+  svg.addEventListener("pointermove", ev => showAt(id, nearest(ev)));
+  svg.addEventListener("pointerleave", () => hideAt(id));
+  svg.addEventListener("focus", () => { const st = charts[id]; if (st && st.pts.length) showAt(id, st.idx >= 0 ? st.idx : st.pts.length - 1); });
+  svg.addEventListener("blur", () => hideAt(id));
+  svg.addEventListener("keydown", ev => {
+    const st = charts[id]; if (!st || !st.pts.length) return;
+    let k = st.idx >= 0 ? st.idx : st.pts.length - 1;
+    if (ev.key === "ArrowLeft") k = Math.max(0, k - 1);
+    else if (ev.key === "ArrowRight") k = Math.min(st.pts.length - 1, k + 1);
+    else if (ev.key === "Home") k = 0;
+    else if (ev.key === "End") k = st.pts.length - 1;
+    else if (ev.key === "Escape") { hideAt(id); return; }
+    else return;
+    ev.preventDefault(); showAt(id, k);
+  });
+}
+function showAt(id, k) {
+  const st = charts[id], box = document.getElementById(id);
+  if (!st || k < 0 || k >= st.pts.length) return;
+  st.idx = k;
+  const s = st.pts[k], x = st.X(s[0]).toFixed(1), L = T[lang];
+  box.querySelector(".hover").innerHTML = `<line x1="${x}" x2="${x}" y1="${st.m.t}" y2="${st.m.t + st.ph}" style="stroke:var(--muted);stroke-width:1;opacity:.6"/>`
+    + st.series.map(([i, , c]) => `<circle cx="${x}" cy="${st.Y(s[i]).toFixed(1)}" r="4" style="fill:var(${c});stroke:var(--card);stroke-width:2"/>`).join("");
+  const tip = box.querySelector(".tip");
+  tip.textContent = "";
+  const line = (cls, text) => { const d = document.createElement("div"); if (cls) d.className = cls; if (text) d.textContent = text; tip.appendChild(d); return d; };
+  line("tt", clock(s[0], true));
+  for (const [i, n, c] of st.series) {
+    const row = line(""), key = document.createElement("i"), b = document.createElement("b"), nm = document.createElement("span");
+    key.className = "key"; key.style.background = `var(${c})`;
+    b.textContent = fix(s[i], st.digits) + st.short;
+    nm.textContent = L[n];
+    row.append(key, b, nm);
+  }
+  line("tt", L.tt_pl.replace("{0}", s[6]) + (s[7] ? " · " + L.tt_thr.replace("{0}", s[7]) : ""));
+  tip.hidden = false;
+  const pw = box.querySelector(".plot").clientWidth, tw = tip.offsetWidth, px = Number(x) * pw / st.W;
+  tip.style.left = Math.max(0, px + 14 + tw > pw ? px - 14 - tw : px + 14) + "px";
+}
+function hideAt(id) {
+  const st = charts[id], box = document.getElementById(id);
+  if (st) st.idx = -1;
+  const hov = box.querySelector(".hover"); if (hov) hov.innerHTML = "";
+  const tip = box.querySelector(".tip"); if (tip) tip.hidden = true;
+}
+
+// ── ADMIN-1 (user 2026-11-02: "an interface for the admins with chat, ban list and so on - or through the ranking login"):
+// signs in at this server's AMP instance (AMP's own login and rights, through ADS: /API/ADSModule/Servers/<id>/API) and
+// talks to the server through its console - commands in with Core/SendConsoleMessage, the answers ("[BAMP-HEADLESS] OUT /
+// DATA <id> <json> / CHAT / JOIN / LEAVE") back with Core/GetUpdates. Whatever a player wrote goes in as text, never as HTML.
+const A = { inst: "", base: "", sid: "", poll: 0, tick: 0, seq: 0, players: [], bans: [], chat: [], status: null, replies: [] };
+const $ = id => document.getElementById(id);
+const one = v => String(v ?? "").replace(/[\r\n]+/g, " ").trim();
+const quoted = id => id.includes('"') ? id : '"' + id + '"';
+const SPAN = s => s < 3600 ? Math.floor(s / 60) + " min" : Math.floor(s / 3600) + " h " + Math.floor(s / 60) % 60 + " min";
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+async function amp(method, data) {
+  const body = Object.assign({}, data || {}); if (A.sid) body.SESSIONID = A.sid;
+  const headers = { "Content-Type": "application/json", "Accept": "application/json" }; if (A.sid) headers.Authorization = "Bearer " + A.sid;
+  const r = await fetch(A.base + "/" + method, { method: "POST", headers, body: JSON.stringify(body), cache: "no-store" });
+  if (r.status === 401 || r.status === 403) throw new Error("auth");
+  if (!r.ok) throw new Error("http");
+  const t = await r.text(); const j = t ? JSON.parse(t) : null;
+  if (j && j.Title && j.Message && j.StackTrace !== undefined) throw new Error(/unauthori|session|permission/i.test(j.Title + j.Message) ? "auth" : "err");
+  return j;
+}
+const send = line => amp("Core/SendConsoleMessage", { message: one(line) });
+const ask = what => send("admin " + what + " w" + (++A.seq));
+async function admInit() {
+  try { const r = await fetch("amp.json?t=" + Date.now(), { cache: "no-store" }); if (r.ok) { const j = await r.json(); if (/^[0-9a-f-]{36}$/.test(j.instance || "")) A.inst = j.instance; } } catch (e) {}
+  if (!A.inst) return;   // the shared page of earlier versions, or a server before 1.0.16.3: no admin part
+  A.base = location.origin + "/API/ADSModule/Servers/" + A.inst + "/API";
+  $("adm").hidden = false; $("admRow").hidden = false;   // ADMIN-LINK-1: also under the ranking
+  try { A.sid = sessionStorage.getItem("gpsAmp" + A.inst) || ""; } catch (e) {}
+  if (location.hash === "#admin") admOpen();
+}
+function admOpen() {
+  document.querySelector("main").classList.add("adminView");
+  if (location.hash !== "#admin") history.replaceState(null, "", location.pathname + "#admin");
+  admRender();
+  if (A.sid) admStart(); else { $("aLogin").hidden = false; $("aPanel").hidden = true; }
+}
+function admClose() { document.querySelector("main").classList.remove("adminView"); history.replaceState(null, "", location.pathname); admStop(); }
+function admStop() { clearInterval(A.poll); clearInterval(A.tick); A.poll = A.tick = 0; }
+function admErr(m) { $("aErr").textContent = m || ""; }
+function admSignedOut(msg) {
+  admStop(); A.sid = ""; try { sessionStorage.removeItem("gpsAmp" + A.inst); } catch (e) {}
+  $("aPanel").hidden = true; $("aLogin").hidden = false; admErr(msg);
+}
+async function admLogin(ev) {
+  ev.preventDefault(); admErr("");
+  A.sid = "";
+  let r = null;
+  try { r = await amp("Core/Login", { username: $("aUser").value.trim(), password: $("aPass").value, token: $("aCode").value.trim(), rememberMe: false }); }
+  catch (e) { return admErr(T[lang].a_neterr); }
+  const sid = r && (r.sessionID || r.SessionID), ok = r && (r.success === true || r.Success === true);
+  if (ok && sid) {
+    A.sid = sid; try { sessionStorage.setItem("gpsAmp" + A.inst, sid); } catch (e) {}
+    $("aPass").value = ""; $("aCode").value = ""; $("aCode").hidden = true;
+    return admStart();
+  }
+  const code = r ? (r.result ?? r.Result) : -1;
+  if (code === 40) { $("aCode").hidden = false; $("aCode").focus(); return admErr(T[lang].a_2fa); }
+  admErr((r && (r.resultReason || r.ResultReason)) || T[lang].a_bad);
+}
+async function admStart() {
+  $("aLogin").hidden = true; $("aPanel").hidden = false;
+  try { await amp("Core/GetUpdates"); }   // what the console held before is not ours to read again
+  catch (e) { return admSignedOut(e.message === "auth" ? "" : T[lang].a_neterr); }
+  try { await ask("status"); await ask("players"); await ask("bans"); await ask("chat"); }
+  catch (e) { return admSignedOut(e.message === "auth" ? T[lang].a_noperm : T[lang].a_neterr); }
+  admStop();
+  A.poll = setInterval(admPoll, 2000);
+  A.tick = setInterval(() => { ask("status").catch(() => {}); ask("players").catch(() => {}); }, 20000);
+  A.clock = A.clock || setInterval(() => { if (A.status && A.status.restartIn >= 0) admStatusLine(); }, 1000);
+}
+async function admPoll() {
+  let u;
+  try { u = await amp("Core/GetUpdates"); } catch (e) { if (e.message === "auth") admSignedOut(""); return; }
+  let dirty = false;
+  for (const c of (u && (u.ConsoleEntries || u.consoleEntries)) || []) {
+    const m = /\[BAMP-HEADLESS\] ([A-Z]+) ?(.*)$/.exec(String(c.Contents ?? c.contents ?? ""));
+    if (!m) continue;
+    const kind = m[1], rest = m[2];
+    if (kind === "DATA") {
+      const sp = rest.indexOf(" "); let d = null;
+      try { d = JSON.parse(rest.slice(sp + 1)); } catch (e) { continue; }
+      if (Array.isArray(d.players)) A.players = d.players;
+      if (Array.isArray(d.bans)) A.bans = d.bans;
+      if (Array.isArray(d.chat)) A.chat = d.chat.slice(-100);
+      if (d.state !== undefined) { A.status = d; A.statusAt = Date.now(); }
+      dirty = true;
+    } else if (kind === "CHAT") {
+      const i = rest.indexOf(": ");
+      if (i > 0) { A.chat.push({ t: new Date().toISOString(), who: rest.slice(0, i), text: rest.slice(i + 2) }); if (A.chat.length > 100) A.chat.shift(); dirty = true; }
+    } else if (kind === "JOIN" || kind === "LEAVE") {
+      ask("players").catch(() => {}); ask("status").catch(() => {});
+    } else if (kind === "OUT") {
+      A.replies.push(rest); if (A.replies.length > 6) A.replies.shift(); dirty = true;
+      if (/^OK (un)?banned/.test(rest)) ask("bans").catch(() => {});
+      if (/^OK (kicked|banned)/.test(rest)) ask("players").catch(() => {});
+      if (/^OK restart/.test(rest)) ask("status").catch(() => {});
+    }
+  }
+  if (dirty) admRender();
+}
+function admStatusLine() {
+  const L = T[lang], st = A.status, rIn = st && st.restartIn >= 0 ? st.restartIn - Math.floor((Date.now() - (A.statusAt || Date.now())) / 1000) : -1;
+  $("aStatus").textContent = st ? L.a_status.replace("{s}", (L.a_state[st.state] || st.state)).replace("{w}", st.world || "—").replace("{d}", st.day ?? "—")
+    .replace("{p}", st.players ?? 0).replace("{v}", st.version + (st.build ? " (" + st.build + ")" : ""))
+    + (rIn >= 0 ? " · " + (st.countdown === "stop" ? L.a_stop_in : L.a_restart_in).replace("{0}", rIn >= 60 ? Math.round(rIn / 60) + " min" : Math.max(0, rIn) + " s") : "") : "";
+  $("aRestartOff").hidden = !(rIn >= 0) || st.countdown === "stop";   // AMP's own stop cannot be called off here
+}
+function act(label, cls, fn) { const b = el("button", "abtn" + (cls ? " " + cls : ""), label); b.type = "button"; b.onclick = fn; return b; }
+function admRender() {
+  const L = T[lang];
+  $("adm").textContent = L.a_link;
+  $("aUser").placeholder = L.a_user; $("aPass").placeholder = L.a_pass; $("aCode").placeholder = L.a_code; $("aText").placeholder = L.a_chat + " …";
+  $("aNotice").placeholder = L.a_notice_ph;
+  admStatusLine();
+  const rep = $("aReplies"); rep.textContent = ""; for (const r of A.replies) rep.appendChild(el("div", "", r));
+  const pt = $("aPlayers"); pt.textContent = "";
+  if (!A.players.length) { const tr = el("tr"); const td = el("td", "empty", L.a_none); td.colSpan = 4; tr.appendChild(td); pt.appendChild(tr); }
+  for (const p of A.players) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "", p.name));
+    tr.appendChild(el("td", "", p.ping >= 0 ? L.a_ping.replace("{0}", p.ping) : "—"));
+    tr.appendChild(el("td", "", L.a_on.replace("{0}", SPAN(p.secs || 0))));
+    const td = el("td", "act");
+    td.appendChild(act(L.a_msg, "", () => { const t = prompt(L.a_msg_to.replace("{0}", p.name), ""); if (t && one(t)) send("msg " + quoted(p.id) + " " + one(t)).catch(() => {}); }));
+    td.appendChild(act(L.a_kick, "", () => { const r = prompt(L.a_reason_kick.replace("{0}", p.name), ""); if (r !== null) send("kick " + quoted(p.id) + " " + one(r)).catch(() => {}); }));
+    td.appendChild(act(L.a_ban, "bad", () => { const r = prompt(L.a_reason_ban.replace("{0}", p.name), ""); if (r !== null) send("ban " + quoted(p.id) + " " + one(r)).catch(() => {}); }));
+    tr.appendChild(td); pt.appendChild(tr);
+  }
+  const to = $("aTo"), keep = to.value; to.textContent = "";
+  const all = el("option", "", L.a_all); all.value = ""; to.appendChild(all);
+  for (const p of A.players) { const o = el("option", "", p.name); o.value = p.id; to.appendChild(o); }
+  to.value = [...to.options].some(o => o.value === keep) ? keep : "";
+  const log = $("aChat"), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 8; log.textContent = "";
+  if (!A.chat.length) log.appendChild(el("div", "tm", L.a_chat_none));
+  for (const c of A.chat) {
+    const d = el("div"); d.appendChild(el("span", "tm", new Date(c.t).toLocaleTimeString(L.loc, { hour: "2-digit", minute: "2-digit" })));
+    d.appendChild(el("span", "who", c.who + ":")); d.appendChild(document.createTextNode(c.text)); log.appendChild(d);
+  }
+  if (atEnd) log.scrollTop = log.scrollHeight;
+  const bt = $("aBans"); bt.textContent = "";
+  if (!A.bans.length) { const tr = el("tr"); const td = el("td", "empty", L.a_bans_none); td.colSpan = 5; tr.appendChild(td); bt.appendChild(tr); }
+  for (const b of A.bans) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "", b.name || "?"));
+    const when = b.utc ? new Date(b.utc).toLocaleDateString(L.loc) : "—";
+    tr.appendChild(el("td", "", when + (b.day ? " · " + L.a_day.replace("{0}", b.day) : "")));
+    tr.appendChild(el("td", "", b.reason || "—"));
+    tr.appendChild(el("td", "", b.how === "Steam account" ? L.a_how_steam : L.a_how_ip));
+    const td = el("td", "act");
+    td.appendChild(act(L.a_unban, "", () => { if (confirm(L.a_unban_q.replace("{0}", b.name || "?"))) send("unban " + b.key).catch(() => {}); }));
+    tr.appendChild(td); bt.appendChild(tr);
+  }
+  $("aUnbanAll").hidden = A.bans.length < 2;
+}
+$("adm").onclick = admOpen;
+$("admLink").onclick = ev => { ev.preventDefault(); admOpen(); };
+$("aBack").onclick = ev => { ev.preventDefault(); admClose(); };
+$("aLogin").onsubmit = admLogin;
+$("aOut").onclick = async () => { try { await amp("Core/Logout"); } catch (e) {} admSignedOut(""); };
+$("aSave").onclick = () => send("save").catch(() => {});
+$("aRestart").onclick = () => {
+  const v = prompt(T[lang].a_restart_min, "5");
+  if (v === null) return;
+  const m = Number(String(v).replace(",", "."));
+  if (!(m >= 0)) return;
+  if (m === 0) { if (confirm(T[lang].a_restart_q)) send("restart").catch(() => {}); }
+  else send("restart " + m).catch(() => {});
+};
+$("aRestartOff").onclick = () => send("restart cancel").catch(() => {});
+$("aNoticeForm").onsubmit = ev => {
+  ev.preventDefault();
+  const t = one($("aNotice").value);
+  if (t) send("notice " + t).then(() => { $("aNotice").value = ""; }).catch(() => {});
+};
+$("aUnbanAll").onclick = () => { if (confirm(T[lang].a_unban_all_q)) send("unban all").catch(() => {}); };
+$("aChatForm").onsubmit = ev => {
+  ev.preventDefault();
+  const t = one($("aText").value), to = $("aTo").value;
+  if (!t) return;
+  send(to ? "msg " + quoted(to) + " " + t : "say " + t).then(() => { $("aText").value = ""; }).catch(() => {});
+};
+document.getElementById("login").onsubmit = ev => { ev.preventDefault(); KEY = document.getElementById("keyIn").value.trim(); load(); };
+document.querySelectorAll("#tbl th").forEach(th => th.onclick = () => { if (key === th.dataset.k) asc = !asc; else { key = th.dataset.k; asc = key === "name"; } render(); });
+document.getElementById("lang").onclick = () => { lang = lang === "de" ? "en" : "de"; render(); renderNet(); admRender(); renderBlds(); };
+document.getElementById("tblBtn").onclick = () => { showTbl = !showTbl; renderNet(); };
+let resizeTimer = 0;
+window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderNet, 150); });
+// BUILDING-LIST-1: the players' buildings - buildings.json (written by the server every 20 s on a change; BuildingOwnersList.cs).
+// One row: [address, business, bought by, rented or run by]. Sorted by the column clicked; at first by the player.
+let blds = null, bCol = -1, bAsc = true;
+async function loadBlds() {
+  if (!KEY || !data) return;
+  let r = null;
+  try { r = await fetch((await keyFolder(KEY)) + "/buildings.json?t=" + Date.now(), { cache: "no-store" }); } catch (e) {}
+  if (r && r.status === 404) { blds = null; document.getElementById("blds").hidden = true; return; }   // a server without the list
+  if (!r || !r.ok || !(r.headers.get("content-type") || "").includes("json")) return;              // keep the last list
+  try { blds = await r.json(); } catch (e) { return; }
+  renderBlds();
+}
+function renderBlds() {
+  const sec = document.getElementById("blds");
+  if (!blds || !Array.isArray(blds.buildings) || !data) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const L = T[lang], rows = blds.buildings.slice();
+  setText("bSub", L.b_sub.replace("{b}", rows.filter(b => b[2]).length).replace("{r}", rows.filter(b => b[3]).length)
+    .replace("{u}", new Date(blds.updatedUnix * 1000).toLocaleString(L.loc)));
+  const val = b => bCol < 0 ? (b[2] || b[3]) : b[bCol];
+  rows.sort((a, b) => {
+    const x = val(a) || "", y = val(b) || "";
+    if (!x !== !y) return x ? -1 : 1;   // empty cells last, either way
+    const r = x.localeCompare(y, L.loc);
+    return (bAsc ? r : -r) || a[0].localeCompare(b[0], L.loc);
+  });
+  const head = [L.b_addr, L.b_biz, L.b_buy, L.b_rent].map((h, i) => `<th data-c="${i}" class="${bCol === i ? "on" + (bAsc ? " asc" : "") : ""}">${h}</th>`).join("");
+  document.getElementById("bTbl").innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${rows.length
+    ? rows.map(b => `<tr>${[b[0], b[1], b[2], b[3]].map(c => `<td>${esc(c || "—")}</td>`).join("")}</tr>`).join("")
+    : `<tr><td colspan="4" class="empty">${L.b_none}</td></tr>`}</tbody></table>`;
+}
+document.getElementById("bTbl").addEventListener("click", e => {
+  const th = e.target.closest("th[data-c]"); if (!th) return;
+  const c = +th.dataset.c;
+  if (c === bCol) bAsc = !bAsc; else { bCol = c; bAsc = true; }
+  renderBlds();
+});
+load(); setInterval(load, 30000); setInterval(loadNet, 15000); setInterval(loadBlds, 20000);
+admInit();
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "Headless": true,
+  "DedicatedHost": true,
+  "DedicatedSession": "MeineWelt",
+  "PlayerId": "Server",
+  "HostPort": 7777,
+  "DedicatedIdleGraceSeconds": 10,
+  "DedicatedAutoAccept": true,
+  "AutosaveMinutes": 5,
+  "HeadlessFps": 30,
+  "HeadlessIdleFps": 10,
+  "HeadlessLoadTimeoutSeconds": 900,
+  "HeadlessStallSeconds": 300,
+  "HeadlessDisableCameras": false,
+  "TelemetryKey": ""
+}
