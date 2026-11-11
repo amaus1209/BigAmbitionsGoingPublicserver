@@ -34,14 +34,14 @@ App.SteamWorkshopDownloadLocation=
 App.StoresSupported=SteamWorkshop
 App.StoreDownloadLocations={"SteamWorkshop":"{{$FullRootDir}}bamp-mods-extra"}
 App.ExecutableWin=1331550\Big Ambitions.exe
-App.ExecutableLinux=bamp-start.sh
+App.ExecutableLinux=/usr/bin/xvfb-run
 App.WorkingDir=1331550
-App.LinuxCommandLineArgs="{{$FullRootDir}}.proton/proton" runinprefix "{{$FullBaseDir}}Big Ambitions.exe" -batchmode -nographics -bamp-config "Z:{{$FullBaseDir}}bamp-server.json" -bamp-headless-dir "Z:{{$FullRootDir}}headless"
+App.LinuxCommandLineArgs=-a "{{$FullRootDir}}.proton/proton" runinprefix "{{$FullBaseDir}}Big Ambitions.exe" -batchmode -nographics -bamp-config "Z:{{$FullBaseDir}}bamp-server.json" -bamp-headless-dir "Z:{{$FullRootDir}}headless"
 App.WindowsCommandLineArgs=
 App.CommandLineArgs={{$PlatformArgs}}
 App.UseLinuxIOREDIR=False
 App.AppSettings={}
-App.EnvironmentVariables={"SteamAppId": "1331550", "SteamGameId": "1331550", "STEAM_COMPAT_DATA_PATH": "{{$FullRootDir}}.proton/compatdata", "STEAM_COMPAT_CLIENT_INSTALL_PATH": "{{$FullBaseDir}}.steam/steam", "HOME": "{{$FullBaseDir}}", "LD_LIBRARY_PATH": "{{$FullRootDir}}linux64:%LD_LIBRARY_PATH%"}
+App.EnvironmentVariables={"SteamAppId": "1331550", "SteamGameId": "1331550", "STEAM_COMPAT_DATA_PATH": "{{$FullRootDir}}.proton/compatdata", "STEAM_COMPAT_CLIENT_INSTALL_PATH": "{{$FullBaseDir}}.steam/steam", "HOME": "{{$FullBaseDir}}", "LD_LIBRARY_PATH": "{{$FullRootDir}}linux64:%LD_LIBRARY_PATH%", "WINEDLLOVERRIDES": "winhttp=n,b"}
 App.CommandLineParameterFormat=-{0}={1}
 App.CommandLineParameterDelimiter=
 App.ExitMethod=String
@@ -75,7 +75,7 @@ App.RCONHeartbeatMinutes=0
 App.RCONHeartbeatCommand=status
 App.TelnetLoginFormat={0}
 App.UpdateSources=@IncludeJson[bigambitionsupdates.json]
-App.PreStartStages=[]
+App.PreStartStages=@IncludeJson[bigambitionsstart.json]
 App.ForceUpdate=False
 App.ForceUpdateReason=
 App.Compatibility=None

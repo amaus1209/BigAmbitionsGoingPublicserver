@@ -37,14 +37,6 @@
         "SkipOnFailure": true
     },
     {
-        "UpdateStageName": "Going Public Server start script",
-        "UpdateSourcePlatform": "Linux",
-        "UpdateSource": "Executable",
-        "UpdateSourceData": "/bin/bash",
-        "UpdateSourceArgs": "-c \"[ -f \\\"{{$FullRootDir}}bamp-start.sh\\\" ] && chmod +x \\\"{{$FullRootDir}}bamp-start.sh\\\"; true\"",
-        "SkipOnFailure": true
-    },
-    {
         "UpdateStageName": "Settings for AMP",
         "UpdateSourcePlatform": "Linux",
         "UpdateSource": "Executable",
