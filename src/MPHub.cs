@@ -1,0 +1,721 @@
+using System;
+using System.Collections.Generic;
+using Helpers;
+using UnityEngine;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Business Hub (wave 1, 2026-06-10): direct money transfers and
+    /// player-to-player LOANS in the game's own convention (flat DAILY
+    /// interest + daily principal payment — mirrors the bank's Loan model).
+    ///
+    /// Money model: each machine owns its own wallet (gi.Money — the same
+    /// write the save coordinator already uses).  A transfer debits the
+    /// sender locally and ships a credit through the host (MoneyAdjust).
+    /// The HOST owns the loan ledger: offers route through it, acceptance
+    /// moves the principal, and on every game-day rollover it drafts
+    /// interest+payment from borrower to lender (negative balances allowed —
+    /// the game itself has overdraft).  Ledger is session-scoped (v1).
+    /// </summary>
+    public static class MPHub
+    {
+        // ── Shared state (host-broadcast) ─────────────────────────────────────
+        public static readonly List<LoanEntry> Loans = new();
+
+        // Incoming offers awaiting MY answer (this machine).
+        public static readonly List<LoanOfferPayload> IncomingOffers = new();
+        // Offers I sent that are still pending (cancellable).
+        public static readonly List<LoanOfferPayload> OutgoingOffers = new();
+        public static int PendingCount => IncomingOffers.Count;
+        public static int Version;                 // bump = UI refresh + badge
+
+        public static void Reset()
+        {
+            Loans.Clear();
+            IncomingOffers.Clear();
+            OutgoingOffers.Clear();
+            _hostLoans.Clear();
+            _hostOffers.Clear();
+            _lastDay = -1;
+            MPOffers.Reset();   // round-196: pending business-transfer finalizes are session state
+            _ledgerLoaded = false;   // next session loads its own ledger file
+            Version++;
+        }
+
+        // ── Wallet ────────────────────────────────────────────────────────────
+        public static float MyMoney()
+        {
+            try { return SaveGameManager.Current?.Money ?? 0f; }
+            catch { return 0f; }
+        }
+
+        /// <summary>MAIN THREAD: adjust the local wallet.  notice=false keeps the
+        /// chat clean (the receiver of an accepted offer already knows; daily
+        /// loan drafts live in the Hub list, not the chat).</summary>
+        public static void ApplyMoneyDelta(float delta, string reason, bool notice = true)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) return;
+                gi.Money += delta;
+                MergerWallet.ForwardExternal(delta, $"hub: {reason}");   // slice 4: direct writes must reach the shared ledger
+                // DESIGNER-MONEY-1 (M2): a DIRECT wallet write never passes native ChangeMoney, so an open
+                // Interior Designer session would claw it back at close — tell the designer about it.
+                DesignerBalanceKeeper.OnExternalMoneyChange(delta, "hub");
+                if (notice) MPChat.AddNotice($"{(delta >= 0 ? "+" : "−")}${Mathf.Abs(delta):N0} — {reason}");
+                Plugin.Logger.LogInfo($"[Hub] money {(delta >= 0 ? "+" : "")}{delta:N0} ({reason}); balance {gi.Money:N0}.");
+                Version++;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Hub] ApplyMoneyDelta: {ex.Message}"); }
+        }
+
+        /// <summary>Money not yet promised to pending outgoing offers.</summary>
+        public static float AvailableMoney()
+        {
+            float pending = 0f;
+            foreach (var o in OutgoingOffers) pending += o.Principal;
+            return MyMoney() - pending;
+        }
+
+        private static bool HasPendingTo(string to, string kind)
+            => OutgoingOffers.Exists(o => o.To == to && o.Kind == kind);
+
+        // ── Gifts (accept-required: no silent handouts; acceptance = receipt) ─
+        public static bool OfferGift(string to, float amount)
+        {
+            if (amount <= 0 || string.IsNullOrEmpty(to) || to == MPConfig.PlayerId) return false;
+            if (HasPendingTo(to, "gift"))
+            {
+                MPChat.AddNotice($"you already have a pending gift offer to {to}");
+                return false;
+            }
+            if (AvailableMoney() < amount)
+            {
+                MPChat.AddNotice($"not enough uncommitted money for a ${amount:N0} gift (pending offers count)");
+                return false;
+            }
+            var p = new LoanOfferPayload
+            {
+                Id = Guid.NewGuid().ToString("N").Substring(0, 8),
+                From = MPConfig.PlayerId, To = to,
+                Principal = amount, Kind = "gift",
+            };
+            OutgoingOffers.Add(p);
+            Version++;
+            if (MPServer.IsRunning) HostRouteOffer(p);
+            else MPClient.SendHub(MessageType.LoanOffer, p);
+            return true;
+        }
+
+        // ── Business purchase offers (round-196; accept-required like gifts — the
+        //    buyer is the offerer and pays on accept; the transfer itself is
+        //    host-orchestrated in MPOffers after the money moves) ─────────────
+        public static bool OfferBusiness(string to, float amount, string addressKey, string businessName)
+        {
+            if (amount <= 0 || string.IsNullOrEmpty(to) || to == MPConfig.PlayerId || string.IsNullOrEmpty(addressKey)) return false;
+            if (OutgoingOffers.Exists(o => o.Kind == "business" && o.AddressKey == addressKey))
+            {
+                MPChat.AddNotice($"you already have a pending offer for '{businessName}'");
+                return false;
+            }
+            if (AvailableMoney() < amount)
+            {
+                MPChat.AddNotice($"not enough uncommitted money for a ${amount:N0} offer (pending offers count)");
+                return false;
+            }
+            var p = new LoanOfferPayload
+            {
+                Id = Guid.NewGuid().ToString("N").Substring(0, 8),
+                From = MPConfig.PlayerId, To = to,
+                Principal = amount, Kind = "business",
+                AddressKey = addressKey, BusinessName = businessName,
+            };
+            OutgoingOffers.Add(p);
+            Version++;
+            if (MPServer.IsRunning) HostRouteOffer(p);
+            else MPClient.SendHub(MessageType.LoanOffer, p);
+            return true;
+        }
+
+        /// <summary>Cancel one of MY pending offers (the outgoing list's X).</summary>
+        public static void CancelOffer(string id)
+        {
+            var mine = OutgoingOffers.Find(o => o.Id == id);
+            if (mine == null) return;
+            OutgoingOffers.Remove(mine);
+            Version++;
+            var p = new LoanOfferPayload { Id = mine.Id, From = mine.From, To = mine.To, Kind = mine.Kind, Principal = mine.Principal, State = "revoke" };
+            if (MPServer.IsRunning) HostRouteOffer(p);
+            else MPClient.SendHub(MessageType.LoanOffer, p);
+        }
+
+        // ── Loans: offer / answer (any role) ──────────────────────────────────
+        public static void OfferLoan(string to, float principal, float dailyInterest, float dailyPayment)
+        {
+            if (principal <= 0 || string.IsNullOrEmpty(to) || to == MPConfig.PlayerId) return;
+            if (HasPendingTo(to, "loan"))
+            {
+                MPChat.AddNotice($"you already have a pending loan offer to {to}");
+                return;
+            }
+            if (AvailableMoney() < principal)
+            {
+                MPChat.AddNotice($"not enough uncommitted money to offer a ${principal:N0} loan (pending offers count)");
+                return;
+            }
+            var p = new LoanOfferPayload
+            {
+                Id = Guid.NewGuid().ToString("N").Substring(0, 8),
+                From = MPConfig.PlayerId, To = to,
+                Principal = principal, DailyInterest = dailyInterest, DailyPayment = dailyPayment,
+            };
+            OutgoingOffers.Add(p);
+            Version++;
+            if (MPServer.IsRunning) HostRouteOffer(p);
+            else MPClient.SendHub(MessageType.LoanOffer, p);
+        }
+
+        public static void AnswerOffer(string id, bool accept)
+        {
+            var offer = IncomingOffers.Find(o => o.Id == id);
+            if (offer == null) return;
+            IncomingOffers.Remove(offer);
+            Version++;
+            var a = new LoanAnswerPayload { Id = id, From = MPConfig.PlayerId, Accept = accept };
+            if (MPServer.IsRunning) HostHandleAnswer(a);
+            else MPClient.SendHub(MessageType.LoanAnswer, a);
+        }
+
+        /// <summary>BORROWER: pay back one of MY loans early. amount &lt;= 0 = pay off in full;
+        /// otherwise a partial payment (clamped to what's left). Host is authoritative.</summary>
+        public static void RequestRepay(string loanId, float amount)
+        {
+            var ln = Loans.Find(l => l.Id == loanId);
+            if (ln == null || ln.Borrower != MPConfig.PlayerId) return;
+            float pay = amount <= 0f ? ln.Remaining : Mathf.Min(amount, ln.Remaining);
+            if (pay <= 0f) return;
+            if (AvailableMoney() < pay)
+            {
+                MPChat.AddNotice($"not enough uncommitted money to repay ${pay:N0} (pending offers count)");
+                return;
+            }
+            var p = new LoanRepayPayload { Id = loanId, From = MPConfig.PlayerId, Amount = amount };
+            if (MPServer.IsRunning) HostHandleRepay(p);
+            else MPClient.SendHub(MessageType.LoanRepay, p);
+        }
+
+        // Bank reference (dump-CONFIRMED consts): InterestRate=20 (a TOTAL
+        // premium on the principal), YearsToPayLoan=4 → 244-day term (61-day
+        // game year); dailies = ceil(P*0.20/244) and ceil(P/244) — matches the
+        // user's observed $9 + $41 on $10k exactly.  NO "predatory" indicator
+        // by design: what's predatory depends on business ROI, which we can't
+        // judge — the borrower decides (user call, 2026-06-10).
+
+        public static int OfferTermDays(LoanOfferPayload o)
+            => o.DailyPayment > 0 ? Mathf.Max(1, Mathf.RoundToInt(o.Principal / o.DailyPayment)) : 1;
+
+        public static float OfferTotalPct(LoanOfferPayload o)
+            => o.Principal > 0 ? o.DailyInterest * OfferTermDays(o) / o.Principal * 100f : 0f;
+
+        /// <summary>An offer-lifecycle message arrived for ME (main thread).</summary>
+        public static void ReceiveOffer(LoanOfferPayload p)
+        {
+            if (p == null) return;
+            // Result for an offer I sent (host-forwarded).
+            if (p.State == "accepted" || p.State == "declined")
+            {
+                if (p.From != MPConfig.PlayerId) return;
+                OutgoingOffers.RemoveAll(o => o.Id == p.Id);
+                Version++;
+                // The proposer deserves an explicit answer (user 2026-07-20) — before
+                // this, acceptance was only inferable from the money-movement toast.
+                string verdict = p.State == "accepted" ? "accepted" : "declined";
+                string what = p.Kind == "gift" ? "gift" : p.Kind == "business" ? $"offer for '{p.BusinessName}'" : "loan offer";
+                // HUBSALE-1: the verdict is logged on the PROPOSER's machine too - a buyer's bundle used to show nothing.
+                Plugin.Logger.LogInfo($"[Hub] offer '{p.Id}' kind={p.Kind} addr='{p.AddressKey}' -> {p.State} from '{p.To}' (${p.Principal:N0}).");
+                GameStatePatcher.EnqueueOnMainThread(() => PassengerHud.Toast($"{p.To} {verdict} your ${p.Principal:N0} {what}.", 4f));
+                return;
+            }
+            if (p.To != MPConfig.PlayerId) return;
+            if (p.State == "revoke")
+            {
+                if (IncomingOffers.RemoveAll(o => o.Id == p.Id) > 0)
+                    MPChat.AddNotice($"{p.From} withdrew their ${p.Principal:N0} {p.Kind} offer");
+                Version++;
+                return;
+            }
+            // No chat notice — the pulsing Business badge is the signal
+            // (user call, 2026-06-10).
+            IncomingOffers.Add(p);
+            Version++;
+        }
+
+        public static void ApplyLoanState(LoanStatePayload? p)
+        {
+            if (p == null) return;
+            Loans.Clear();
+            Loans.AddRange(p.Loans);
+            Plugin.Logger.LogInfo($"[Hub] loan state applied: {Loans.Count} active loan(s).");
+            Version++;
+        }
+
+        // ── HOST: routing + authoritative ledger ──────────────────────────────
+        private static readonly List<LoanEntry> _hostLoans = new();
+        private static readonly Dictionary<string, LoanOfferPayload> _hostOffers = new();
+        private static int _lastDay = -1;
+
+        public static void HostRouteOffer(LoanOfferPayload p)
+        {
+            if (p == null) return;
+            if (p.State == "revoke") { _hostOffers.Remove(p.Id); }
+            else
+            {
+                // Host-side cap: the per-recipient dup guard lives on the
+                // sender's machine and a modified client could skip it — bound
+                // how many offers one player may have pending at once.
+                int pendingFrom = 0;
+                foreach (var o in _hostOffers.Values) if (o.From == p.From) pendingFrom++;
+                if (!_hostOffers.ContainsKey(p.Id) && pendingFrom >= 16)
+                {
+                    Plugin.Logger.LogWarning($"[Hub] offer from '{p.From}' refused — too many pending offers.");
+                    return;
+                }
+                _hostOffers[p.Id] = p;
+            }
+            if (p.To == MPConfig.PlayerId) ReceiveOffer(p);
+            else MPServer.SendHubTo(p.To, MessageType.LoanOffer, p);
+        }
+
+        public static void HostHandleAnswer(LoanAnswerPayload a)
+        {
+            if (a == null || !_hostOffers.TryGetValue(a.Id, out var offer)) return;
+            // Only the player the offer was MADE TO may answer it.
+            if (a.From != offer.To)
+            {
+                Plugin.Logger.LogWarning($"[Hub] answer for offer '{a.Id}' from '{a.From}' but it was made to '{offer.To}' — dropped.");
+                return;
+            }
+            string what = offer.Kind == "gift" ? "gift" : offer.Kind == "business" ? $"offer for '{offer.BusinessName}'" : "loan";
+
+            // Round-196: a business sale needs the seller to STILL own the shop per the
+            // session ledger at accept time (live read at commitment — ownership may have
+            // moved since the offer). A stale sale doesn't stay pending; it dies.
+            if (a.Accept && offer.Kind == "business")
+            {
+                string ownerNow = "";
+                try { MPServer.BuildingOwners.TryGetValue(offer.AddressKey ?? "", out ownerNow); } catch { }
+                bool sellerIsHost = offer.To == MPConfig.PlayerId;
+                string sellerKey = sellerIsHost ? "host" : offer.To;
+                bool sellerHolds;
+                if (sellerIsHost)
+                {
+                    // HUBSALE-1 (bundle 20260908-191001, 2026-09-17): the host's own PRE-SESSION rentals are never
+                    // ledgered (GameStatePatcher.cs:2537 - "already native via RentedByPlayer"), and a ledgered host
+                    // entry may carry either id form (IsHostLedgerId, round-172); the literal compare above lapsed
+                    // EVERY sale where the host was the seller, and the buyer was told the owner "declined". The live
+                    // native tenancy (TrulyMine, the bootstrap's own test at :6313) decides, and a confirmed host tenancy
+                    // back-fills the ledger so the re-key at MPOffers.cs:60 finds an entry. An empty ledger entry alone
+                    // never authorises a sale.
+                    bool ledgerOk = string.IsNullOrEmpty(ownerNow) || GameStatePatcher.IsHostLedgerId(ownerNow ?? "");
+                    bool native = false;
+                    try { var reg = GameStatePatcher.FindRegistration(offer.AddressKey ?? ""); native = reg != null && MergerFlip.TrulyMine(reg); } catch { }
+                    sellerHolds = ledgerOk && native;
+                    if (sellerHolds && string.IsNullOrEmpty(ownerNow))
+                    {
+                        try { MPServer.BuildingOwners[offer.AddressKey ?? ""] = MPConfig.PlayerId; } catch { }
+                        Plugin.Logger.LogInfo($"[Hub] business offer '{a.Id}' for '{offer.AddressKey}': the host holds it natively - ledger back-filled (HUBSALE-1).");
+                    }
+                }
+                else sellerHolds = (ownerNow ?? "") == offer.To;
+                if (!sellerHolds)
+                {
+                    Plugin.Logger.LogWarning($"[Hub] business offer '{a.Id}' for '{offer.AddressKey}' lapsed — ledger owner is '{ownerNow}', not the seller '{sellerKey}'.");
+                    NotifyParty(offer.To, $"the sale of '{offer.BusinessName}' can't complete — the session ledger no longer lists you as its owner.");
+                    _hostOffers.Remove(a.Id);
+                    var lapse = new LoanOfferPayload { Id = offer.Id, From = offer.From, To = offer.To, Kind = offer.Kind, Principal = offer.Principal, AddressKey = offer.AddressKey, BusinessName = offer.BusinessName, State = "declined" };
+                    if (offer.From == MPConfig.PlayerId) ReceiveOffer(lapse);
+                    else MPServer.SendHubTo(offer.From, MessageType.LoanOffer, lapse);
+                    return;
+                }
+            }
+
+            // ENFORCEMENT: an offer can't be accepted while the offerer can't
+            // cover it (their wallet may have dropped since offering).  The
+            // offer stays pending — it re-enables when funds recover.
+            if (a.Accept)
+            {
+                float offererCash = offer.From == MPConfig.PlayerId
+                    ? MyMoney()
+                    : MPServer.GetKnownCash(offer.From);
+                if (offererCash >= 0f && offererCash < offer.Principal)
+                {
+                    NotifyParty(offer.To, $"{offer.From}'s ${offer.Principal:N0} {what} offer can't be accepted right now — they can't cover it. It stays pending.");
+                    NotifyParty(offer.From, $"{offer.To} tried to accept your ${offer.Principal:N0} {what} but your balance can't cover it.");
+                    // Put it back in the receiver's incoming list (their accept
+                    // click removed it locally).
+                    if (offer.To == MPConfig.PlayerId) ReceiveOffer(offer);
+                    else MPServer.SendHubTo(offer.To, MessageType.LoanOffer, offer);
+                    return;
+                }
+            }
+            _hostOffers.Remove(a.Id);
+            // Tell the offerer the outcome (clears their outgoing list).
+            var result = new LoanOfferPayload { Id = offer.Id, From = offer.From, To = offer.To, Kind = offer.Kind, Principal = offer.Principal, AddressKey = offer.AddressKey, BusinessName = offer.BusinessName, State = a.Accept ? "accepted" : "declined" };
+            if (offer.From == MPConfig.PlayerId) ReceiveOffer(result);
+            else MPServer.SendHubTo(offer.From, MessageType.LoanOffer, result);
+            if (!a.Accept)
+            {
+                NotifyParty(offer.From, $"{offer.To} declined your ${offer.Principal:N0} {what} offer.");
+                return;
+            }
+            // Principal moves sender → receiver (overdraft allowed, like the
+            // bank).  Only the OFFERER gets a chat line — the receiver just
+            // clicked Accept, telling them again is clutter.
+            NotifyParty(offer.From, $"{offer.To} accepted your ${offer.Principal:N0} {what}.");
+            DeliverMoney(offer.From, -offer.Principal, $"{what} to {offer.To}", silent: true);
+            DeliverMoney(offer.To, offer.Principal, $"{what} from {offer.From}", silent: true);
+            if (offer.Kind == "business")
+            {
+                // Money moved (buyer paid, seller credited) — now the world transfer.
+                MPOffers.HostExecuteTransfer(offer);
+                return;
+            }
+            if (offer.Kind != "gift")
+            {
+                _hostLoans.Add(new LoanEntry
+                {
+                    Id = offer.Id, Lender = offer.From, Borrower = offer.To,
+                    Remaining = offer.Principal,
+                    DailyInterest = offer.DailyInterest, DailyPayment = offer.DailyPayment,
+                });
+                Plugin.Logger.LogInfo($"[Hub] loan LEDGERED: {offer.From} → {offer.To} ${offer.Principal:N0}; broadcasting ({_hostLoans.Count} active).");
+                HostBroadcastLoans();
+                SaveLedger();
+            }
+        }
+
+        /// <summary>HOST: process a borrower's early repayment (full or partial). Mirrors the
+        /// daily-draft money path + closes/updates the ledger exactly like HostTick does.</summary>
+        public static void HostHandleRepay(LoanRepayPayload p)
+        {
+            if (p == null || string.IsNullOrEmpty(p.Id)) return;
+            var ln = _hostLoans.Find(l => l.Id == p.Id);
+            if (ln == null) return;
+            if (ln.Borrower != p.From) return;                       // only the borrower may repay
+            // Both parties must be present — the host can't credit an offline lender (cash is
+            // self-reported per machine), same rule the daily accrual uses.
+            var present = MPRestSync.AllPlayers();
+            if (!present.Contains(ln.Borrower) || !present.Contains(ln.Lender))
+            {
+                NotifyParty(ln.Borrower, $"can't repay yet — {ln.Lender} is offline.");
+                return;
+            }
+            float pay = p.Amount <= 0f ? ln.Remaining : Math.Min(p.Amount, ln.Remaining);
+            if (pay <= 0f) return;
+            DeliverMoney(ln.Borrower, -pay, $"early repayment to {ln.Lender}", silent: true);
+            DeliverMoney(ln.Lender, pay, $"early repayment from {ln.Borrower}", silent: true);
+            ln.Remaining -= pay;
+            if (ln.Remaining <= 0f)
+            {
+                NotifyParty(ln.Lender, $"{ln.Borrower} repaid your loan in full.");
+                NotifyParty(ln.Borrower, $"your loan from {ln.Lender} is fully repaid.");
+                _hostLoans.Remove(ln);
+            }
+            else
+            {
+                NotifyParty(ln.Borrower, $"you paid ${pay:N0} early — ${ln.Remaining:N0} left on your loan from {ln.Lender}.");
+                NotifyParty(ln.Lender, $"{ln.Borrower} paid ${pay:N0} early — ${ln.Remaining:N0} left.");
+            }
+            Plugin.Logger.LogInfo($"[Hub] early repay: {ln.Borrower} → {ln.Lender} ${pay:N0} (remaining ${ln.Remaining:N0}).");
+            HostBroadcastLoans();
+            SaveLedger();
+        }
+
+        /// <summary>PRIVATE notice to one player (gift/loan events are nobody
+        /// else''s business): local notice for the host, private chat otherwise.</summary>
+        internal static void NotifyParty(string playerId, string text)
+        {
+            if (playerId == MPConfig.PlayerId) MPChat.AddNotice(text);
+            else MPServer.SendChatPrivate(MPChat.HubSender, playerId, text);   // reserved id no player can hold (review R1)
+        }
+
+        /// <summary>HOST tick (main thread): day rollover drafts loan payments.</summary>
+        public static void HostTick()
+        {
+            if (!MPServer.IsRunning) return;
+            TryLoadLedger();
+            var (d, _) = GameStateReader.GetGameTime();
+            if (d == 0) return;
+            if (_lastDay < 0) { _lastDay = d; return; }
+            if (d == _lastDay) return;
+            int days = Math.Max(1, d - _lastDay);   // consensus skips can cross several days
+            _lastDay = d;
+
+            bool changed = false;
+            for (int i = _hostLoans.Count - 1; i >= 0; i--)
+            {
+                var ln = _hostLoans[i];
+                // FAIRNESS: no accrual unless BOTH parties are in the session —
+                // an absent borrower must not rack up interest (and an absent
+                // lender's wallet can't be credited anyway).
+                var present = MPRestSync.AllPlayers();
+                if (!present.Contains(ln.Borrower) || !present.Contains(ln.Lender)) continue;
+                for (int k = 0; k < days && ln.Remaining > 0; k++)
+                {
+                    float pay = Math.Min(ln.DailyPayment, ln.Remaining);
+                    float due = ln.DailyInterest + pay;
+                    // Silent: daily drafts live in the Hub's loan list, not chat.
+                    DeliverMoney(ln.Borrower, -due, $"loan payment to {ln.Lender}", silent: true);
+                    DeliverMoney(ln.Lender, due, $"loan payment from {ln.Borrower}", silent: true);
+                    ln.Remaining -= pay;
+                    changed = true;
+                }
+                if (ln.Remaining <= 0)
+                {
+                    NotifyParty(ln.Lender, $"{ln.Borrower} has fully repaid your loan.");
+                    NotifyParty(ln.Borrower, $"your loan from {ln.Lender} is fully repaid.");
+                    _hostLoans.RemoveAt(i);
+                }
+            }
+            if (changed) { HostBroadcastLoans(); SaveLedger(); }
+        }
+
+        // ── Ledger persistence (loans MUST survive sessions) ─────────────────
+        private static bool _ledgerLoaded;
+
+        /// <summary>The ledger file name — shared with the store mirror (handoff review fix
+        /// 2026-07-23: the ledger is part of the session store and must survive a handoff).</summary>
+        internal const string LedgerFileName = "loans.bamp.json";
+
+        private static string? LedgerPath()
+        {
+            try
+            {
+                // Pinned to the lineage BASE (review-2 fix 2026-07-23): EnsureManifest
+                // re-points ActiveSessionName at the SAVE TARGET during automatic saves,
+                // so the ledger used to follow it into '-auto'/'-recover' folders while
+                // reload AND the store mirror read the base — loans changed since the
+                // last manual save silently vanished on reload or handoff.
+                string session = MPSaveCoordinator.StripAutoSuffix(MPSaveCoordinator.ActiveSessionName);
+                if (string.IsNullOrEmpty(session)) return null;
+                return System.IO.Path.Combine(MPSaveManager.MpSessionFolder(session), LedgerFileName);
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Drift self-heal (review-2 fix): older builds scattered the ledger into
+        /// automatic-save sibling folders — find the newest one across the lineage.</summary>
+        private static string? NewestLineageLedger()
+        {
+            try
+            {
+                string baseName = MPSaveCoordinator.StripAutoSuffix(MPSaveCoordinator.ActiveSessionName);
+                if (string.IsNullOrEmpty(baseName)) return null;
+                var names = new System.Collections.Generic.List<string> { baseName + "-auto", baseName + "-disconnect", baseName + "-recover" };
+                for (int i = 2; i <= 10; i++) names.Add(baseName + "-auto-" + i);
+                string? best = null; System.DateTime bestT = System.DateTime.MinValue;
+                foreach (var n in names)
+                {
+                    string p = System.IO.Path.Combine(MPSaveManager.MpSessionFolder(n), LedgerFileName);
+                    if (!System.IO.File.Exists(p)) continue;
+                    var t = System.IO.File.GetLastWriteTimeUtc(p);
+                    if (t > bestT) { bestT = t; best = p; }
+                }
+                return best;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Persist the loan ledger.  Loans ride the session MANIFEST like grants
+        /// (field sweep 2026-08-18): the old base-folder loans.bamp.json write had no
+        /// directory creation, so any world that only ever auto-saved failed EVERY ledger
+        /// write ("Could not find a part of the path", ~15 field bundles) — and a file
+        /// pinned outside the save slots also sat outside the one-save-moment timeline
+        /// rule.  LedgerPath/TryLoadLedger remain as the legacy READ fallback only.</summary>
+        public static void SaveLedger() => MPSaveCoordinator.PersistGrantsNow();
+
+        private static LoanEntry CopyLoan(LoanEntry ln) => new LoanEntry
+        {
+            Id = ln.Id, Lender = ln.Lender, Borrower = ln.Borrower,
+            Remaining = ln.Remaining, DailyInterest = ln.DailyInterest, DailyPayment = ln.DailyPayment,
+        };
+
+        /// <summary>Deep copy of the live ledger for manifest persistence (deep so the
+        /// serialized manifest can never alias entries the ledger later mutates).</summary>
+        internal static System.Collections.Generic.List<LoanEntry> SnapshotLoans()
+        {
+            var list = new System.Collections.Generic.List<LoanEntry>(_hostLoans.Count);
+            foreach (var ln in _hostLoans) list.Add(CopyLoan(ln));
+            return list;
+        }
+
+        /// <summary>Host-load restore: the loaded slot's manifest loans are the timeline
+        /// truth (non-null, even empty, is authoritative; null = manifest predates loan
+        /// tracking → adopt the legacy loans.bamp.json once).  Never overwrites a live
+        /// in-memory ledger — the session name can appear late (first save), and loading
+        /// then would wipe loans created meanwhile.</summary>
+        internal static void RestoreLoans(System.Collections.Generic.List<LoanEntry>? fromManifest)
+        {
+            try
+            {
+                if (_hostLoans.Count > 0)
+                {
+                    _ledgerLoaded = true;
+                    Plugin.Logger.LogInfo("[Hub] manifest loans skipped — in-memory ledger already live.");
+                    return;
+                }
+                if (fromManifest == null) { TryLoadLedger(); return; }   // legacy store — file fallback
+                _ledgerLoaded = true;
+                _hostLoans.Clear();
+                foreach (var ln in fromManifest) if (ln != null) _hostLoans.Add(CopyLoan(ln));
+                if (_hostLoans.Count > 0) HostBroadcastLoans();
+                Plugin.Logger.LogInfo($"[Hub] loans restored from manifest ({_hostLoans.Count}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Hub] RestoreLoans: {ex.Message}"); }
+        }
+
+        private static void TryLoadLedger()
+        {
+            if (_ledgerLoaded) return;
+            var path = LedgerPath();
+            if (path == null) return;
+            _ledgerLoaded = true;
+            try
+            {
+                if (!System.IO.File.Exists(path))
+                {
+                    // Adopt a drifted sibling ledger once (see LedgerPath) — the next
+                    // SaveLedger writes it back at the base where it belongs.
+                    path = NewestLineageLedger() ?? path;
+                    if (!System.IO.File.Exists(path)) return;
+                    Plugin.Logger.LogInfo("[Hub] ledger adopted from an automatic-save sibling (drift self-heal).");
+                }
+                // Never overwrite a LIVE ledger: the session name can appear
+                // late (first save), and loading an old file then would wipe
+                // loans created meanwhile.
+                if (_hostLoans.Count > 0)
+                {
+                    Plugin.Logger.LogInfo("[Hub] ledger file skipped — in-memory ledger already live.");
+                    return;
+                }
+                var st = Newtonsoft.Json.JsonConvert.DeserializeObject<LoanStatePayload>(System.IO.File.ReadAllText(path));
+                if (st == null) return;
+                _hostLoans.Clear();
+                _hostLoans.AddRange(st.Loans);
+                HostBroadcastLoans();
+                Plugin.Logger.LogInfo($"[Hub] ledger loaded ({_hostLoans.Count} loan(s)).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Hub] TryLoadLedger: {ex.Message}"); }
+        }
+
+        /// <summary>Re-broadcast the ledger (a late-loading player missed it).</summary>
+        public static void BroadcastLoansIfAny()
+        {
+            if (MPServer.IsRunning && _hostLoans.Count > 0) HostBroadcastLoans();
+        }
+
+        private static void HostBroadcastLoans()
+        {
+            var st = new LoanStatePayload();
+            st.Loans.AddRange(_hostLoans);
+            ApplyLoanState(st);              // host's own UI
+            MPServer.BroadcastHub(MessageType.LoanState, st);
+        }
+
+        /// <summary>HOST: credit/debit a player's wallet wherever it lives.</summary>
+        private static void DeliverMoney(string playerId, float amount, string reason, bool silent = false)
+        {
+            if (playerId == MPConfig.PlayerId) ApplyMoneyDelta(amount, reason, !silent);
+            else MPServer.SendHubTo(playerId, MessageType.MoneyAdjust,
+                     new MoneyAdjustPayload { To = playerId, Amount = amount, Reason = reason, Silent = silent });
+        }
+
+        /// <summary>HOST: a validated cross-player sale — credit the shop
+        /// owner and notify the buyer (RemoteSale slice 1).</summary>
+        public static void DeliverSaleRevenue(string ownerId, string buyerId, float total, string address, string desc)
+        {
+            DeliverMoney(ownerId, total, $"Sale: {desc} (sold to {buyerId})");
+            NotifyParty(buyerId, $"Purchase complete — ${total:F2} went to {ownerId}.");
+            if (ownerId == MPConfig.PlayerId) ShowSalePopup(buyerId, total);   // host-as-owner feedback
+            Plugin.Logger.LogInfo($"[RemoteSale] HOST credited '{ownerId}' ${total:F2} (buyer '{buyerId}', {address}).");
+        }
+
+        // ── Sale popup (user, 2026-06-12): the WORKER needs feedback — a
+        // rising "+$X" over the buyer's head for a moment (classic floating-
+        // number style) and the ring-up animation on their own character (the
+        // buyer's screen already plays it on the worker's avatar). ────────────
+        private static readonly List<(GameObject go, float bornAt)> _salePopups = new();
+        private const float POPUP_SECONDS = 2.0f;
+
+        /// <summary>Runs on the OWNER's machine when a sale lands.</summary>
+        public static void ShowSalePopup(string buyerId, float amount)
+        {
+            try
+            {
+                Vector3? buyerPos = null;
+                try { buyerPos = RemotePlayerManager.GetPlayerPosition(buyerId); } catch { }
+                var at = buyerPos
+                         ?? Helpers.PlayerHelper.PlayerController?.Character?.transform.position
+                         ?? Vector3.zero;
+
+                var go = new GameObject("BAMP_SalePopup");
+                go.transform.position = at + new Vector3(0f, 2.3f, 0f);
+                var canvas = go.AddComponent<Canvas>();
+                canvas.renderMode   = RenderMode.WorldSpace;
+                canvas.sortingOrder = 11;
+                var rt = go.GetComponent<RectTransform>();
+                rt.sizeDelta  = new Vector2(300f, 60f);
+                rt.localScale = new Vector3(0.012f, 0.012f, 0.012f);
+                var tmp = go.AddComponent<TMPro.TextMeshProUGUI>();
+                tmp.text      = $"+${amount:F0}";
+                tmp.fontSize  = 60f;
+                tmp.fontStyle = TMPro.FontStyles.Bold;
+                tmp.alignment = TMPro.TextAlignmentOptions.Center;
+                tmp.color     = new Color(0.549f, 0.878f, 0.549f);   // 8CE08C accent
+                _salePopups.Add((go, Time.unscaledTime));
+
+                // Ring the sale up on the worker's own screen too — but only
+                // when they're actually working a register (employee-staffed
+                // sales land while the owner may be across town; no miming).
+                try
+                {
+                    if (MPRestSync.CurrentActivityName() == "Work")
+                    {
+                        var ch = Helpers.PlayerHelper.PlayerController?.Character;
+                        var anim = ch?.GetComponentInChildren<Animator>();
+                        if (anim != null) anim.SetTrigger("UsingCashRegister");
+                    }
+                }
+                catch { }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Hub] sale popup: {ex.Message}"); }
+        }
+
+        /// <summary>Per-frame: rise + fade + face the camera; destroy when
+        /// done.  Called from MPCanvasUI.Update.</summary>
+        public static void TickSalePopups()
+        {
+            if (_salePopups.Count == 0) return;
+            var cam = Camera.main;
+            for (int i = _salePopups.Count - 1; i >= 0; i--)
+            {
+                var (go, born) = _salePopups[i];
+                if (go == null) { _salePopups.RemoveAt(i); continue; }
+                float t = (Time.unscaledTime - born) / POPUP_SECONDS;
+                if (t >= 1f)
+                {
+                    try { UnityEngine.Object.Destroy(go); } catch { }
+                    _salePopups.RemoveAt(i);
+                    continue;
+                }
+                go.transform.position += new Vector3(0f, Time.unscaledDeltaTime * 0.6f, 0f);
+                if (cam != null)
+                    go.transform.rotation = Quaternion.LookRotation(go.transform.position - cam.transform.position);
+                var tmp = go.GetComponent<TMPro.TextMeshProUGUI>();
+                if (tmp != null) { var c = tmp.color; c.a = 1f - t * t; tmp.color = c; }
+            }
+        }
+    }
+}

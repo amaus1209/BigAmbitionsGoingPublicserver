@@ -112,6 +112,8 @@
   <ItemGroup>
     <Reference Include="BigAmbitions"><HintPath>$(ManagedDir)BigAmbitions.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="BigAmbitions.Items"><HintPath>$(ManagedDir)BigAmbitions.Items.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.InputSystem"><HintPath>$(ManagedDir)BigAmbitions.InputSystem.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Unity.InputSystem"><HintPath>$(ManagedDir)Unity.InputSystem.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="BigAmbitions.Factories"><HintPath>$(ManagedDir)BigAmbitions.Factories.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="BigAmbitions.Characters"><HintPath>$(ManagedDir)BigAmbitions.Characters.dll</HintPath><Private>false</Private></Reference>
     <!-- Round-119 serve mirror: the follower performs the job, so it needs the game's own animation/audio calls. -->
@@ -153,6 +155,9 @@
     <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(ManagedDir)UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.UIModule"><HintPath>$(ManagedDir)UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.UI"><HintPath>$(ManagedDir)UnityEngine.UI.dll</HintPath><Private>false</Private></Reference>
+    <!-- CAR-LIVERY-1: HDRP's DecalProjector (the cars' liveries) and HDAdditionalCameraData (the editor's preview) -->
+    <Reference Include="Unity.RenderPipelines.HighDefinition.Runtime"><HintPath>$(ManagedDir)Unity.RenderPipelines.HighDefinition.Runtime.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Unity.RenderPipelines.Core.Runtime"><HintPath>$(ManagedDir)Unity.RenderPipelines.Core.Runtime.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.TextMeshPro"><HintPath>$(ManagedDir)Unity.TextMeshPro.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Cinemachine"><HintPath>$(ManagedDir)Cinemachine.dll</HintPath><Private>false</Private></Reference>
     <!-- TRAFFIC-GRID-1: GridManager.activeCameraPositions is a NativeArray<float3> — the

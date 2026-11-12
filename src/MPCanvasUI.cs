@@ -1,0 +1,8572 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
+using TMPro;
+using Helpers;
+using Intro;
+using UI.Load;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Canvas/uGUI multiplayer panel.  Opened via the mod's "Business" app button
+    /// in the game's full-screen menu (MPHubNativePage) and the mod's menu
+    /// integration — there is NO release-build hotkey (all F-key bindings in this
+    /// class are dev cheats/probes under BAMP_DEV; "Toggle F8" was the pre-hub
+    /// design and stale as of 2026-07-30).  Draggable via title bar.
+    ///
+    /// CanvasScaler = ConstantPixelSize/scaleFactor 1 → 1 canvas unit = 1 screen pixel.
+    /// All layout dimensions are therefore plain pixels.
+    /// </summary>
+    public partial class MPCanvasUI : MonoBehaviour
+    {
+        // ── colours ──────────────────────────────────────────────────────────
+        private static readonly Color C_BG       = new Color(0.12f, 0.12f, 0.14f, 0.97f);
+        private static readonly Color C_HDR      = new Color(0.20f, 0.40f, 0.70f, 1.00f);
+        private static readonly Color C_FIELD    = new Color(0.18f, 0.18f, 0.22f, 1.00f);
+        private static readonly Color C_FIELDFOC = new Color(0.25f, 0.35f, 0.55f, 1.00f);
+        private static readonly Color C_BTN      = new Color(0.22f, 0.48f, 0.22f, 1.00f);
+        private static readonly Color C_BTNHOV   = new Color(0.28f, 0.60f, 0.28f, 1.00f);
+        private static readonly Color C_BTNBLUE  = new Color(0.18f, 0.38f, 0.65f, 1.00f);
+        private static readonly Color C_STOP     = new Color(0.55f, 0.20f, 0.20f, 1.00f);
+        private static readonly Color C_WHITE    = Color.white;
+        private static readonly Color C_RED      = new Color(1f,    0.35f, 0.35f, 1f);
+        private static readonly Color C_GREEN    = new Color(0.35f, 1f,    0.35f, 1f);
+        private static readonly Color C_LBLGREY  = new Color(0.70f, 0.70f, 0.75f, 1f);
+        private static readonly Color C_YELLOW   = new Color(1f,    0.85f, 0.20f, 1f);
+
+        // ── layout (pixels) ───────────────────────────────────────────────────
+        private const float W      = 540f;
+        private const float HDR    = 40f;
+        private const float PAD    = 12f;
+        private const float FW     = W - PAD * 2;   // 516
+        private const float LH     = 22f;
+        private const float LADV   = 30f;
+        private const float FH     = 32f;
+        private const float FADV   = 42f;
+        private const float BH     = 36f;
+        private const float BADV   = 48f;
+        private const float SGAP   = 12f;
+        private const float CSTART = -(HDR + 10f);  // -50
+
+        private const int SZ_HDR = 16;
+        private const int SZ_LBL = 14;
+        private const int SZ_FLD = 15;
+        private const int SZ_BTN = 15;
+        private const int SZ_STS = 14;
+        private const int SZ_SEP = 10;
+
+        // ── model ─────────────────────────────────────────────────────────────
+        // Hidden by default now that the native main-menu "Multiplayer" entry is the
+        // way in.  F8 still toggles the legacy panel as a dev fallback.
+        private bool   _visible = false;
+        // #1 — initialised from MPConfig in Awake() so the F8 panel pre-fills
+        // with the previously-used (or Steam-detected) name, not "Player1".
+        private string _name    = "Player1";
+        private string _port    = "7777";
+        private string _ip      = "127.0.0.1";
+
+        // ── state transition tracking (for auto-hide) ─────────────────────────
+        private MPState _prevState = MPState.Idle;
+
+        // ── player sync ───────────────────────────────────────────────────────
+        private float _posSyncTimer;
+        private float _worldSnapshotTimer;
+        private bool  _wasInGame;
+
+        // Startup pause hold — host-side watchdog so the game can't freeze forever
+        // if a player gets stuck loading and never reports in-game.
+        private float _startupHoldElapsed;
+        private const float STARTUP_HOLD_TIMEOUT = 180f;   // 3 min (user spec) — countdown shown on the wait screen
+
+        // Sends the local player's appearance once, after the character is ready.
+
+        // ── periodic host-side sync timers ────────────────────────────────────
+        /// <summary>Counts down to next game-time/speed heartbeat (host, every 3 s).</summary>
+        private float _timeSyncTimer = 3f;
+        /// <summary>Counts down to next market broadcast (host, ~60 s).</summary>
+        private float _marketSyncNextAt;   // round-102h: REAL-time deadline (was a scaled-deltaTime countdown)
+        // Portrait is written to disk lazily (after we first broadcast the
+        // profile), so the initial profile carries portrait=none.  Re-send the
+        // profile once the portrait file appears, until it goes out once.
+        private float _profileResendTimer = 5f;
+        private float _profileResendElapsed = 0f;
+        private bool  _profileNameConfirmed = false;   // a REAL character name (not the PlayerId fallback) has gone out
+
+        // ── in-game player HUD (F9 toggle) ────────────────────────────────────
+        private bool        _hudVisible;
+        private GameObject? _hudGO;
+        private TextMeshProUGUI?   _hudHeader;
+        private TextMeshProUGUI[]  _hudRows = new TextMeshProUGUI[8];
+
+        // ── in-game multiplayer window (Phase 6: draggable; players + chat;
+        //    resize + transparency).  Replaces the old fixed HUD; F9 toggles it. ──
+        private bool          _mpWinVisible;
+        private bool          _mpWasInGame;          // tracks in-game transitions for auto-show/hide
+        private GameObject?   _mpWin;
+        private RectTransform? _mpWinRT;
+        private RectTransform? _mpTitleRT;          // drag handle
+        private TMP_InputField?   _mpChatInputField; private RectTransform? _mpChatInputRT;
+        private string        _mpChatInput = "";    private bool _mpChatFocus;
+        private RectTransform? _mpSendRT;
+        private RectTransform? _mpGripRT;            // bottom-left corner resize handle
+        private bool          _mpResizing;           private Vector2 _mpResizeStartMouse; private Vector2 _mpResizeStartSize;
+        private RectTransform? _mpOpacityTrackRT; private RectTransform? _mpOpacityKnobRT;
+        private bool          _mpDragging;          private Vector2 _mpDragLast;
+        private bool          _mpOpacityDragging;
+
+        private bool          _mpChatNavBlocked;           // true while chat focus is suppressing player movement
+        private float         _mpOpacity = 1f;      // current window opacity [0.15..1]; default fully solid (manager 2026-09-28)
+        private bool          _mpStyled;            // rounded-corner sprite applied (lazy, once assets captured)
+        // Images whose alpha follows the opacity slider (background + chrome ONLY).
+        // Text, the slider itself, the roster and chat stay fully opaque so they're
+        // readable even at opacity 0.
+        private readonly List<(Image img, float baseA)> _mpFade = new();
+
+        // ── startup pause screen (full-screen "waiting for players") ──────────
+        private GameObject?      _startupScreenGO;
+        private TextMeshProUGUI? _startupScreenTxt;
+
+        // ── drag ─────────────────────────────────────────────────────────────
+        private RectTransform _panelRT = null!;
+        private bool    _dragging;
+        private Vector2 _dragOff;
+
+        // ── focus  (0=none 1=name 2=port 3=ip 4=joinPort) ────────────────────
+        private int _focus;
+
+        // ── root objects ──────────────────────────────────────────────────────
+        private GameObject _canvasGO = null!;
+
+        // ── per-state panes ───────────────────────────────────────────────────
+
+        // ── Idle pane interactive elements ────────────────────────────────────
+        private Image           _imgName     = null!;
+        private TextMeshProUGUI _txtName     = null!;
+        private RectTransform   _rtName      = null!;
+        private Image           _imgPort     = null!;
+        private TextMeshProUGUI _txtPort     = null!;
+        private RectTransform   _rtPort      = null!;
+        private Image           _imgIp       = null!;
+        private TextMeshProUGUI _txtIp       = null!;
+        private RectTransform   _rtIp        = null!;
+        private Image           _imgJoinPort = null!;
+        private TextMeshProUGUI _txtJoinPort = null!;
+        private RectTransform   _rtJoinPort  = null!;
+        private Image           _imgHostBtn  = null!;
+        private RectTransform   _rtHostBtn   = null!;
+        private Image           _imgJoinBtn  = null!;
+        private RectTransform   _rtJoinBtn   = null!;
+
+        // ── Lobby-host live labels ────────────────────────────────────────────
+        private string          _clientCash       = "4200";
+        private string _selectedDifficulty = "Normal";
+        private static readonly string[] _difficulties = { "Easy", "Normal", "Hard" };
+
+        // ── Game settings editor ──────────────────────────────────────────────
+        // Audit 2026-08-26: this was `= MPServer.Preset("Normal")`, a FIELD INITIALIZER — so the call
+        // ran inside the component CONSTRUCTOR, i.e. inside AddComponent<MPCanvasUI>() at Plugin.cs:253,
+        // which sits OUTSIDE the try that opens at :263. MPServer.Preset binds DifficultySetting and 13
+        // of its fields; if a game update retires any of them, the throw kills the mod load before any
+        // UI exists at all. Resolved lazily and guarded instead. The lobby reassigns this whenever a
+        // difficulty is picked (SetDifficulty), so nothing downstream changes.
+        private GameVariablesDto? _hostSettingsBacking;
+        private GameVariablesDto _hostSettings
+        {
+            get => _hostSettingsBacking ??= ResolveDefaultPreset();
+            set => _hostSettingsBacking = value;
+        }
+
+        /// <summary>NoInlining so a runtime-absent DifficultySetting member throws HERE, in this
+        /// method's own frame where the try catches it — not in whatever caller touched the
+        /// property.</summary>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private static GameVariablesDto ResolveDefaultPreset()
+        {
+            try { return MPServer.Preset("Normal"); }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError($"[MenuUI] the default difficulty preset is unavailable ({ex.Message}) — falling back to empty defaults; pick a difficulty in the lobby before hosting.");
+                return new GameVariablesDto();
+            }
+        }
+        private GameObject?   _settingsPanelGO;
+        private Image?        _settingsContentImg;   // content bg — rounded with the menu sprite on first open
+        private bool          _settingsHidLobby;      // remembers we hid the lobby behind the settings modal
+        private RectTransform _rtSettingsClose = null!;
+        private bool _settingsOpen;
+        private readonly List<(RectTransform rt, System.Action act)> _settingsHits = new();
+        private readonly List<System.Action> _settingsRefreshers = new();
+        private readonly List<(RectTransform rt, string desc, string title)> _settingsTips = new();
+        private readonly List<NumField> _numFields = new();
+        private int    _editField  = -1;       // index into _numFields, or -1
+        private string _editBuffer = "";
+        private GameObject?      _tooltipGO;
+        private TextMeshProUGUI? _tooltipTxt;
+
+        /// <summary>A click-to-type numeric value field in the settings panel.</summary>
+        private sealed class NumField
+        {
+            public RectTransform   Rt  = null!;
+            public TextMeshProUGUI Lbl = null!;
+            public System.Func<float>   Get = null!;
+            public System.Action<float> Set = null!;
+            public float  Min, Max;
+            public string Fmt = "0";
+        }
+
+        // ── Lobby-client live labels ──────────────────────────────────────────
+
+        // ── In-game host labels ───────────────────────────────────────────────
+        private RectTransform   _rtStopBtn      = null!;
+
+        // ── In-game client labels ─────────────────────────────────────────────
+        private TextMeshProUGUI _txtConnAs      = null!;
+        private TextMeshProUGUI _txtConnHost    = null!;
+        private RectTransform   _rtDiscBtn      = null!;
+
+        // ── Connecting labels ─────────────────────────────────────────────────
+        private RectTransform   _rtCancelBtn    = null!;
+
+        // ── Status bar ────────────────────────────────────────────────────────
+        private TextMeshProUGUI _txtStatus      = null!;
+
+        // ── hit-test rect for title bar ───────────────────────────────────────
+        private RectTransform _rtHdr = null!;
+
+        // ── deferred init ─────────────────────────────────────────────────────
+        private bool _built;
+        private int  _initDelay;
+        private bool _crashReportPopupVisible;
+        private string _crashReportMessage = "";
+        private readonly List<string> _crashReportAttachments = new();
+        private GameObject? _crashReportGO;
+        private RectTransform? _crashReportRT;
+        private RectTransform? _crashReportInputRT;
+        private RectTransform? _crashReportTagRT;
+        private RectTransform? _crashReportAttachRT;
+        private RectTransform? _crashReportSendRT;
+        private RectTransform? _crashReportDismissRT;
+        private TMP_InputField? _crashReportInputField;
+        private bool   _crashReportSending;       // an upload is in flight: block re-send + hold the status line
+        private string _crashReportResult = "";   // "" = none; else the status line to display (submit/sent/failed)
+        private float  _crashReportAutoCloseAt;    // >0 = unscaled time to auto-close the popup after a success
+        private string _crashReportDir = "";     // H-REPORTLOSS-1: the report this popup opening filed — a late retry result is shown only for it
+        private bool   _crashReportSentOk;         // round-96: this popup opening already submitted successfully — block re-sends (field: one prompt submitted twice, 2s apart, in the gap between upload-success and auto-close)
+        private TextMeshProUGUI? _crashReportTitleLbl;
+        private TextMeshProUGUI? _crashReportBodyLbl;
+        private TextMeshProUGUI? _crashReportTagLbl;
+        private TextMeshProUGUI? _crashReportStatusLbl;
+        private bool _crashReportFocus = true;
+        private bool _crashReportAutoFocusPending;
+        private bool _crashReportIsCrash = true;
+        private Sprite? _crashReportStyledWith;
+        private int _bugReportTagIndex;
+
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>The live UI component (one DontDestroyOnLoad instance) so
+        /// Harmony patches can reach instance state (e.g. chat typing focus).</summary>
+        public static MPCanvasUI? Instance { get; private set; }
+
+        /// <summary>Round-225b: the mod's UI canvas root ("BAMP_Canvas") — cloned native
+        /// panels must parent HERE to render (the manager component itself lives on a
+        /// plain object; a RectTransform outside a Canvas draws nothing, rig-proven).</summary>
+        internal GameObject? CanvasRoot => _canvasGO;
+
+        /// <summary>Clear chat typing-focus + input suppression.  Called from the
+        /// HandleEscapeClick guard so Escape always escapes our input block instead
+        /// of crashing the game's escape handler.</summary>
+        public static void ClearChatFocus()
+        {
+            if (Instance != null) Instance._mpChatFocus = false;
+            MPChat.SuppressGameInput = false;
+        }
+
+        private void Awake()
+        {
+            Instance = this;
+            DontDestroyOnLoad(gameObject);
+            // #1 — pre-fill the F8 panel from persisted MPConfig (saved last
+            // time the user clicked Host/Join).  Awake runs after Plugin.Load
+            // → MPConfig.Init, so PlayerId is already resolved here.
+            if (!string.IsNullOrWhiteSpace(MPConfig.PlayerId))
+                _name = MPConfig.PlayerId;
+            _port = MPConfig.Port.ToString();
+            _ip   = MPConfig.HostIP;
+            Plugin.Logger.LogInfo(
+                $"[UI] F8 panel pre-fill: name='{_name}' port={_port} ip={_ip}");
+
+            // Round-93 (user decision 2026-07-26): the crash AUTO-PROMPT is retired — too many false
+            // positives (Task Manager quits filed as "crashes"; e.g. field 20260725-172640, a
+            // frustrated manual quit). Detection still runs: the marker rides every MANUAL report as
+            // PreviousCrashDetected/Hint metadata, and the top-bar Report button is always available.
+            if (MPBugReport.PendingCrashDetected)
+                Plugin.Logger.LogInfo("[BugReport] previous-session crash marker present — auto-prompt retired (round-93); metadata rides any manual report.");
+
+            // Stage-4 migration #1: the join quiesce ends on the lifecycle
+            // WorldReady EVENT (replaces the hand-tuned 4s timer).
+            MPLifecycle.PhaseChanged += OnLifecyclePhase;
+        }
+
+        // World-integrity one-shot (approved diagnostics batch, 2026-07-09): armed at scene-ready,
+        // fires once ~30s later when the rival cache has filled.
+        private float _worldHealthAt = -1f;
+
+        private void TickWorldHealth()
+        {
+            if (_worldHealthAt >= 0f && Time.unscaledTime >= _worldHealthAt)
+            {
+                _worldHealthAt = -1f;
+                if (MPServer.IsRunning || MPClient.IsConnected)
+                    GameStatePatcher.LogWorldHealth("scene ready +30s");
+            }
+            if (_postSyncHealthAt >= 0f && Time.unscaledTime >= _postSyncHealthAt)
+            {
+                _postSyncHealthAt = -1f;
+                if (MPServer.IsRunning || MPClient.IsConnected)
+                    GameStatePatcher.LogWorldHealth("post-sync +10s");
+            }
+        }
+
+        // Round-50 (approved): one-shot per load, armed by the FIRST business-snapshot apply —
+        // the event the +30s timer races on slow links. Static so GameStatePatcher can arm it.
+        private static float _postSyncHealthAt = -1f;
+        private static bool  _postSyncHealthDone;
+        public static void ArmPostSyncWorldHealth()
+        {
+            if (_postSyncHealthDone) return;
+            _postSyncHealthDone = true;
+            _postSyncHealthAt = Time.unscaledTime + 10f;
+        }
+
+        // Task #5 (Prabaha report, 2026-07-08): a leftover marker said NOTHING about where the dead
+        // session was — menu-kill loop and mid-game crash looked identical. Stamp phase + uptime ~30s.
+        private float _nextCrashHeartbeat;
+
+        private void TickCrashHeartbeat()
+        {
+            if (Time.unscaledTime < _nextCrashHeartbeat) return;
+            _nextCrashHeartbeat = Time.unscaledTime + 30f;
+            string phase;
+            try
+            {
+                phase = !IsInGame() ? "main menu"
+                      : MPServer.IsRunning ? $"in-game (host, day {SafeDay()})"
+                      : MPClient.IsConnected ? $"in-game (client, day {SafeDay()})"
+                      : $"in-game (offline, day {SafeDay()})";
+            }
+            catch { phase = "unknown"; }
+            MPBugReport.Heartbeat(phase);
+            MPBugReport.OutboxTick();   // H-REPORTLOSS-1: retry undelivered bug reports whose next attempt is due
+            TickDuplicateInstallWarning();
+            TickPatchFailureWarning();
+            TickSteamProbe();
+        }
+
+        private static bool _steamProbed;
+        /// <summary>Steam-connect campaign, slice-1 probe: one line confirming we can
+        /// link + read the game-initialized Facepunch SteamClient.  Gates slice 2
+        /// (relay transport rides the same client).  Logs once, first heartbeat
+        /// where Steam reports valid; silent otherwise.</summary>
+        // H-IDENT-1 r3 (review F-2026-09-06-AJ): the Steam probe rides the 30 s crash heartbeat, so an account change noticed
+        // there could land up to 30 s after Steam turned valid - after a Host/Join click (MAJOR-1) - and nothing stopped it from
+        // switching the identity in the middle of a running session (MAJOR-2). This per-frame check costs one bool until it
+        // has run once: the FIRST frame Steam is valid, and only while no session runs, the stored identity is rechecked
+        // against the live account; in a session the recheck is deferred to the next launch (never switch mid-session).
+        private static bool _identityRechecked;
+        private static void TickIdentityRecheck()
+        {
+            if (_identityRechecked) return;
+            try
+            {
+                if (!Steamworks.SteamClient.IsValid) return;
+                if (MPServer.IsRunning || MPClient.IsClientInWorld || MPClient.IsConnecting)   // r4 (F-2026-09-06-AK): a Join handshake in flight counts as a session too
+                {
+                    _identityRechecked = true;
+                    Plugin.Logger.LogInfo("[Steam] identity recheck deferred to the next launch — Steam became valid while a session was already running (H-IDENT-1).");
+                    return;
+                }
+                _identityRechecked = true;
+                if (MPConfig.OnSteamReady(out string oldName))
+                {
+                    if (Instance != null && Instance._name == oldName) Instance._name = MPConfig.PlayerId;   // the panel showed the old name - repaint
+                    MPLoadWindow.RefreshIfOpen();
+                }
+            }
+            catch (Exception ex) { _identityRechecked = true; Plugin.Logger.LogWarning($"[Steam] identity recheck: {ex.Message}"); }
+        }
+
+        private static void TickSteamProbe()
+        {
+            if (_steamProbed) return;
+            try
+            {
+                if (!Steamworks.SteamClient.IsValid) return;
+                _steamProbed = true;
+                Plugin.Logger.LogInfo($"[Steam] client valid: app={Steamworks.SteamClient.AppId} id={Steamworks.SteamClient.SteamId} name='{Steamworks.SteamClient.Name}'.");
+                MPSteamPresence.EnsureHooked();   // stage C: invites/join-requests + cold-start connect
+            }
+            catch (Exception ex)
+            {
+                _steamProbed = true;   // one shot either way — a throw means the link/runtime is the story
+                Plugin.Logger.LogWarning($"[Steam] probe failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private bool _duplicateWarned;
+        /// <summary>A second copy of this mod (ModsLocal + Workshop subscription)
+        /// refuses to start (Plugin double-install guard) and records itself in an
+        /// AppDomain slot — assembly statics are per-copy, so the slot is the only
+        /// channel.  The LIVE copy announces it here, once, so the player learns
+        /// to remove one install instead of wondering why the Mods list shows two.</summary>
+        private void TickDuplicateInstallWarning()
+        {
+            if (_duplicateWarned) return;
+            string? dup = null;
+            try { dup = System.AppDomain.CurrentDomain.GetData("BAMP_DUPLICATE_ROOT") as string; } catch { }
+            if (string.IsNullOrEmpty(dup)) return;
+            _duplicateWarned = true;
+            Plugin.Logger.LogWarning($"[Plugin] Duplicate install detected: a second copy at '{dup}' was refused. Remove either the Workshop subscription or the ModsLocal folder.");
+            try { ModEntry.PatchIssues.Add($"duplicate install refused: {dup}"); } catch { }
+            try
+            {
+                UI.Notification.Notifications.Show(UI.Notification.NotificationType.Error,
+                    $"{MyPluginInfo.SHORT_NAME} is installed twice (Steam Workshop + local mods). The extra copy was disabled — please remove one install.");
+            }
+            catch { }
+        }
+
+        private bool _patchFailWarned;
+        /// <summary>Round-229 two-tier boot-health announcement, once per run. A
+        /// systemic hook collapse (>= ModEntry.PatchFailHardBlock) also refuses MP
+        /// entry (gates in MPServer.Start / MPClient.Connect / ConnectSteam); a
+        /// handful of failures only warns — MP stays enabled. Self-diagnosis first
+        /// by design: verify game files, then remove other mods — the message
+        /// deliberately does NOT steer them to the report button (players report
+        /// at their own discretion; that path stays alive regardless — it needs
+        /// no game hooks).</summary>
+        private void TickPatchFailureWarning()
+        {
+            if (_patchFailWarned || !ModEntry.PatchesDegraded) return;
+            _patchFailWarned = true;
+            try
+            {
+                if (ModEntry.MpDisabledByPatchFailure)
+                    UI.Notification.Notifications.Show(UI.Notification.NotificationType.Error, ModEntry.PatchFailureNotice);
+                else
+                    UI.Notification.Notifications.Show(UI.Notification.NotificationType.Warning, ModEntry.PatchDegradedNotice);
+            }
+            catch { }
+        }
+
+        /// <summary>Consume a Steam invite/join queued by MPSteamPresence — from
+        /// the MENU it auto-joins the friend's session; mid-game or mid-session
+        /// it shows a notice instead of yanking the player out.</summary>
+        private void TickSteamJoin()
+        {
+            bool server = MPSteamPresence.PendingJoinAddr.Length > 0;   // STEAM-FRIEND-JOIN-1: a friend on a dedicated server
+            if (MPSteamPresence.PendingJoinId == 0 && !server) return;
+            ulong id = MPSteamPresence.PendingJoinId;
+            string addr = MPSteamPresence.PendingJoinAddr, key = MPSteamPresence.PendingJoinKey;
+            int port = MPSteamPresence.PendingJoinPort;
+            MPSteamPresence.PendingJoinId = 0;
+            MPSteamPresence.PendingJoinAddr = ""; MPSteamPresence.PendingJoinKey = "";
+            if (IsInGame() || MPClient.IsConnected || MPClient.IsConnecting || MPServer.IsRunning)
+            {
+                Plugin.Logger.LogInfo($"[SteamJoin] join request {(server ? "for a server" : "for " + id)} ignored — already in a game/session (notice shown).");
+                try { UI.Notification.Notifications.Show(UI.Notification.NotificationType.Info, Loc.T("gps_steam_join_in_game", "Steam invite received - go back to the main menu and choose Join Game on your friend once more.")); } catch { }
+                return;
+            }
+            if (server)
+            {
+                Plugin.Logger.LogInfo($"[SteamJoin] auto-join → a Going Public server ({MPSteamPresence.PendingJoinVia}).");   // IP-IN-LOGS-1: no address
+                if (key.Length > 0 && key != MPConfig.JoinKey) MPConfig.SetJoinKey(key);   // a server without a key keeps the saved one
+                MPConfig.SetRuntime(MPConfig.PlayerId, addr, port);
+                _ip = addr; _port = port.ToString();
+                MPClient.Connect(addr, port);
+                ShowView(MpView.Lobby);
+                SetStatus(Loc.T("gps_ui_connecting", "Connecting..."), false);
+                return;
+            }
+            Plugin.Logger.LogInfo($"[SteamJoin] auto-join → {id} ({MPSteamPresence.PendingJoinVia}).");
+            MPConfig.SetRuntime(MPConfig.PlayerId, $"steam:{id}", 0);
+            if (MPClient.ConnectSteam(id))
+            { ShowView(MpView.Lobby); SetStatus(Loc.T("gps_ui_connecting_via_steam_relay", "Connecting via Steam relay..."), false); }
+            else
+            { SetStatus(Loc.T("gps_ui_steam_relay_connect_failed_to_start", "Steam relay connect failed to start (see log)."), true); }
+        }
+
+        /// <summary>DEDICATED-HOST-1: drives the always-on host from the main thread. The idle pause and the auto-accept run in
+        /// DedicatedHost.Tick; from the main menu, with a configured save (DedicatedSession), this hosts and loads it through
+        /// the same path a click on the save picker and on Start takes (OnSpLoad, then StartLoadNow).</summary>
+        private void TickDedicated()
+        {
+            try
+            {
+                if (!DedicatedHost.Enabled) return;
+                DedicatedHost.Tick();
+                HeadlessHost.Tick();   // HEADLESS-1: console commands, status file, events, watchdogs (no-op unless headless)
+                if (HeadlessHost.Stopping) return;
+                DedicatedHost.TickNewGame();   // DEDICATED-NEWGAME-1: character creation + first save of a new world
+                // AUTOSTART-UI-1: hosting opens the lobby view, which needs the canvas (BuildLobbyWindow returns without one).
+                // The first try used to come before the canvas existed, failed with "lobby window unavailable", and the next
+                // try took the NEXT OLDER save - every server start rolled the world back to its second newest save, and a
+                // chosen save (console 'load', DedicatedLoadSave) was never loaded. Wait for the canvas build (a failed build
+                // still sets _built, so that case retries and reports as before).
+                if (!_built) return;
+                if (!DedicatedHost.WantsAutoStart(IsInGame(), out string configured)) return;
+                if (DedicatedHost.StuckInLobby)
+                {
+                    // the last try hosted but its load was refused (the lobby stays as it was): stop hosting, then try again
+                    Plugin.Logger.LogWarning("[Dedicated] auto-start: the lobby is still open after the last try - stopping hosting before the next one.");
+                    try { MPServer.Stop(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[Dedicated] stop before retry: {ex.Message}"); }
+                    if (MPServer.IsRunning) return;
+                }
+                if (DedicatedHost.WantsNewGame(configured, out string difficulty))
+                {
+                    // DEDICATED-NEWGAME-1: no save of that name yet - host and start a new world (the lobby's Host + Start New)
+                    DedicatedHost.NoteAutoStartAttempt();
+                    if (string.IsNullOrWhiteSpace(_name)) _name = MPConfig.PlayerId;
+                    if (!MPServer.IsRunning) OnHost();
+                    if (!MPServer.IsRunning)
+                    {
+                        Plugin.Logger.LogWarning("[Dedicated] new world: hosting failed (see the lines above); it will be retried.");
+                        return;
+                    }
+                    DedicatedHost.BeginNewGame(configured, difficulty);
+                    MPServer.StartNewGame(DedicatedHost.NewGameSettings(difficulty));   // NEWGAME-CUSTOM-1: Custom = AMP's values
+                    // StartNewGame minted a fresh, unnamed world identity; naming it now keeps that identity (a rename)
+                    MPSaveCoordinator.ActiveSessionName = MPSaveCoordinator.SanitizeSession(configured);
+                    return;
+                }
+                DedicatedHost.NoteAutoStartAttempt();
+                string session = DedicatedHost.PickSaveToLoad(configured, out string pickedPid);   // newest save of that playthrough
+                Plugin.Logger.LogInfo($"[Dedicated] auto-start: hosting saved game '{session}' (try {DedicatedHost.AttemptsMade}).");
+                if (string.IsNullOrWhiteSpace(_name)) _name = MPConfig.PlayerId;
+                _spSelSession = session;
+                _spSelPid = pickedPid;
+                // OnSpLoad hosts, mirrors the save's settings and, as its LAST step, opens the lobby view. A headless host does not
+                // need that view, so a failure while building it must not stop the start - hosting and the chosen save count.
+                try { OnSpLoad(); }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Dedicated] auto-start: lobby view after hosting failed ({ex.GetType().Name}: {ex.Message}) - continuing."); }
+                if (!MPServer.IsRunning || string.IsNullOrEmpty(MPServer.ChosenLoadSession))
+                {
+                    Plugin.Logger.LogWarning($"[Dedicated] auto-start: '{session}' could not be hosted (see the lines above); it will be retried.");
+                    return;
+                }
+                StartLoadNow();   // a solo host has nobody to wait for
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Dedicated] auto-start: {ex.Message}"); }
+        }
+
+        private static int SafeDay()
+        { try { return SaveGameManager.Current?.Day ?? 0; } catch { return 0; } }
+
+        private void OnApplicationQuit()
+        {
+            MPBugReport.MarkCleanShutdown();
+            try { PlayerLedger.Flush(); } catch { }   // DEDICATED-RANK-1
+            // Persist the local player's CURRENT character on a raw window-close (X / quit-to-desktop), the
+            // same as the Save-and-Exit button — otherwise a window-close ships NOTHING and the session
+            // keeps only what the last periodic autosave (or the host's host-only disconnect checkpoint)
+            // captured, so a member can return as a brand-new player. PerformLocalSave is synchronous
+            // (JoinSaveGameThreads blocks), so the .hsg is on disk before we exit; on one machine it lands
+            // in the shared session folder the host's disconnect carry-forward then reads.
+            try
+            {
+                if (IsInGame())
+                {
+                    if (MPServer.IsRunning)
+                    {
+                        // Round-37: the quit-save goes to the DISCONNECT variant — never the manual base
+                        // (this direct PerformLocalSave(active) was one of the two "my save advanced
+                        // without me saving" leaks; the join-save was the other).
+                        Plugin.Logger.LogInfo("[MPSave] OnApplicationQuit — host quit-checkpoint before exit.");
+                        // Round-184: a save made seconds before quitting may still be waiting on
+                        // member uploads — complete its carry-forward NOW or the session exits
+                        // missing a player (save-and-quit is the common flow; user call 2026-07-29).
+                        try { MPSaveCoordinator.FlushCarryBackstopsNow("application quit"); } catch { }
+                        MPSaveCoordinator.HostQuitCheckpoint();
+                    }
+                    else if (MPClient.IsConnected || MPClient.SessionEnded)
+                    {
+                        // Client: write the designated disconnect save (+ marker) — the trusted-newer file
+                        // Phase 3 may restore on rejoin if the host's stored copy is older.
+                        // Round-282 (checked, not assumed): this branch sends NOTHING over the wire —
+                        // WriteClientDisconnectSave writes '<base>-disconnect' and clientDisconnect.json to
+                        // LOCAL disk only.  So there is no client-side equivalent of the host's quit
+                        // drain-wait to add.  The client's one inline upload at exit lives in a DIFFERENT
+                        // flow (MPSaveCoordinator.MenuSave with exiting:true → SendSaveData, the pause-menu
+                        // Save-and-Exit button) and is IMMEDIATE, not paced — unaffected by mirror pacing.
+                        MPSaveCoordinator.WriteClientDisconnectSave();
+                    }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MPSave] OnApplicationQuit save: {ex.Message}"); }
+            // QUIT-KICK-1: a host quit that took no checkpoint (no world loaded, no session) still tells its players.
+            try { if (MPServer.IsRunning) MPServer.CloseLinksForQuit(); } catch { }
+            // H6 (review of 480184b, 2026-09-28): a Disconnect close still held for the host's receipt closes now, with
+            // linger, after the disconnect save above (which needs the session state) - not dropped by the shutdown.
+            try { MPClient.CloseHeldOnQuit(); } catch { }
+        }
+
+        private void OnLifecyclePhase(MPLifecycle.MPPhase prev, MPLifecycle.MPPhase next)
+        {
+            try { DetourCheck.Now("phase " + next); } catch { }   // DETOUR-CHECK-1
+            // LEFT THE WORLD → force-hide every in-game panel unconditionally
+            // (the rest dock once survived all the way into the main menu).
+            if (next == MPLifecycle.MPPhase.Menu || next == MPLifecycle.MPPhase.None
+                || next == MPLifecycle.MPPhase.Lobby)
+            {
+                try
+                {
+                    if (_dock != null && _dock.activeSelf) { _dock.SetActive(false); Plugin.Logger.LogInfo("[Lifecycle] left world — rest dock force-hidden."); }
+                    if (_hub != null && !_hubNative && _hub.activeSelf) { _hub.SetActive(false); _hubVisible = false; }
+                    if (_joinPop != null && _joinPop.activeSelf) _joinPop.SetActive(false);
+                    // The loiter button's tick stops outside the world (TickPositionSync gate),
+                    // so it can never hide itself — same survival hole as the dock above.
+                    if (_loiterBtn != null && _loiterBtn.activeSelf) _loiterBtn.SetActive(false);
+                    if (_loiterTip != null && _loiterTip.activeSelf) _loiterTip.SetActive(false);
+                    _loiterUiHover = false;
+                }
+                catch { }
+            }
+
+            // Fence visibility: the host excuses clients parked in Menu
+            // (a connected client who cancels a load never disconnects —
+            // the old fence waited the full 90s timeout on them).
+            // Round-276 probe: the transition's reason string rides along so the
+            // host's log carries the client-side discriminators (a congested link
+            // makes peer-log collection impossible exactly when it matters).
+            if (MPClient.IsConnected) MPClient.SendPhaseReport(next.ToString(), MPLifecycle.LastSetReason);
+
+            if (next != MPLifecycle.MPPhase.WorldReady) return;
+            MPClient.EndJoinQuiesce();
+            GameStatePatcher.StripGhostVehicles("world-ready");   // leaked-ghost hygiene (data only)
+            GameStatePatcher.HealStaleActiveVehicleId();   // round-68: BAMP_/unresolvable ActiveVehicleId = trapped-in-building + frozen-ghost poison
+            MPRegisterSync.StripOrphanSyntheticEmployees("world-ready");   // clear duty-staff a prior save left behind
+            MPRegisterSync.DemoteForeignAssignedStaff("world-ready");      // round-196: interrupted-transfer staff residue
+            MergerDissolve.HealIfPending("world-ready");   // DISSOLVE fold d: the heal armed by a first non-member state that landed before the world did
+            MPSaveIntegrity.RunSweep("world-ready");   // dangling-reference repair/detect (includes duty-shift repair); summary rides bug reports
+            VehicleManager.LogOwnedVehicleCensus("world-ready");   // GARAGE-MASK-1: log-only owned-vehicle census (where each car is, and whether the mask hides it)
+            GameStatePatcher.LogUnregisteredBusinessTypes("world-ready");   // BIZTYPE-1: log-only — rented addresses whose business type no loaded mod registers (the black-screen start-up abort)
+            OptionsGuard.PinClock("world-ready");   // SPEED-SHARED: adopt the session clock speed as the world opens (the host's own slider on the host, the value the host sent on a client)
+            MPSaveCoordinator.EnsurePortraitFolderForWorld("world-ready");   // DISK-JUNK backstop: the scene-loaded call bails while the session name is still unknown
+            GameStatePatcher.SweepLedgerVsRivalBusinesses("world-ready");   // round-50: drop player reservations on AI-rival-run addresses (host-only inside)
+            GameStatePatcher.HealHollowAiLayouts("world-ready");   // field 175635: hosting from a client mirror — restore AI-shop layouts from business defaults (host-only inside)
+            GameStatePatcher.ReconcileLoadedNeedsFlag();   // round-53: the drain dial owns the save's baked energy on/off after load (host-only inside)
+            // H-FRESH-1: a host that LOADED a world (or a manifest that predates StartSettings) has no lobby DTO — describe the live world
+            // so a first-time joiner is born with ITS settings, not the Normal preset (bundle 20260906-030014: 10k instead of 100k).
+            try
+            {
+                if (MPServer.IsRunning && MPServer.LastStartSettings == null && SaveGameManager.Current?.gameVariables != null)
+                {
+                    MPServer.LastStartSettings = MPServer.DtoFromGameVariables(SaveGameManager.Current.gameVariables);
+                    Plugin.Logger.LogInfo($"[Server] start settings derived from the loaded world at world-ready (cash {MPServer.LastStartSettings.StartingMoney}, difficulty {MPServer.LastStartSettings.Difficulty}).");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Server] start settings at world-ready: {ex.Message}"); }
+            // SAVED-SETTINGS-1: the host applies the load lobby's changed world settings (and delivers them); a client applies a set
+            // the host sent while its own save was still loading.
+            try { if (MPServer.IsRunning) MPServer.HostApplyPendingWorldSettings("world-ready"); else if (MPClient.IsConnected) MPClient.WorldSettingsOnWorldReady(); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[World] world-ready: {ex.Message}"); }
+            MPSaveCoordinator.CheckManifestFreshness();    // round-58: stale ownership-ledger detector (host-only inside)
+            ApplyFreshSpawnWarp();  // fresh-character joins: designated start, not the prefab spot
+            ApplySpawnSidestep();   // fresh games: one navmesh-validated de-stack, placement final
+            // Placement diagnostic: position-restore runs in load-finish —
+            // still at the default spawn here = it was skipped.
+            try
+            {
+                var ch = Helpers.PlayerHelper.PlayerController?.Character?.transform;
+                if (ch != null) Plugin.Logger.LogInfo($"[UI] world-ready position: ({ch.position.x:F1}, {ch.position.y:F1}, {ch.position.z:F1})");
+            }
+            catch { }
+        }
+
+        // ── Update ────────────────────────────────────────────────────────────
+
+        // ── Round-254: Harmony-bootstrap failure banner ───────────────────────
+        // Set by Plugin when the shared patching library was poisoned by another
+        // mod (incomplete package or outdated version). In that state this
+        // component does EXACTLY ONE thing — show the banner naming the culprit —
+        // and everything else stays off: with zero patches applied, any normal MP
+        // activity would be a half-alive hazard.
+        internal static string? FatalBootBanner;
+        private GameObject? _fatalGO;
+        private bool _fatalDismissed;
+
+        private void Update()
+        {
+            if (BootConsole.Live) return;                // BOOT-TERMINAL-2: the load is still handing frames back - nothing of ours runs half-patched
+            try { JsonWarmup.Ensure(); } catch { }       // JSON-WARMUP-1: once, on the main thread, long before the first connection
+            try { ModTranslations.Tick(); } catch { }   // MOD-TRANSLATIONS-2: tables downloaded from the repository take effect
+            try { LogoShapesExtra.Ensure(); } catch { }   // LOGO-SHAPES-1: our logo shapes in the game's list, before our types take theirs
+            try { GoingOnlineModule.EnsureHost(); GoingOnline.GameTypes.Ensure(); } catch { }
+            try { BizPack.Ensure(); } catch { }   // BUSINESS-PACK-1: IT firm, cleaning company, laundromat - registered like the cable provider   // GAME-TYPES-1: the cable provider's business types, items and jobs - from the main menu on, on a dedicated server too, the module on or off (a save with them must load)
+            try { DetourCheck.Tick(); } catch { }        // DETOUR-CHECK-1: did a patched method's entry change?
+            try { FriendMapMarkers.Tick(); } catch { }   // FRIENDS-1: friends on the city map
+            if (_built) TickClickShield();               // NAV-WALK-CLICK-1: a window closed on the press keeps the release
+            if (_built) TickSignManager();               // MODULE-SIGNS-1: F7 shop signs window
+            if (_built) TickLogoPicker();                // LOGO-PICKER-1: the logo editor's picture window
+            if (_built) TickLiveryEditor();              // CAR-LIVERY-1: a vehicle's livery, each side its look
+            if (_built) TickCameraModule();              // MODULE-CAMERA-1: F6 RPG camera, F8 its settings
+            if (_built) TickPlanner();                   // MODULE-PLANNER-1: Shift+F9 schedules and opening hours
+            if (_built) TickInsights();                  // MODULE-INSIGHTS-1: Shift+F10 the books of your businesses
+            if (_built) TickNavigation();                // MODULE-NAVIGATION-1: Shift+F11 destination and route
+            if (_built) TickAutoWalkHud();               // NAV-AUTOWALK-1: walk to the waypoint (map card and HUD buttons)
+            if (IsInGame()) { try { ExitRescue.Tick(); } catch { } }   // EXIT-NAVMESH-1: out of a car beside the walkable mesh
+            if (_built) TickMenuExtras();                // MENU-VERSION-1 / MOD-NEWS-1: the mod's version and news on the main menu
+            if (FatalBootBanner != null)
+            {
+                // HEADLESS-1: nobody can read the banner on an unattended host - end the process so its supervisor reports it
+                if (HeadlessHost.Active) { HeadlessHost.FatalExit("the mod could not start: " + FatalBootBanner.Replace("\n", " "), HeadlessHost.ExitModBroken); return; }
+                // 2026-08-18 DEADLOCK FIX (rig-reproduced with a staged Harmony conflict:
+                // menu up, no banner, "Canvas built OK" absent from the log): the banner
+                // waited for _canvasGO while this early return skipped the lazy
+                // BuildCanvas below — EnsureFatalBanner's "retry until the canvas
+                // exists" retried against a canvas its own branch was blocking.  The
+                // banner therefore NEVER rendered in the field (Lord-Wolf 2026-08-18,
+                // and plausibly every case since round-254 shipped).  Banner mode now
+                // runs the same lazy build first; BuildCanvas is pure uGUI by design
+                // (round-241: the canvas must survive a dead Harmony), so it is safe
+                // with zero patches applied.
+                if (!_built)
+                {
+                    if (++_initDelay < 30) return;
+                    try   { BuildCanvas(); _built = true; Plugin.Logger.LogInfo("[UI] Canvas built OK (banner mode)."); }
+                    catch (Exception ex) { _built = true; Plugin.Logger.LogError($"[UI] Build failed (banner mode): {ex}"); }
+                    return;
+                }
+                if (!_fatalDismissed) EnsureFatalBanner();
+                return;
+            }
+            // ── Build the canvas FIRST (1.0 audit 2026-08-26) ─────────────────────────────────
+            // This block used to sit at the BOTTOM of Update, below ~215 lines that reach into game
+            // types. A binding those lines resolve at JIT/prepare time throws BEFORE the enclosing
+            // method's first statement, so any one of them failing on a future game build aborted
+            // Update at that line EVERY frame and BuildCanvas was never reached: no Multiplayer button,
+            // no lobby, no phone button, no bug-report takeover — and no line in our own log, because
+            // the throw escapes to Unity. The banner path above already knew this ("the canvas must
+            // survive a dead Harmony"); the normal path never got the same treatment.
+            //
+            // WHAT THIS DOES AND DOES NOT RESCUE (review 2026-08-26 — the list above describes the OLD
+            // failure, not what building early restores). Saved: the canvas, the Multiplayer button, the
+            // lobby and the settings panel, because uGUI click handlers run from Unity's EventSystem, not
+            // from this Update. Still lost if something below throws: everything driven FROM here —
+            // TickGameLoadDetect, the crash-report takeover, the phone button, loiter and hub. The first
+            // native touch below is EnsureVersionCached, which is why its own call is isolated behind a
+            // NoInlining helper in MPSaveManager. This block buys a working menu and a visible failure,
+            // not a working mod.
+            //
+            // It deliberately does NOT return after building: the work below must keep running from
+            // frame 1 (EnsureVersionCached's contract, documented at its call site — the poll thread
+            // depends on that cache existing before it ever handles an uploaded save).
+            if (!_built && ++_initDelay >= 30)
+            {
+                try   { BuildCanvas(); _built = true; Plugin.Logger.LogInfo("[UI] Canvas built OK."); }
+                catch (Exception ex) { _built = true; Plugin.Logger.LogError($"[UI] Build failed: {ex}"); }
+            }
+
+            TickUiScale();   // round-176: keep the canvas scale tracking resolution + the game's UI Zoom
+
+            // Resolve + cache the save version folder on the MAIN thread, unconditionally
+            // and as early as possible.  The network poll thread reaches MpCharacterFolder
+            // (→ IL2CPP CurrentVersionFolderPath) when it handles a client's uploaded save
+            // (host) OR a host-sent save to load (client) — and on the client that can
+            // arrive before it is in-game.  Caching here, every frame from the start,
+            // guarantees the path is ready so NO poll-thread handler ever calls IL2CPP.
+            MPSaveManager.EnsureVersionCached();
+            MPStoreCarryForward.RunIfNeeded();   // game-version upgrade (user-approved 2026-08-21): copy the previous version's MP store forward, once, in the background
+            if (!MPStoreCarryForward.Busy)       // lean-A ordering: the migrator waits out a pending carry (it would race the copy's renames otherwise)
+                MPStoreMigration.RunIfNeeded();  // store v2 M2: one-time flat→pid migration, first frame the version resolves
+            MPRadioSync.Tick();   // round-227: debounced volume-drag flush
+            PlayerColours.Tick();   // 2026-09-05 colours: one repaint + options re-registration per frame, at most
+            try { PlayerReports.Tick(); } catch { }   // PLAYER-REPORTS-1: error reports to the server (player) / their files (dedicated server)
+            try { ChatTranslate.Tick(); } catch { }   // CHAT-TRANSLATE-1: the player's language to the server / the server's translator
+            try { PedSignals.Tick(); } catch { }   // PED-SIGNALS-1: the pedestrian lights at the crossings
+            PlayerPins.Tick();      // 2026-09-05 colours piece two: the Players map filter + one live pin per remote player
+            BillboardAdSync.Tick();   // round-290: own billboard campaigns → peers (diff-triggered + heartbeat)
+#if BAMP_DEV
+            TestDrive.Tick();   // round-239 (registered in 04-probes.md): file-drop test command channel — inert until <DataRoot>\testdrive\ exists
+            // DIAG:DEVTOOL (round-228 test, registered in 04-probes.md): the game's native
+            // debug console ships in retail but its hotkey is compiled off (IsDevMode=false).
+            // Dev builds only: Ctrl+F9 toggles it, giving the rig the game's own commands
+            // (addHappinessModifier etc.) with autocomplete. Never present in Release.
+            if (Input.GetKeyDown(KeyCode.F9) && (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)))
+            {
+                try
+                {
+                    // Reflection: DebugLogManager lives in the IngameDebugConsole plugin assembly,
+                    // which the mod doesn't reference — a dev key doesn't earn a csproj reference.
+                    var t = HarmonyLib.AccessTools.TypeByName("IngameDebugConsole.DebugLogManager");
+                    var dlm = t?.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetValue(null);
+                    if (dlm != null)
+                    {
+                        bool visible = (bool)(t.GetProperty("IsLogWindowVisible")?.GetValue(dlm) ?? false);
+                        t.GetMethod(visible ? "HideLogWindow" : "ShowLogWindow", System.Type.EmptyTypes)?.Invoke(dlm, null);
+                        Plugin.Logger.LogInfo($"[DevTool] native debug console {(visible ? "closed" : "OPENED")} (Ctrl+F9).");
+                    }
+                    else Plugin.Logger.LogWarning("[DevTool] DebugLogManager not found — console unavailable in this build.");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[DevTool] console toggle: {ex.Message}"); }
+            }
+#endif
+            // Round-225f lock-safety: the load window hides the MP menu while open (native
+            // behavior) — Escape ALWAYS closes it and restores the menu, so no render
+            // failure can ever strand the player without interactables.
+            if (MPLoadWindow.IsOpen && Input.GetKeyDown(KeyCode.Escape)) { MPLoadWindow.Close(); OnLoadWindowClosed(); }
+            TickSteamJoin();   // consume a queued Steam invite/join (menu only)
+            MPSteamPresence.TickServerJoin();   // STEAM-FRIEND-JOIN-1: on a dedicated server, friends see Join Game
+            AutoRejoin.Tick();   // RECONNECT-1: join the lost dedicated server again
+            CarRadioSync.Tick();   // PASSENGER-RADIO-1: the driver's station for the riders
+            RadioStreams.Prefetch();   // RADIO-STREAMS-2: the server's station list from GitHub
+            MergerDissolveSale.Tick();   // DISSOLVE-SALE-1: a company every member voted to dissolve sells here (host: the split)
+            TickDedicated();   // DEDICATED-HOST-1: always-on host (idle pause, auto-accept, auto-start)
+#if BAMP_DEV
+            // DIAG:INVESTIGATION(passenger-doors) — F6 spawns a visible row of the next few
+            //   not-yet-seen vehicle types (their wheel/door data is dumped). F5 was unreliable
+            //   (likely game-bound); F6 is the proven ablation key. Entry log proves it fired.
+            if (Input.GetKeyDown(KeyCode.F6))
+            {
+                Plugin.Logger.LogInfo("[VehProbe] F6 pressed — spawning the next uncollected vehicle batch.");
+                VehicleManager.DevProbeUncollected(5);
+            }
+            // F8: dev money cheat — add $1,000,000 to the local wallet (notice + log).
+            if (Input.GetKeyDown(KeyCode.F8))
+            {
+                MPHub.ApplyMoneyDelta(1_000_000f, "DEV cheat (F8)", true);
+                Plugin.Logger.LogInfo("[DevCheat] F8 — +$1,000,000.");
+            }
+            // F9: dev travel — open the city map in taxi-destination mode (the native
+            // taxi flow, no cab needed): pick a building, the ride charges + warps you
+            // there; the MP instant-arrival machinery applies. Testing mobility helper.
+            if (Input.GetKeyDown(KeyCode.F9))
+            {
+                Plugin.Logger.LogInfo("[DevCheat] F9 — taxi-destination map (dev travel).");
+                // 1.0: ToggleTaxiMode is gone; SetTaxiMode(ITaxi) needs a live taxi, which this
+                // no-cab cheat doesn't have. Disabled rather than half-ported.
+                Plugin.Logger.LogWarning("[DevCheat] F9 dev travel is unavailable on game 1.0 (native taxi-map API changed).");
+            }
+            // F7: dev weather toggle — forces a local rain transition through the
+            // SAME apply path the weather sync uses, so the whole loop (host F7 →
+            // GameTimeSync → client follows) is testable on one rig without
+            // waiting for natural rain.  Also the discovery trigger for the
+            // RainHelper API dump (decompile gap).
+            if (Input.GetKeyDown(KeyCode.F7))
+            {
+                int cur = MPWeatherSync.CurrentRainState();
+                Plugin.Logger.LogInfo($"[DevCheat] F7 — force rain toggle (current={(cur == 1 ? "raining" : cur == 0 ? "dry" : "unknown")}).");
+                MPWeatherSync.TryForceRain(cur != 1);
+            }
+            // F10: Steam-frame self-test — round-trips a 2MB random buffer through
+            // WrapFragment → SteamReassembly (in order AND shuffled) and verifies the
+            // reassembled bytes match.  Validates the fragmentation logic on one rig;
+            // the actual relay behavior still needs a two-rig session.
+            if (Input.GetKeyDown(KeyCode.F10))
+                DevRunSteamFrameSelfTest();
+#endif
+            // Round-98: this whole pre-block ran UNMEASURED (modTicks only covered
+            // Drain/WorldSnap/PosSync*) — the 5s duty scan + staff evaluator and the
+            // puppet tick live here. PreTick umbrella + named sub-brackets so a
+            // periodic field hitch is named or cleared by column.
+            // Round-207c: PreTick named as the sawtooth's dominant cost (48–75ms hitches,
+            // modHeavy=26/33 on the rig) — the umbrella is split into six group brackets
+            // so the next run names the hot GROUP; the winner gets split further.
+            long _pre = MPPerf.Begin();
+            long _sub = MPPerf.Begin();
+            MPContentFingerprint.EnsureCached();   // MAIN THREAD: compute once, well before any connect (crash 2026-07-27)
+            TickThemeCapture();      // frontload native font + rounded sprite (no timing dependency)
+            TickIdentityRecheck();   // H-IDENT-1 r3: per-frame until it has run once (unthrottled, unlike the Steam probe)
+            TickCrashHeartbeat();    // task #5: stamp the session marker with where-we-are (~30s)
+            PlacementWatch.Tick();   // P-PLACEMENT-STRAND: a session-long placement mode is the bug; say so on a cadence
+            MPLifecycle.Tick();      // single-source phase tracker (stage 4: first consumer live)
+            MPPerf.End("Pre.A", _sub);
+            _sub = MPPerf.Begin(); MPRegisterSync.TickDuty(); MPPerf.End("RegDuty", _sub);   // mirror the native Work activity into register duty (1s self-throttle; contains the 5s employee-duty scan + staff evaluator)
+            _sub = MPPerf.Begin();
+            MPHub.TickSalePopups();      // rising +$ worker feedback (per-frame: smooth rise/fade)
+            MPOffers.HostTick();         // round-196: re-send unacked business-transfer finalizes (5s)
+            MPTakeover.Tick();           // round-204b: expire an unanswered takeover offer (6s — older host)
+            MPClient.TickWorldReadyGate();   // round-205: recurring readiness check (content bar + deadline)
+            MPClient.TickBanExit();          // BAN-PLAYERS-1 C1 re-check c2/c3: an in-game ban's exit waits out a load
+            MPClient.TickActivity();         // DEDICATED-AFK-1: pause-menu / idle report to a dedicated host
+            ServerSaveNotice.Tick();         // SAVE-NOTICE-1: "saving on the server" / saved / failed
+            MPFrameRhythm.Tick();            // round-207: frame-rhythm capture (oscillation shape/cadence/beat match)
+            MPPerf.End("Pre.B", _sub);
+            _sub = MPPerf.Begin();
+            PassengerRide.Update();      // passenger ride: click-to-board → pin-to-seat → exit + remote riders
+            ServiceCars.Tick();          // 2026-09-02: private-driver mirrors — prune, owner auto-resume, rider walk → map
+            PassengerHud.Tick();         // passenger's in-ride "Exit Vehicle" panel
+            VehicleStoragePanel.Tick();  // non-owner shared-storage panel (refresh on cargo change / auto-close)
+            TimeSync.TickStartupHold();  // round-36: had NO caller (dead since inception) — the hold's timeScale re-clamp
+            MPClient.TickJoinDownloadReport();   // round-270: throttled world-download percent → host → everyone's overlay
+            MPClient.TickJoinWaitReport();       // JOIN-WAIT-1: say how long a parked mid-game join has been waiting
+            MPClient.TickSettledReport();        // round-271: one-shot 'Settled' phase → host fires the join baseline save
+            GameStateReader.TickPendingNativePause();   // round-36c: converge the pause flag onto the last
+                                                        // requested state (rate-limit drops lost it before)
+            MPPerf.End("Pre.C", _sub);
+            _sub = MPPerf.Begin(); CustomerPuppets.Tick(); MPPerf.End("Puppets", _sub);   // round-41: simulator election (host) + puppet stream/render (both-inside shops)
+            _sub = MPPerf.Begin();
+            MergerSync.TickDropGrace();  // D25: drop the merged-company view when a disconnect outlives the grace
+            MergerFlip.Tick();           // merger slice 3: ownership-flip reconcile (1 Hz) + host state push (10s)
+            MergerEmployeeSync.Tick();   // merger slice 5: schedule write-back scan on flipped shops (2s)
+            SharedShopSchedule.Tick();   // shared-shop management (Business PERMISSION feature, NOT the merger): edit scan + editing sessions (2s)
+            SharedShopStaff.Tick();      // shared-shop management slice 3: owner bench publish (5s) + assignment scan (2s)
+            SharedShopPrices.Tick();     // shared-shop management slice 4: send a price edit after 1 s of quiet
+            SharedShopWorkTabs.Tick();   // shared-shop management slice 6: deferred render of a shared warehouse/factory tab
+            MPNetStats.Tick();           // T0 (throughput audit): per-type bytes/s report every 30 s
+            GameStatePatcher.TickMapFilterDebounce();   // v9 MIN-2: one map refresh after a delta burst goes quiet
+            BusinessSync.TickOwnerBusinessPublish();   // round-190: one owner-business publish at settle (carries logo files; host adopts + re-broadcasts)
+            GameStatePatcher.TickHeldBusinessSnapshot();   // field 20260829-222154: a snapshot that arrived before the world existed applies at settle
+            MPPerf.End("Pre.D", _sub);
+            _sub = MPPerf.Begin();
+            MPFreezeProbe.Tick();        // [MoveFreeze] symptom probe: input-without-motion detector (claim-4 backstop)
+            MPHousingMorale.Tick();      // shared-residence morale: a Housing grant counts as having a home (10s reconcile)
+            MPRegisterSync.TickHideSynthetics();
+            MPRegisterSync.TickContextHeal();   // building-context self-heal (hand-vehicle entry skips the entry hook)
+            ContestedTenancy.TickClient();      // round-162: one-shot native-claims report per world session
+            MPRegisterSync.TickEconDigest();    // [EconProbe] one line per owned business per game-day (2026-07-09)
+            MPRegisterSync.TickDutySummary();   // TEMPORARY: duty-broadcast activation watch, 10m (2026-07-09)
+            TickWorldHealth();                  // one-shot world-integrity line ~30s after scene-ready (2026-07-09)
+            MPPerf.End("Pre.E", _sub);
+            // Round-207d: Pre.F named as the hot group (4.4ms avg / 57ms worst in the
+            // heavy window ≈ all of PreTick) — split per call for the final naming run.
+            _sub = MPPerf.Begin(); RemotePlayerManager.TickVehicleCollisionIgnores(); MPPerf.End("F.CollIgn", _sub);   // per-frame over ent parked≈2200 — prime sweep suspect
+            _sub = MPPerf.Begin(); TickMenuIntegration(); MPPerf.End("F.MenuInt", _sub);
+            _sub = MPPerf.Begin(); MPSaveCoordinator.TickPendingLoad(); MPPerf.End("F.PendLoad", _sub);
+            _sub = MPPerf.Begin(); GameStatePatcher.TickPendingMarketEvents(); MPPerf.End("F.MktEvt", _sub);
+            _sub = MPPerf.Begin(); GameStatePatcher.TickDemandHealth(); MPPerf.End("F.DemHealth", _sub);
+            _sub = MPPerf.Begin(); GameStatePatcher.TickActiveVehicleIdHealth(); MPPerf.End("F.VehIdH", _sub);
+            // Round-207e: F.rest carried the cost (4.3ms/frame avg, 65ms worst) — final
+            // per-call split. Suspicion: a dialog tick doing per-frame work while its
+            // window is open (the lobby window is typically open all session).
+            _sub = MPPerf.Begin(); MPPriceFillProbe.Tick(); MPPerf.End("F.PriceP", _sub);   // PROBE PriceFill (round-101 item 3) — remove when resolved
+            _sub = MPPerf.Begin(); MPDemandProbe.Tick(); MPPerf.End("F.DemP", _sub);        // PROBE Demand (round-102) — remove when resolved
+            _sub = MPPerf.Begin(); CustProbe.Tick(); MPPerf.End("F.CustP", _sub);         // PROBE CustStall (P-CUST-STALL) — remove when resolved
+            // (quiesce-off 4s timer RETIRED 2026-06-11 — stage-4 migration #1:
+            //  the quiesce now ends on the lifecycle WorldReady EVENT; see
+            //  OnLifecyclePhase below.)
+            _sub = MPPerf.Begin(); TickOverlayWatchdog(); MPPerf.End("F.OverW", _sub);      // stuck loading screen over a live world → force-dismiss
+            _sub = MPPerf.Begin(); TickJoinDialog(); MPPerf.End("F.JoinD", _sub);           // Phase 5 — connect-dialog input (when open)
+            _sub = MPPerf.Begin(); TickLobbyWindow(); MPPerf.End("F.Lobby", _sub);          // Phase 5 — lobby window input (when open)
+            TickBanUi();                                                                     // BAN-PLAYERS-1 C2: ban follow-up + 'REMOVED FROM GAME'
+            _sub = MPPerf.Begin(); TickSavePicker(); MPPerf.End("F.SaveP", _sub);           // Phase 5 — save-picker input (when open)
+            StallWatch.Frame();   // P-MIDNIGHT: the per-frame main-thread stamp the stall watchdog reads (rode the retired top-bar report takeover)
+            MPPerf.End("PreTick", _pre);   // round-98: close the pre-block umbrella
+
+            // Overlay-aware freeze gate — freezes once our loading overlay clears
+            // (must run BEFORE TickStartupScreen so the wait screen appears the same
+            // frame we freeze, with no flash of the un-synced world).
+            MPSaveCoordinator.DiagPhase("Update: TickOverlayFreezeGate"); TickOverlayFreezeGate();
+
+            // Startup pause screen — full-screen "waiting for players" overlay
+            TickStartupScreen();
+
+            // Rival-stats freshness (round-25): each machine re-publishes its self-stats every couple of
+            // minutes (client push → host re-broadcasts the merged snapshot to everyone; host pushes its own
+            // directly). Before this, another player's rival sheet only updated when THAT player opened
+            // their own rivals app — arbitrarily stale for every viewer.
+            TickRivalStatsPush();
+
+            // Settings panel — hover tooltips + click-to-type field cursor
+            TickSettingsPanel();
+
+            // Drain the main-thread action queue
+            // NOTE: TickTimeScaleMonitor was moved to LateUpdate so it runs AFTER Unity's
+            // EventSystem processes button clicks (speed buttons, pause, sleep, rest).
+            // EventSystem fires after ALL Update() calls, so Update-phase monitoring is
+            // always 1 frame behind any button-click-driven timeScale change. — runs in ALL scenes (GameManager.Update
+            // only exists in-game; this canvas is DontDestroyOnLoad so it's always active).
+            MPSaveCoordinator.DiagPhase("Update: DrainQueue");
+            long _dq = MPPerf.Begin(); GameStatePatcher.DrainQueue(); MPPerf.End("Drain", _dq);
+
+            // Per-frame clock drift correction (drips small adjustments in if scheduled)
+            MPSaveCoordinator.DiagPhase("Update: TickClockCorrection");
+            TimeSync.TickClockCorrection();
+
+            // Player sync ticks — run regardless of panel visibility or build state
+            MPSaveCoordinator.DiagPhase("Update: TickGameLoadDetect");   TickGameLoadDetect();
+            MPSaveCoordinator.DiagPhase("Update: TickStartupTimeout");   TickStartupTimeout();
+            MPSaveCoordinator.DiagPhase("Update: TickWorldSnapshot");    long _ws = MPPerf.Begin(); TickWorldSnapshot(); MPPerf.End("WorldSnap", _ws);
+            MPSaveCoordinator.DiagPhase("Update: TickPositionSync");     long _ps = MPPerf.Begin(); TickPositionSync(); MPPerf.End("PosSync*", _ps);
+            MPSaveCoordinator.DiagPhase("Update: TickTimeSync");         TickTimeSync();
+            MPSaveCoordinator.DiagPhase("Update: TickMarketSync");       TickMarketSync();
+            MPSaveCoordinator.DiagPhase("Update: TickProfileResend");    TickProfileResend();
+            MPSaveCoordinator.DiagPhase("Update: TickSuppressBlackOverlay"); TickSuppressBlackOverlay(); // backlog #6 fix
+            // (F3-F12 diagnostic toggle tick removed 2026-06-10.)
+            MPSaveCoordinator.DiagPhase("Update: TickMpSave");           TickMpSave();   // Phase 4 — suppress SP autosave, upload saves, host autosave
+            MPSaveCoordinator.DiagPhase("Update: TickCashSync");         TickCashSync(); // Phase 4 — live cash stream to host
+#if BAMP_DEV
+            TickAnimProbe();   // run-animation pipeline snapshot (SP vs host diff)
+#endif
+            MPSaveCoordinator.DiagTick();    // count down the diagnostic window
+
+            // Perf attribution: frame stats + the per-system summary every 10s.
+            // ("PosSync*" wraps the whole sync chain; Probes/Parked/BizHost/etc.
+            //  are subsets of it.  Anything choppy NOT showing in a bracket is
+            //  either the game itself or our Harmony patch bodies.)
+            MPPerf.FrameTick(Time.unscaledDeltaTime);
+
+            // (The build moved to the top of Update — see the 1.0 audit note there.)
+            if (!_built || _canvasGO == null) return;
+            TickCrashReportPopup();
+
+            // The MP window is an IN-GAME widget: auto-shown when a game is live,
+            // forced hidden everywhere else (menu/intro).  F9 toggles it while in
+            // game.  This is what keeps it from lingering after "exit to menu".
+            bool mpInGame = _mpWin != null && IsInGame()
+                          && (MPServer.IsRunning || MPClient.IsConnected);
+            if (!mpInGame && _mpWin != null)
+            {
+                _mpWinVisible = false;
+                if (_mpWin.activeSelf) _mpWin.SetActive(false);
+                _mpChatFocus = false; _chatSuppress = false; _mpDragging = false; _mpOpacityDragging = false; _mpResizing = false;
+                SyncChatNavBlock(false); MPChat.SuppressGameInput = false;
+            }
+            if (mpInGame && !_mpWasInGame)
+            {
+                // Default CLOSED on entering a game (user 2026-06-10) — the
+                // phone Chat button opens it; the badge/pulse signal unread.
+                _mpWinVisible = false; _chatSuppress = false;
+                StyleMpWindow();        // round corners + native font once assets are captured
+                _mpWin!.SetActive(false);
+            }
+            else if (!mpInGame && _mpWasInGame)
+            {
+                _mpWinVisible = false;  // leaving the game → always hide
+                if (_mpWin != null) _mpWin.SetActive(false);
+                _mpChatFocus = false; _chatSuppress = false; _mpDragging = false; _mpOpacityDragging = false; _mpResizing = false;
+                SyncChatNavBlock(false); MPChat.SuppressGameInput = false;
+            }
+            _mpWasInGame = mpInGame;
+
+            // (F10 phone-probe keybind removed 2026-06-10 — phone work done;
+            //  MPPhoneProbe.Run() can be re-wired if ever needed.)
+
+            // (F3 test row removed for release 2026-06-10 — no debug keys ship.)
+
+            // (F7 test-row removed 2026-06-10 — capture complete: offsets are
+            //  zero for all open types; passive RideProbe sampling remains.)
+
+            // BizPhone Chat button: inject once per game scene while MP active;
+            // its click requests an MP-window toggle (same as F9).  The icon
+            // pulses while chat lines are unread (window closed).
+            MPPhoneButton.Tick(IsInGame(), MPServer.IsRunning || MPClient.IsConnected);
+            CwTickClock();   // chat time lines: the game's own day + clock, stamped on each new line (MPChat)
+            MPPhoneButton.TickPulse(_mpWinVisible);
+            MPPhoneButton.TickHubPulse(_hubVisible);
+            if (MPPhoneButton.OpenRequested)
+            {
+                MPPhoneButton.OpenRequested = false;
+                if (mpInGame) ToggleMpWindow();
+            }
+            if (MPPhoneButton.HubOpenRequested)
+            {
+                MPPhoneButton.HubOpenRequested = false;
+                if (mpInGame)
+                {
+                    // Native full-menu app when ready; standalone fallback.
+                    if (_hubVisible) { _hubVisible = false; if (_hubNative) MPHubNativePage.CloseMenu(); }
+                    else ShowHubNative();
+                }
+            }
+            if (MPPhoneButton.AppRequested.Length > 0)
+            {
+                string app = MPPhoneButton.AppRequested;
+                MPPhoneButton.AppRequested = "";
+                if (mpInGame) OpenPhoneApp(app);   // PHONE-PAGES-1
+            }
+
+            // (F9 toggle removed — the BizPhone Chat button + [X] are the toggles.)
+
+            // (Ctrl+S removed — the pause-menu Save now routes to the MP save.)
+
+            // In-game multiplayer window: refresh content + handle its input (drag,
+            // opacity slider, resize, chat) whenever it's visible — independent of
+            // the F8 panel gate below.
+            if (_mpWin != null && _mpWinVisible)
+            {
+                RefreshMpWindow();
+                TickMpWindow();
+            }
+
+            // The only per-frame input left for this canvas is the deep settings /
+            // "Customize" overlay (the F8 panel is gone; the native menu/lobby/F9
+            // window handle everything else, with their own ticks above).
+            if (!_settingsOpen) return;
+
+            var mpScreen = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+
+            // Settings value field — type a number directly into the focused field.
+            if (_editField >= 0)
+            {
+                foreach (char c in Input.inputString)
+                {
+                    if (c == '\b') { if (_editBuffer.Length > 0) _editBuffer = _editBuffer.Substring(0, _editBuffer.Length - 1); }
+                    else if (c == '\n' || c == '\r') { CommitSettingsEdit(); break; }
+                    else if ((c >= '0' && c <= '9') || c == '.' || c == '-') { if (_editBuffer.Length < 12) _editBuffer += c; }
+                }
+            }
+
+            // Settings clicks — steppers, value-field focus, close.
+            if (Input.GetMouseButtonDown(0))
+            {
+                CommitSettingsEdit();   // commit any in-progress typing (click-away)
+                bool done = false;
+                foreach (var h in _settingsHits)
+                    if (RectHit(h.rt, mpScreen)) { h.act(); done = true; break; }
+                if (!done)
+                    for (int fi = 0; fi < _numFields.Count; fi++)
+                        if (RectHit(_numFields[fi].Rt, mpScreen)) { BeginSettingsEdit(fi); done = true; break; }
+                if (!done && RectHit(_rtSettingsClose, mpScreen)) OnCloseSettings();
+            }
+        }
+
+        // ── LateUpdate — runs AFTER all MonoBehaviour.Updates AND EventSystem ──
+        //
+        // Unity processes button-click handlers via the EventSystem, which fires
+        // AFTER all Update() calls in the same frame.  Any timeScale change triggered
+        // by a game UI button (sleep, pause, rest, speed buttons) happens AFTER
+        // Update() has run.  LateUpdate() is therefore the correct place for:
+        //
+        //   1. TickTimeScaleMonitor — detects button-driven timeScale changes in the
+        //      SAME frame they occur, not one frame later.
+        //
+        //   2. EnforcePauseConsensus — re-applies paused state AFTER the monitor has
+        //      updated _pausedPlayers / voted, so it acts on fresh state.
+        //
+        //   3. EnforceSkipSuppression — clamps skip-timeScale in the same frame the
+        //      game sets it, even if set by a non-GameManager MonoBehaviour.
+
+        private static bool _cityUnloadFreezeLogged;   // UMBRELLA-LEAVE-1: once per unload edge, re-armed when the flag clears
+
+        private void LateUpdate()
+        {
+            if (FatalBootBanner != null) return;   // round-254: banner-only mode
+            // SOLE OWNER of the input-suppression flag: computed fresh every
+            // frame from live contributions — a stale latch once locked a
+            // player's keyboard permanently (2026-06-10).
+            MPChat.SuppressGameInput = _chatSuppress || _restUiHover || _loiterUiHover || _hubUiHover || _joinPopHover || _crashReportPopupVisible || _sgOpen || _camOpen || _plOpen || _inOpen || _navOpen || _lvOpen;
+            // Player-movement / click-to-move block — owned here (LateUpdate runs every frame, even
+            // when the MP window is closed) so the bug-report/crash popup blocks input like the chat does.
+            SyncChatNavBlock(_chatSuppress || _crashReportPopupVisible);
+
+            // STICKY MP-game latch: keep native-time suppression engaged across a transient drop+reconnect.
+            // Set true whenever we're in the game scene and hosting or live-connected; NEVER cleared here —
+            // only on exit-to-menu (scene unload) and the offline-fork dismiss. The live IsConnected briefly
+            // reads false on a reconnect, which used to lapse the gate below and let the vanilla skip UI run.
+            if (IsInGame() && (MPServer.IsRunning || MPClient.IsConnected)) MPClient.InMpGame = true;
+
+            if (!MPServer.IsRunning && !MPClient.InMpGame) return;
+
+            // Self-check: surface (throttled) when the sticky flag is the ONLY thing holding suppression —
+            // we're in an MP game but momentarily disconnected (the reconnect window). Confirms the fix holds.
+            if (MPClient.InMpGame && !MPServer.IsRunning && !MPClient.IsConnected
+                && Time.unscaledTime >= _inMpGameHoldLogNext)
+            {
+                _inMpGameHoldLogNext = Time.unscaledTime + 3f;
+                Plugin.Logger.LogInfo("[Skip] InMpGame holding native-time suppression while disconnected (reconnect window).");
+            }
+
+            // The startup hold freezes the game from the moment our loading overlay
+            // clears (TickOverlayFreezeGate) until every player has truly entered.
+            // Enforce it here directly so the freeze never depends on another patch
+            // (the GameManager.Update backup was itself silently dead for a while).
+            // SessionEnded = host lost in-game: same hard freeze, so the MP
+            // character can't keep playing/grinding offline.
+            if (TimeSync.IsStartupHeld || MPClient.SessionEnded)
+            {
+                try { Time.timeScale = 0f; } catch { }
+                return;
+            }
+
+            if (!IsInGame()) return;
+
+            try
+            {
+                // UMBRELLA-LEAVE-1 (C6, decision 49 A): the plain game's clock is paused through the city unload (its exit
+                // menu pauses; LoadingScreen.cs:117 sets 1 only after the load), so scaled waits (a pedestrian's umbrella,
+                // AI/UmbrellaHandler.cs:57) cannot end mid-unload. This pin used to write 1 through the unload - freeze it.
+                // LEAVE-TAXI-1: read BEFORE the taxi step-aside below, so a leave during a taxi ride freezes too (the taxi's
+                // fast-forward no longer runs on through the unload).
+                bool cityUnloading = GameStateReader.CityUnloading();
+                if (!cityUnloading) _cityUnloadFreezeLogged = false;
+                else if (!_cityUnloadFreezeLogged)
+                {
+                    _cityUnloadFreezeLogged = true;
+                    Plugin.Logger.LogInfo("[Pause] clock frozen for the city unload (as the plain game).");
+                }
+
+                // Backlog #5 — during a taxi ride the game intentionally bumps
+                // Time.timeScale to ~8× to fast-forward through the trip.  If
+                // we keep pinning timeScale to 1× the ride takes minutes of
+                // real time; the user perceives it as a lock-up.  Step out of
+                // the way while LocalInTaxi is set — except through a city
+                // unload, which freezes below like any other.
+                if (TrafficSync.LocalInTaxi && !cityUnloading) return;
+
+                // The mod owns Time.timeScale.  The world runs at 1× real-time
+                // always; it stops ONLY for a deliberate manual pause, the
+                // startup load hold or the city unload.  Forcing it here (after the EventSystem and
+                // the game's own Update) overrides menu / bench / bed pauses —
+                // opening a menu no longer stops time for anyone.
+                bool frozen = TimeSync.ManualPaused || TimeSync.IsStartupHeld || cityUnloading;
+                Time.timeScale = frozen ? 0f : 1f;
+
+                // World-clock guardian: taxi 1× clamp + unaccounted-acceleration
+                // net (known skips are suppressed at the TimeMachine patch).
+                if (!frozen)
+                    TickWorldClock();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError($"[UI] LateUpdate error: {ex.Message}");
+            }
+        }
+
+        // ── World clock — the MP time architecture (overhauled 2026-06-10) ────
+        //
+        //   Layer 1 (primary): Patch_TimeMachine_Start_Consensus suppresses
+        //     EVERY native skip at the source; MPRestSync turns long ones into
+        //     consensus votes and the HOST executes sanctioned skips by writing
+        //     the clock directly (clients follow via the regular time sync).
+        //   Layer 2 (taxi): the ride keeps its visual fast-forward, but this
+        //     clamp holds GAME TIME to the measured 1× rate during it.
+        //   Layer 3 (anomaly net): the rate detector below — anything that
+        //     still races the clock is an unaccounted mechanism: pin + warn.
+
+        private const float  WC_SAMPLE_WINDOW = 0.15f;  // s — rate measurement window
+        private const double WC_SKIP_H_PER_S  = 0.20;   // game-h/real-s above this = a skip
+        private const double WC_SETTLE_SLACK  = 0.02;   // game-h — skip considered over below this
+
+        private static double _wcWindowStartHours = -1;
+        private static float  _wcWindowStartReal;
+        private static bool   _wcRejecting;
+        private static double _wcLockHours;
+        // Live 1× clock-rate estimate (game-hours per real-second; EMA over
+        // healthy windows) and the taxi-clamp anchor state.
+        private static double _wcNormalRate = 1.0 / 60.0;
+        private static bool   _wcInTaxiClamp;
+        private static double _wcTaxiAnchorHours;
+        private static float  _wcTaxiAnchorReal;
+        private static float  _inMpGameHoldLogNext;   // throttle for the reconnect-window self-check log
+
+        /// <summary>Resets the world-clock skip detector — call on game (re)load.</summary>
+        private static void ResetWorldClock()
+        {
+            _wcWindowStartHours = -1;
+            _wcRejecting        = false;
+        }
+
+        private static void TickWorldClock()
+        {
+            var (d, h) = GameStateReader.GetGameTime();
+            if (d == 0 && h == 0f) return;            // clock not ready yet
+            double nowHours = d * 24.0 + h;
+            float  realNow  = Time.unscaledTime;
+
+            // TimeSync just wrote the clock (snap or drift drip) — that jump is
+            // AUTHORIZED.  Re-base the sampling window at the new time instead
+            // of treating it as a skip; without this the watchdog reverted every
+            // sync write and the client's clock flickered night↔day forever
+            // (user, 2026-06-12).
+            if (TimeSync.ConsumeClockWrite())
+            {
+                _wcWindowStartHours = -1;             // fresh window from next tick
+                _wcRejecting        = false;
+                return;
+            }
+
+            // Backlog #5 — exempt taxi travel.  The game's TaxiTravel coroutine
+            // genuinely needs to fast-forward the clock to complete the ride;
+            // pinning the clock would lock the player in the cab.  While the
+            // local player is in a taxi we stop measuring rate and stay out of
+            // the way; the moment the ride ends we re-arm the detector at the
+            // post-ride clock (so the new time isn't seen as a skip retroactively).
+            // Consensus skip: the HOST deliberately races the clock and clients
+            // follow it — stand down entirely.
+            if (MPRestSync.SkipActive)
+            {
+                _wcWindowStartHours = nowHours;        // keep window glued to live time
+                _wcWindowStartReal  = realNow;
+                _wcRejecting        = false;
+                _wcInTaxiClamp      = false;
+                return;
+            }
+
+            // Taxi: the ride keeps its local fast-forward (timescale exempt in
+            // LateUpdate — the trip completes in seconds) but GAME TIME flows
+            // at the measured normal rate, so the ride costs the same time it
+            // would for everyone else.  (Overhaul 2026-06-10: replaces the full
+            // exemption that let the rider's clock genuinely race ahead.)
+            if (TrafficSync.LocalInTaxi)
+            {
+                if (!_wcInTaxiClamp)
+                {
+                    _wcInTaxiClamp     = true;
+                    _wcTaxiAnchorHours = nowHours;
+                    _wcTaxiAnchorReal  = realNow;
+                    Plugin.Logger.LogInfo($"[Time] taxi clock clamp ON (1x = {_wcNormalRate * 3600.0:F1} game-min/real-min).");
+                }
+                double expected = _wcTaxiAnchorHours + (realNow - _wcTaxiAnchorReal) * _wcNormalRate;
+                if (nowHours > expected + WC_SETTLE_SLACK) WriteWorldClock(expected);
+                return;
+            }
+            if (_wcInTaxiClamp)
+            {
+                _wcInTaxiClamp      = false;
+                _wcWindowStartHours = -1;              // re-arm the window fresh
+                _wcRejecting        = false;
+                Plugin.Logger.LogInfo("[Time] taxi clock clamp OFF.");
+                return;
+            }
+
+            // Currently rejecting a skip — keep pinning the clock until it settles.
+            if (_wcRejecting)
+            {
+                if (nowHours > _wcLockHours + WC_SETTLE_SLACK)
+                {
+                    WriteWorldClock(_wcLockHours);     // skip still ramping — revert it
+                    return;
+                }
+                _wcRejecting        = false;          // skip stopped — resume normal flow
+                _wcWindowStartHours = -1;
+                Plugin.Logger.LogInfo("[UI] Time skip ended — world clock resumed.");
+                return;
+            }
+
+            if (_wcWindowStartHours < 0)
+            {
+                _wcWindowStartHours = nowHours;
+                _wcWindowStartReal  = realNow;
+                return;
+            }
+
+            float realElapsed = realNow - _wcWindowStartReal;
+            if (realElapsed < WC_SAMPLE_WINDOW) return;
+
+            double rate = (nowHours - _wcWindowStartHours) / realElapsed;
+            if (rate > WC_SKIP_H_PER_S)
+            {
+                // ANOMALY: every known skip is suppressed at the TimeMachine
+                // choke point, so an acceleration reaching here is a mechanism
+                // we haven't accounted for — pin the clock and SHOUT.
+                _wcRejecting = true;
+                _wcLockHours = _wcWindowStartHours;
+                WriteWorldClock(_wcLockHours);
+                Plugin.Logger.LogWarning(
+                    $"[Time] UNACCOUNTED time acceleration ({rate * 60:F1} game-h/min) — " +
+                    $"clock pinned at day {(int)(_wcLockHours / 24.0)} hour {_wcLockHours % 24.0:F2}.  " +
+                    "Report this: a skip mechanism bypassed the TimeMachine patch.");
+            }
+            else
+            {
+                // Healthy 1× window — refine the live normal-rate estimate
+                // (powers the taxi clamp) and slide the window forward.
+                if (rate > 0)
+                    _wcNormalRate = _wcNormalRate * 0.9 + rate * 0.1;
+                _wcWindowStartHours = nowHours;
+                _wcWindowStartReal  = realNow;
+            }
+        }
+
+        /// <summary>Consensus-skip executor entry (MPRestSync, host only):
+        /// advance the authoritative clock to the given total game-minutes.</summary>
+        public static void WriteWorldClockMinutes(double totalMinutes) => WriteWorldClock(totalMinutes / 60.0);
+
+        // ── Rest-vote banner — small top-center overlay, NON-interactive (no
+        // raycast target, no input capture: ignorable while playing). ─────────
+        private TextMeshProUGUI? _restBanner;
+        private GameObject? _restBannerPlate;   // REST-UI-2: the dark plate the banner's text sits on
+        private string _restBannerSig = "\0";
+        private const float DockScale = 1.3f;   // REST-UI-2: the rest dock larger, so its texts can be read
+
+        private void TickRestBanner()
+        {
+            try
+            {
+                int n = MPRestSync.Votes.Count;
+                string sig = n == 0 ? ""
+                    : $"{n}|{MPRestSync.RequiredVotes}|{MPRestSync.SkipActive}|{string.Join(",", MPRestSync.Votes.ConvertAll(v => v.PlayerId + v.Activity + (int)v.GoalMinutes))}";
+                if (sig == _restBannerSig) return;
+                _restBannerSig = sig;
+
+                if (n == 0)
+                {
+                    if (_restBannerPlate != null) _restBannerPlate.SetActive(false);
+                    return;
+                }
+                if (_restBanner == null)
+                {
+                    if (_canvasGO == null) return;
+                    // REST-UI-2: on a dark plate (over the street it was hard to read), the text a child of it
+                    var plate = MakeGO("BAMP_RestBannerPlate", _canvasGO.transform);
+                    var prt = plate.GetComponent<RectTransform>();
+                    prt.anchorMin = prt.anchorMax = new Vector2(0.5f, 1f); prt.pivot = new Vector2(0.5f, 1f);
+                    prt.anchoredPosition = new Vector2(0f, -146f); prt.sizeDelta = new Vector2(900f, 40f);
+                    var pimg = plate.AddComponent<Image>();
+                    pimg.color = new Color(0.07f, 0.08f, 0.11f, 0.86f);
+                    pimg.raycastTarget = false;
+                    var ps = EnsureRoundedSprite();
+                    if (ps != null) { try { pimg.sprite = ps; pimg.type = Image.Type.Sliced; } catch { } }
+                    _restBannerPlate = plate;
+                    var go = MakeGO("BAMP_RestBanner", plate.transform);
+                    var rt = go.GetComponent<RectTransform>();
+                    rt.anchorMin = Vector2.zero; rt.anchorMax = Vector2.one; rt.pivot = new Vector2(0.5f, 0.5f);
+                    rt.offsetMin = new Vector2(14f, 4f); rt.offsetMax = new Vector2(-14f, -4f);
+                    _restBanner = go.AddComponent<TextMeshProUGUI>();
+                    _restBanner.fontSize = 20; _restBanner.alignment = TextAlignmentOptions.Center;
+                    _restBanner.raycastTarget = false;          // never blocks clicks
+                    _restBanner.enableWordWrapping = true;
+                    ApplyFont(_restBanner);
+                }
+                if (_restBannerPlate != null) _restBannerPlate.SetActive(true);
+
+                // For other players: who is requesting the skip, doing what,
+                // until when — plus the count.
+                var sb = new System.Text.StringBuilder();
+                if (MPRestSync.SkipActive)
+                    sb.Append("<color=#8CE08C><b>").Append(Loc.T("gps_rest_skipping", "Skipping time…")).Append("</b></color>  ");
+                else
+                    sb.Append("<color=#FFD27A><b>").Append(Loc.T("gps_rest_votes", "Time skip: {0}/{1} votes", n, MPRestSync.RequiredVotes)).Append("</b></color>  ");
+                for (int i = 0; i < MPRestSync.Votes.Count; i++)
+                {
+                    var v = MPRestSync.Votes[i];
+                    if (i > 0) sb.Append("   ");
+                    sb.Append(Loc.T("gps_rest_vote_line", "{0}: {1} until {2}",
+                        $"<color=#CFE3FF>{MPNames.Resolve(v.PlayerId)}</color>", NiceActivity(v.Activity), MPRestSync.Fmt(v.GoalMinutes)));
+                }
+                _restBanner.text = sb.ToString();
+            }
+            catch { }
+        }
+
+        // REST-UI-2: in the player's language (the dock's title and the banner's lines)
+        private static string NiceActivity(string a) => a switch
+        {
+            "Sleep" => Loc.T("gps_rest_act_sleep", "Sleeping"),
+            "Rest"  => Loc.T("gps_rest_act_rest", "Resting on a bench"),
+            "Work"  => Loc.T("gps_rest_act_work", "Working a shift"),
+            "Workout" => Loc.T("gps_rest_act_workout", "Working out"),
+            "Study" => Loc.T("gps_rest_act_study", "Studying"),
+            "Entertain" => Loc.T("gps_rest_act_entertain", "Relaxing"),
+            "Hygiene" => Loc.T("gps_rest_act_hygiene", "Showering"),
+            "Swimming" => Loc.T("gps_rest_act_swim", "Swimming"),
+            "loitering" => Loc.T("gps_rest_act_loiter", "Fast-forwarding"),   // standing skip vote
+            _ => string.IsNullOrEmpty(a) ? Loc.T("gps_rest_act_rest_any", "Resting") : a.ToLowerInvariant(),
+        };
+
+        // ── Loitering button (user feature 2026-08-26): bottom-left HUD toggle that
+        // opens the rest dock in "Loitering" mode — a skip vote from anywhere, no
+        // seat required, no needs benefit. Icon: assets\BAMP_LoiterIcon.png (user
+        // artwork); tooltip wording user-approved. RectHit pattern like the dock. ──
+        private GameObject? _loiterBtn; private RectTransform? _loiterBtnRT;
+        private GameObject? _loiterTip;
+        private GameObject? _loiterRing;   // active-state frame (user 2026-08-26: the icon stays SOLID always; no alpha states)
+        private bool _loiterUiHover;
+        private bool _loiterBuildFailed;  // review MINOR-6: a build throw must not retry every frame
+
+        private void TickLoiterButton()
+        {
+            try
+            {
+                _loiterUiHover = false;   // recomputed below; EVERY early return must leave it false
+                // Review finding-7: duck under native fullscreen surfaces (the same set the game's
+                // own CityMapCam composes) so the icon never floats over the map/menus.
+                bool nativeFullscreen = false;
+                try { nativeFullscreen = UI.Smartphone.FullMenu.IsOpen || UI.MiniMenu.MiniMenu.IsOpen || CityMap.IsOpen || Scenes.MainMenu.Options.IsVisible; } catch { }
+                // Field 20260901-213253 (user-approved 2026-09-02): while seated the dock owns the vote and this
+                // button's click was silently ignored — a visible control the code ignores. Hide it instead.
+                bool show = IsInGame() && (MPServer.IsRunning || MPClient.IsConnected) && !nativeFullscreen
+                            && !MPRestSync.SeatedForUi;
+                if (_loiterBtn == null)
+                {
+                    if (!show || _canvasGO == null || _loiterBuildFailed) return;
+                    try { BuildLoiterButton(); }
+                    catch (Exception bex)
+                    {
+                        _loiterBuildFailed = true;
+                        // Review N3 + ring round N2: a throw AFTER _loiterBtn (or the tip) was
+                        // created would leave a half-built, hit-testable rect and make this latch
+                        // unreachable — tear everything down fully.
+                        try { if (_loiterBtn != null) Destroy(_loiterBtn); } catch { }
+                        try { if (_loiterTip != null) Destroy(_loiterTip); } catch { }
+                        _loiterBtn = null; _loiterTip = null; _loiterRing = null;
+                        Plugin.Logger.LogWarning($"[Rest] loiter button build failed (giving up): {bex.Message}");
+                    }
+                    if (_loiterBtn == null) return;
+                }
+                if (_loiterBtn!.activeSelf != show) _loiterBtn.SetActive(show);
+                if (!show) { if (_loiterTip != null && _loiterTip.activeSelf) _loiterTip.SetActive(false); return; }
+
+                // User field ruling 2026-08-26: the icon is SOLID at all times — no alpha states.
+                // The active indicator is the purple frame ring behind the tile instead.
+                if (_loiterRing != null && _loiterRing.activeSelf != MPRestSync.Loitering)
+                    _loiterRing.SetActive(MPRestSync.Loitering);
+
+                var mp = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+                bool hover = RectHit(_loiterBtnRT, mp);
+                _loiterUiHover = hover;
+                if (_loiterTip != null && _loiterTip.activeSelf != hover) _loiterTip.SetActive(hover);
+                if (!hover || !Input.GetMouseButtonDown(0)) return;
+                if (MPRestSync.SeatedForUi)
+                {
+                    // The seated dock already owns the vote UI — one line so the click isn't silent.
+                    Plugin.Logger.LogInfo("[Rest] loiter button ignored — seated (the dock owns the vote).");
+                    return;
+                }
+                MPRestSync.SetLoitering(!MPRestSync.Loitering);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Rest] loiter button: {ex.Message}"); }
+        }
+
+        // ── HUD-DODGE-1 (user 2026-11-06, two screenshots from a drive): the version line (y 50) and the fast-forward button
+        //    (y 82) sit in the bottom-left corner, where the game shows its key hints while driving or placing furniture
+        //    (ControlsHintsUI, "Tastenkürzel fürs Fahren") - "Handbremse", "Hupe" and "Blinker" were covered. While those
+        //    hints show, both stand to their right. The fast-forward window opened over the car's own panel at the bottom
+        //    centre (ItemPanelUI); unless the player dragged it somewhere, it now opens above that panel (DockHome). ──
+        private static Player.HUD.ControlHints.ControlsHintsUI? _hintsUi;
+        private static float _hintsFindNext, _dodgeNext;
+        private static readonly Vector3[] _uiCorners = new Vector3[4];
+
+        private void TickHudDodge()
+        {
+            try
+            {
+                float now = Time.unscaledTime;
+                if (now < _dodgeNext) return;
+                _dodgeNext = now + 0.25f;
+                float x = 14f;
+                if (IsInGame())
+                {
+                    if (_hintsUi == null && now >= _hintsFindNext)
+                    {
+                        _hintsFindNext = now + 2f;
+                        _hintsUi = UnityEngine.Object.FindObjectOfType<Player.HUD.ControlHints.ControlsHintsUI>(true);
+                    }
+                    if (_hintsUi != null && _hintsUi.gameObject.activeInHierarchy && ScreenRectOf(_hintsUi, out var hr)
+                        && hr.xMin < Screen.width * 0.25f && hr.yMin < 170f * UiScale)   // in the bottom-left corner, where ours are
+                        x = hr.xMax / UiScale + 10f;
+                }
+                if (_mpVersionTag != null && _mpVersionTag.transform is RectTransform vrt) vrt.anchoredPosition = new Vector2(x, vrt.anchoredPosition.y);
+                if (_loiterBtnRT != null) _loiterBtnRT.anchoredPosition = new Vector2(x, _loiterBtnRT.anchoredPosition.y);
+                if (_loiterTip != null && _loiterTip.transform is RectTransform trt) trt.anchoredPosition = new Vector2(x, trt.anchoredPosition.y);
+            }
+            catch { }
+        }
+
+        /// <summary>HUD-DODGE-1: the screen rectangle (pixels) of everything visible under a piece of the game's UI; false =
+        /// nothing of it shows.</summary>
+        private static bool ScreenRectOf(Component root, out Rect r)
+        {
+            r = default;
+            float xMin = float.MaxValue, yMin = float.MaxValue, xMax = float.MinValue, yMax = float.MinValue;
+            var canvas = root.GetComponentInParent<Canvas>();
+            Camera? cam = canvas != null && canvas.rootCanvas.renderMode != RenderMode.ScreenSpaceOverlay ? canvas.rootCanvas.worldCamera : null;
+            foreach (var g in root.GetComponentsInChildren<Graphic>(false))
+            {
+                if (g == null || !g.enabled || g.color.a < 0.05f) continue;
+                g.rectTransform.GetWorldCorners(_uiCorners);
+                for (int i = 0; i < 4; i++)
+                {
+                    Vector2 p = RectTransformUtility.WorldToScreenPoint(cam, _uiCorners[i]);
+                    xMin = Mathf.Min(xMin, p.x); xMax = Mathf.Max(xMax, p.x);
+                    yMin = Mathf.Min(yMin, p.y); yMax = Mathf.Max(yMax, p.y);
+                }
+            }
+            if (xMin > xMax) return false;
+            r = Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+            return true;
+        }
+
+        /// <summary>HUD-DODGE-1: where the fast-forward window opens when the player never dragged it - bottom centre, and in
+        /// a car (or with anything in the game's item panel there) just above that panel.</summary>
+        private static Vector2 DockHome()
+        {
+            float y = 120f;
+            try
+            {
+                var panel = InstanceBehavior<UI.UIs>.Instance?.playerHUD?.itemPanelUI;
+                if (panel != null && panel.isActiveAndEnabled && ScreenRectOf(panel, out var r) && r.yMin < Screen.height * 0.3f)
+                    y = Mathf.Max(y, r.yMax / UiScale + 8f);
+            }
+            catch { }
+            return new Vector2(0f, y);
+        }
+
+        private void BuildLoiterButton()
+        {
+            var go = MakeGO("BAMP_LoiterBtn", _canvasGO!.transform);
+            _loiterBtn = go;
+            _loiterBtnRT = go.GetComponent<RectTransform>();
+            _loiterBtnRT.anchorMin = _loiterBtnRT.anchorMax = _loiterBtnRT.pivot = new Vector2(0f, 0f);
+            _loiterBtnRT.sizeDelta = new Vector2(44f, 44f);
+            // Review MINOR-5 + ring round N5: the MOD's version tag (which leaks into the in-game
+            // view and is what the user sees there) spans y 50-74 at this x — the RING's 4px
+            // overhang (bottom edge y-4) must clear it too, so the button sits at 82.
+            _loiterBtnRT.anchoredPosition = new Vector2(14f, 82f);
+
+            // Child [0]: the active-state RING — first sibling so it renders BEHIND the icon.
+            // (User field ruling: the icon itself is solid always; state lives in this frame.)
+            _loiterRing = MakeGO("Ring", go.transform);
+            var rrt = _loiterRing.GetComponent<RectTransform>();
+            rrt.anchorMin = Vector2.zero; rrt.anchorMax = Vector2.one;
+            rrt.pivot = new Vector2(0.5f, 0.5f);   // ring round N4: symmetric overhang by statement, not by default
+            rrt.sizeDelta = new Vector2(8f, 8f);   // 4px frame on every side
+            rrt.anchoredPosition = Vector2.zero;
+            var ringImg = _loiterRing.AddComponent<Image>();
+            ringImg.color = new Color(0.66f, 0.56f, 0.85f, 1f);   // the icon's purple, solid
+            // Ring round N1: a bare Image is a SQUARE plate and the icon tile has rounded
+            // corners — use the same rounded-corner source every mod panel uses.
+            var ringSp = EnsureRoundedSprite();
+            if (ringSp != null) { try { ringImg.sprite = ringSp; ringImg.type = Image.Type.Sliced; } catch { } }
+            ringImg.raycastTarget = false;   // ring round N3: the 4px overhang must not eat world clicks
+            _loiterRing.SetActive(false);
+
+            // Child [1]: the icon itself — always solid.
+            var iconGo = MakeGO("Icon", go.transform);
+            var irt = iconGo.GetComponent<RectTransform>();
+            irt.anchorMin = Vector2.zero; irt.anchorMax = Vector2.one;
+            irt.sizeDelta = Vector2.zero; irt.anchoredPosition = Vector2.zero;
+            var img = iconGo.AddComponent<Image>();
+            var sp = MPPhoneButton.LoadIconFile("BAMP_LoiterIcon.png");
+            if (sp != null) { img.sprite = sp; img.preserveAspect = true; }
+            else
+            {
+                // Icon missing on disk — the feature still works: plain dark tile + letter.
+                img.color = new Color(0.16f, 0.17f, 0.22f, 1f);
+                var lbl = MakeGO("Lbl", iconGo.transform);
+                var lrt = lbl.GetComponent<RectTransform>();
+                lrt.anchorMin = Vector2.zero; lrt.anchorMax = Vector2.one; lrt.sizeDelta = Vector2.zero;
+                var lt = lbl.AddComponent<TextMeshProUGUI>();
+                lt.text = "L"; lt.fontSize = 22; lt.alignment = TextAlignmentOptions.Center;
+                ApplyFont(lt);
+            }
+
+            _loiterTip = MakeGO("BAMP_LoiterTip", _canvasGO.transform);
+            var trt = _loiterTip.GetComponent<RectTransform>();
+            trt.anchorMin = trt.anchorMax = trt.pivot = new Vector2(0f, 0f);
+            trt.sizeDelta = new Vector2(300f, 28f);
+            trt.anchoredPosition = new Vector2(14f, 132f);   // above the button AND its ring overhang, never under the cursor
+            var tbg = _loiterTip.AddComponent<Image>();
+            tbg.color = new Color(0.07f, 0.08f, 0.11f, 0.92f);
+            var ttxt = MakeGO("Txt", _loiterTip.transform);
+            var ttrt = ttxt.GetComponent<RectTransform>();
+            ttrt.anchorMin = Vector2.zero; ttrt.anchorMax = Vector2.one;
+            ttrt.sizeDelta = new Vector2(-12f, 0f); ttrt.anchoredPosition = Vector2.zero;
+            var tt = ttxt.AddComponent<TextMeshProUGUI>();
+            tt.text = Loc.T("gps_rest_loiter_tip", "Fast-forward time - vote to skip");   // REST-UI-2 (was "Loitering - vote to skip time")
+            tt.fontSize = 15; tt.alignment = TextAlignmentOptions.MidlineLeft;
+            tt.color = new Color(0.92f, 0.93f, 0.98f, 1f);
+            ApplyFont(tt);
+            _loiterTip.SetActive(false);
+            Plugin.Logger.LogInfo($"[Rest] loiter button built (icon {(sp != null ? "loaded" : "MISSING — letter fallback")}).");
+        }
+
+        // ── Rest dock (v7) — chat-program styling, centered "Rest until".
+        // Left: who-voted checklist (+match).  Center: day (amber when not
+        // today) over a large centered time, nudge row, preset row, toggle.
+        // Header: activity title + X (the native Stop/Cancel). ───────────────
+        private GameObject? _dock;          private RectTransform? _dockRT;
+        private TextMeshProUGUI? _dockTitle, _dockDay, _dockTime, _dockPlayers, _dockSkipLbl;
+        private RectTransform? _dockXRT;
+        private RectTransform? _tgtM1h, _tgtM15, _tgtP15, _tgtP1h, _tgtP1d, _skipToggleRT;   // _tgtP1d: "+1d" (user-approved 2026-09-05)
+        private RectTransform? _dockSellRT;   // BOAT-SELL-DOCK: shown only while sleeping on an owned boat (user-approved 2026-09-05)
+        private RectTransform? _dockNapRT;    // POWERNAP: shown only while lying in a BED and the host allows it (user-approved 2026-09-05)
+        private Image? _dockNapImg;
+        private bool _skipCommitNudge;   // a wake target was adjusted without committing → pulse "Request time skip"
+        private readonly RectTransform?[] _presetRT = new RectTransform?[4];
+        private static readonly int[] PresetHours = { 7, 12, 18, 22 };
+        private readonly RectTransform?[] _matchRT = new RectTransform?[3];
+        private readonly double[] _matchGoal = new double[3];
+        private Image? _skipToggleImg;
+        private double _skipTarget;
+        private bool _restUiHover;
+
+        /// <summary>True while ANY text box owns the keyboard — our chat, the bug-report
+        /// popup, or any focused uGUI input field (the game's sign editor, save name, …).
+        /// The WASD escape hatch must never read typed letters as movement: a report
+        /// typed mid-abandoned-bench-approach clicked CancelRest with the native panel
+        /// GameObject inactive and wedged the activity slot for 46 minutes
+        /// (round-194, field 20260729-220133).</summary>
+        private bool TypingIntoTextField()
+        {
+            if (_mpChatFocus || _crashReportPopupVisible) return true;
+            try
+            {
+                var go = EventSystem.current?.currentSelectedGameObject;
+                if (go != null)
+                {
+                    var tmp = go.GetComponent<TMP_InputField>();
+                    if (tmp != null && tmp.isFocused) return true;
+                    var leg = go.GetComponent<InputField>();
+                    if (leg != null && leg.isFocused) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private void TickRestUI()
+        {
+            try
+            {
+                // SeatedForUi (not Seated): a half-cancelled bench approach
+                // wedged the dock open with no X (user, 2026-06-11).
+                // inActivity = in ANY activity state — drives the escape hatch (always available).
+                // show = the dock's VISIBILITY, DELAYED until the avatar has physically sat down
+                // (AvatarInActivity), so clicking a bench walks you over first instead of popping the
+                // dock instantly. The delay never PREVENTS the dock — AvatarInActivity reads the game's
+                // live state, so once seated it reliably shows.
+                bool inActivity = MPRestSync.SeatedForUi;
+                // Loitering (user feature 2026-08-26): the dock also opens for a standing skip
+                // session. Seated mode WINS — UpdateSeated clears the flag on sit-down, this is
+                // just the same-frame tiebreak.
+                bool loiter = MPRestSync.Loitering && !inActivity;
+                bool show = (inActivity && MPRestSync.AvatarInActivity()) || loiter;
+                _restUiHover = false;   // recomputed below; EVERY early return must leave it false
+
+                // POWERNAP E2 (belt and braces with MPRestSync.UpdateSeated): the nap ends the moment the
+                // local player is no longer in a bed, or the host withdraws the option. Placed ABOVE every
+                // early return below so a hidden dock cannot leave a nap stuck on.
+                if (MPNeedsTuning.PowerNapOn && !(MPNeedsTuning.PowerNapAllowed && MPRestSync.SeatedInBed()))
+                    MPNeedsTuning.SetPowerNap(false);
+
+                // ESCAPE HATCH — independent of any UI existing: movement keys
+                // always stand you up (a half-built dock once trapped a player).
+                // Typed letters are NOT movement (round-194).
+                if (inActivity && !TypingIntoTextField() &&
+                    (Input.GetKeyDown(KeyCode.W) || Input.GetKeyDown(KeyCode.A) ||
+                     Input.GetKeyDown(KeyCode.S) || Input.GetKeyDown(KeyCode.D)))
+                {
+                    Plugin.Logger.LogInfo("[RestDock] movement key — standing up.");
+                    MPRestSync.StandUp();
+                    return;
+                }
+
+                if (_dock == null)
+                {
+                    if (!show || _canvasGO == null || _dockBuildFailed) return;
+                    BuildDock();
+                    if (_dock == null) return;
+                }
+                if (_dock!.activeSelf != show)
+                {
+                    _dock.SetActive(show);
+                    if (show && _dockRT != null) _dockRT.anchoredPosition = ClampDockPos(_dockSavedPos ?? DockHome());   // H-DOCK-1 r2: UI zoom or resolution may have changed since the last open; HUD-DODGE-1: unmoved, it opens above the car's own panel
+                    // RESTDOCK-LOG (bundle 20260903-180322 "rest menu is gone", F-2026-09-05-U): the log could not say whether the
+                    // dock was on screen. One line per flip with every gate value; capped so a flicker cannot flood the log.
+                    if (_dockFlipLogged++ < 200 || _dockFlipLogged % 200 == 0)
+                    {
+                        try { Plugin.Logger.LogInfo($"[RestDock] {(show ? "SHOWN" : "HIDDEN")} (#{_dockFlipLogged}) — {MPRestSync.DescribeDockGate()}"); }
+                        catch { }
+                    }
+                }
+                _restUiHover = false;
+                if (!show) return;
+
+                bool voting = MPRestSync.LocalVoteActive;
+
+                if (_dockTitle != null)
+                    _dockTitle.text = (loiter ? Loc.T("gps_rest_title_loiter", "Fast-forward time") : NiceActivity(MPRestSync.ActivityName)).ToUpperInvariant();   // REST-UI-3: the game's title style
+                // BOAT-SELL-DOCK: the Sell control exists only on the owner's own boat (a SleepActivity on a BoatController the game
+                // marks IsPlayerOwned — read live each tick; never in loitering mode).
+                if (_dockSellRT != null)
+                {
+                    bool boat = !loiter && MPRestSync.SeatedOnOwnBoat();
+                    if (_dockSellRT.gameObject.activeSelf != boat) _dockSellRT.gameObject.SetActive(boat);
+                }
+                // POWERNAP: same slot as Sell — the two can never coincide (a boat is not a bed). Hidden means no
+                // click path at all. ON is shown in the dock's own active colour (the toggle's "voting" green).
+                if (_dockNapRT != null)
+                {
+                    bool nap = !loiter && MPNeedsTuning.PowerNapAllowed && MPRestSync.SeatedInBed();
+                    if (_dockNapRT.gameObject.activeSelf != nap) _dockNapRT.gameObject.SetActive(nap);
+                    if (nap && _dockNapImg != null)
+                        _dockNapImg.color = MPNeedsTuning.PowerNapOn
+                                          ? new Color(0.24f, 0.60f, 0.31f, 1f)    // dock active/pressed colour (skip toggle, voting)
+                                          : CW_BOX;   // REST-UI-3: the nudge buttons' field
+                }
+
+                // The X is UNCONDITIONAL: it used to mirror the game's
+                // per-state cancel-button list, which blinks during activity
+                // transitions and vanished entirely in the wedge (user,
+                // 2026-06-11).  StandUp() already handles the no-cancel-button
+                // case, so the dependency never bought anything.
+                if (_dockXRT != null && !_dockXRT.gameObject.activeSelf)
+                    _dockXRT.gameObject.SetActive(true);
+
+                // Destination time: default is a SHORT wait (now + 1h) — the
+                // old next-morning default silently meant "until tomorrow".
+                double now = MPRestSync.NowMinutes();
+                if (_skipTarget <= 0) _skipTarget = Math.Ceiling((now + 60) / 15.0) * 15.0;
+                double minT = now + 5;
+                if (_skipTarget < minT) _skipTarget = Math.Ceiling(minT / 5.0) * 5.0;
+                double shown = voting ? MPRestSync.LocalGoal : _skipTarget;
+                var (dStr, tStr) = MPRestSync.FmtParts(shown);
+                if (_dockDay != null)
+                {
+                    int dayDiff = (int)(shown / 1440.0) - (int)(now / 1440.0);
+                    _dockDay.text = dayDiff switch
+                    {
+                        0 => Loc.T("gps_rest_today", "today · {0}", dStr),
+                        1 => "<b>" + Loc.T("gps_rest_tomorrow", "tomorrow · {0}", dStr) + "</b>",
+                        _ => "<b>" + Loc.T("gps_rest_in_days", "in {0} days · {1}", dayDiff, dStr) + "</b>",
+                    };
+                }
+                if (_dockTime != null) _dockTime.text = tStr;
+
+                if (_dockSkipLbl != null)
+                    _dockSkipLbl.text = voting ? Loc.T("gps_rest_requested", "Asked - click to call it off") : Loc.T("gps_rest_request", "Fast-forward time");
+                if (voting) _skipCommitNudge = false;   // committed — the nudge did its job
+                if (_skipToggleImg != null)
+                {
+                    // Goonie report (2026-07-09): a player adjusted a wake time and waited — nothing
+                    // happens until "Request time skip" is clicked, and nothing SAID so. Once a target
+                    // is touched without a vote, pulse the commit button gently until it's clicked.
+                    var baseCol = voting ? new Color(0.24f, 0.60f, 0.31f, 1f) : CW_BLUE;   // REST-UI-3: the game's blue
+                    if (!voting && _skipCommitNudge)
+                    {
+                        // Full-swing pulse (user: the soft one was too easy to miss): breathe the button
+                        // all the way to a bright blue-white, ~0.8 Hz — unmissable, layout untouched.
+                        float w = 0.5f + 0.5f * Mathf.Sin(Time.unscaledTime * 5.0f);
+                        baseCol = Color.Lerp(baseCol, new Color(0.48f, 0.80f, 1.0f, 1f), w);
+                    }
+                    _skipToggleImg.color = baseCol;
+                }
+
+                // Left column: compact who-voted checklist + match buttons.
+                if (_dockPlayers != null)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    if (MPRestSync.SkipActive) sb.Append("<color=#8CE08C><b>").Append(Loc.T("gps_rest_skipping", "Skipping time…")).Append("</b></color>\n");
+                    int row = MPRestSync.SkipActive ? 1 : 0, matchIdx = 0;
+                    for (int i = 0; i < 3; i++) { _matchGoal[i] = 0; _matchRT[i]?.gameObject.SetActive(false); }
+                    foreach (var pl in MPRestSync.AllPlayers())
+                    {
+                        bool me = pl == MPConfig.PlayerId;
+                        if (MPRestSync.HasVote(pl, out double g))
+                        {
+                            var (gd, gt) = MPRestSync.FmtParts(g);
+                            sb.Append($"<color=#8CE08C>{pl}{(me ? " " + Loc.T("gps_rest_you", "(you)") : "")}</color>\n<color=#CFE3FF>   {gd} {gt}</color>\n");
+                            if (!me && matchIdx < 3 && _matchRT[matchIdx] != null)
+                            {
+                                _matchGoal[matchIdx] = g;
+                                var mrt = _matchRT[matchIdx]!;
+                                mrt.anchoredPosition = new Vector2(144f, -52f - row * 16f);
+                                mrt.gameObject.SetActive(true);
+                                matchIdx++;
+                            }
+                            row += 2;
+                        }
+                        else
+                        {
+                            sb.Append($"<color=#8A93A6>{pl}{(me ? " " + Loc.T("gps_rest_you", "(you)") : "")} - {Loc.T("gps_rest_novote", "not voted")}</color>\n");
+                            row++;
+                        }
+                    }
+                    _dockPlayers.text = sb.ToString();
+                }
+
+                // Hover + drag + clicks.  (_restUiHover feeds the LateUpdate-
+                // owned suppression flag — never write the flag directly.)
+                var mp = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+                _restUiHover = RectHit(_dockRT, mp) || _dockDragging;
+
+                if (Input.GetMouseButtonUp(0)) _dockDragging = false;
+                if (_dockDragging && _dockRT != null)
+                {
+                    Vector2 d = (mp - _dockDragLast) / UiScale;   // screen px → canvas units (anchoredPosition is canvas units; review F-2026-09-06-E NOTE-4)
+                    _dockDragLast = mp;
+                    _dockRT.anchoredPosition = ClampDockPos(_dockRT.anchoredPosition + d);   // H-DOCK-1: never off screen
+                    _dockSavedPos = _dockRT.anchoredPosition;   // remembered for next open
+                    return;
+                }
+
+                if (!Input.GetMouseButtonDown(0) || !_restUiHover) return;
+
+                if (_dockXRT != null && RectHit(_dockXRT, mp))
+                {
+                    Plugin.Logger.LogInfo($"[Rest] dock X pressed ({(loiter ? "loitering" : MPRestSync.ActivityName)})");
+                    // Loiterers have no activity to stand from — the X ends the loiter session
+                    // (which drops the vote). Seated: unchanged.
+                    if (loiter) MPRestSync.SetLoitering(false);
+                    else        MPRestSync.StandUp();   // StandUp prefers the game's cancel button, falls back otherwise
+                    return;
+                }
+
+                if (RectHit(_dockHdrRT, mp))
+                { _dockDragging = true; _dockDragLast = mp; return; }
+
+                for (int i = 0; i < 3; i++)
+                    if (_matchRT[i] != null && _matchRT[i]!.gameObject.activeSelf && _matchGoal[i] > 0 && RectHit(_matchRT[i], mp))
+                    {
+                        _skipTarget = _matchGoal[i];
+                        MPRestSync.SetSkipRequest(true, _skipTarget);
+                        return;
+                    }
+
+                // BOAT-SELL-DOCK (user-approved 2026-09-05): the game's SellBoat button lives in the native activity panel the mod
+                // hides — the dock carries it for the owner's own boat only (visibility set in TickRestUI). Sell() shows the game's
+                // own confirmation; on confirm the game finishes the activity and completes the sale on this machine.
+                if (_dockSellRT != null && _dockSellRT.gameObject.activeSelf && RectHit(_dockSellRT, mp))
+                {
+                    Plugin.Logger.LogInfo("[Rest] dock click: sell boat → BoatController.Sell (the game's confirmation follows).");
+                    MPRestSync.SellCurrentBoat();
+                    return;
+                }
+                // POWERNAP (user-approved 2026-09-05): local toggle — a second press stops it. No wire traffic:
+                // energy is per-player local state, so there is nothing to arbitrate.
+                if (_dockNapRT != null && _dockNapRT.gameObject.activeSelf && RectHit(_dockNapRT, mp))
+                {
+                    MPNeedsTuning.SetPowerNap(!MPNeedsTuning.PowerNapOn);
+                    Plugin.Logger.LogInfo($"[Rest] dock click: power nap → {(MPNeedsTuning.PowerNapOn ? "ON" : "off")}.");
+                    return;
+                }
+                // Every dock interaction logs ONE line: reporters rarely answer follow-ups, so the
+                // click trail in the log is the interview (Goonie report, 2026-07-09 — a session of
+                // pre-vote preset clicks was completely invisible).
+                double step = 0;
+                if      (RectHit(_tgtM1h, mp)) step = -60;
+                else if (RectHit(_tgtM15, mp)) step = -15;
+                else if (RectHit(_tgtP15, mp)) step = 15;
+                else if (RectHit(_tgtP1h, mp)) step = 60;
+                else if (RectHit(_tgtP1d, mp)) step = 1440;   // "+1d" (user-approved 2026-09-05); no upper bound exists on the target — only minT
+                if (step != 0)
+                {
+                    _skipTarget = Math.Max(minT, (voting ? MPRestSync.LocalGoal : _skipTarget) + step);
+                    if (voting) MPRestSync.SetSkipRequest(true, _skipTarget);
+                    else _skipCommitNudge = true;   // target touched, vote not started → pulse the commit button
+                    var (sd2, st2) = MPRestSync.FmtParts(_skipTarget);
+                    Plugin.Logger.LogInfo($"[Rest] dock click: step {step:+0;-0}m → target {sd2} {st2} (voting={voting}).");
+                    return;
+                }
+                for (int i = 0; i < _presetRT.Length; i++)
+                    if (RectHit(_presetRT[i], mp))
+                    {
+                        _skipTarget = MPRestSync.NextOccurrence(PresetHours[i]);
+                        if (voting) MPRestSync.SetSkipRequest(true, _skipTarget);
+                        else _skipCommitNudge = true;   // ditto — "6:00" alone does not start the wait
+                        var (pd2, pt2) = MPRestSync.FmtParts(_skipTarget);
+                        Plugin.Logger.LogInfo($"[Rest] dock click: preset {PresetHours[i]}:00 → target {pd2} {pt2} (voting={voting}).");
+                        return;
+                    }
+                if (RectHit(_skipToggleRT, mp))
+                {
+                    Plugin.Logger.LogInfo($"[Rest] dock click: skip toggle (voting={voting}, seated={MPRestSync.Seated}).");
+                    if (voting) MPRestSync.SetSkipRequest(false);
+                    else        MPRestSync.SetSkipRequest(true, _skipTarget);
+                }
+            }
+            catch { }
+        }
+
+        private bool _dockBuildFailed;
+        private int _dockFlipLogged;   // RESTDOCK-LOG: show/hide lines, capped per process
+        private Sprite? _dockSprite;
+        // Chat's per-frame contribution to the input-suppression flag (the
+        // flag itself is owned by LateUpdate).
+        private bool _chatSuppress;
+        // Drag + position memory (per session: re-opens where you left it).
+        private RectTransform? _dockHdrRT;
+        private bool _dockDragging;
+        private Vector2 _dockDragLast;
+        private static Vector2? _dockSavedPos;
+
+        /// <summary>H-DOCK-1: keep the rest dock on screen. Pivot/anchor are bottom-centre (0.5, 0), size 700×212: x may roam
+        /// ±(halfScreen − halfDock) (0 on a screen narrower than the dock), y from 0 to screenHeight − dockHeight.</summary>
+        private static Vector2 ClampDockPos(Vector2 p)
+        {
+            float w = Screen.width / UiScale, h = Screen.height / UiScale;
+            float xMax = Mathf.Max(0f, w * 0.5f - 350f * DockScale);
+            float yMax = Mathf.Max(0f, h - 212f * DockScale);
+            return new Vector2(Mathf.Clamp(p.x, -xMax, xMax), Mathf.Clamp(p.y, 0f, yMax));
+        }
+
+        private void BuildDock()
+        {
+            try
+            {
+                _dock = MakeGO("BAMP_RestDock", _canvasGO!.transform);
+                _dockRT = _dock.GetComponent<RectTransform>();
+                _dockRT.anchorMin = _dockRT.anchorMax = _dockRT.pivot = new Vector2(0.5f, 0f);
+                _dockRT.anchoredPosition = new Vector2(0f, 120f);
+                _dockRT.sizeDelta = new Vector2(700f, 212f);
+                _dockRT.localScale = new Vector3(DockScale, DockScale, 1f);   // REST-UI-2: readable (RectHit reads the scale)
+                // Same rounded-corner source the chat window uses: the captured
+                // menu sprite is DEAD in-game — fall back to our immortal one.
+                // REST-UI-3 (user 2026-11-08: "das Vorspulen-Fenster kann an den Stil des Spiels angepasst werden"): the game's card
+                // look, as the chat window has it - soft shadow, solid slate body, light title bar with the dark bold upper-case
+                // title, red square close button, blue buttons; the chat window's own sprites (3 px corners), never a dead native
+                // one. The root stays a transparent click catcher (world clicks stop here); the layout and every hit rect as before.
+                _dockSprite = LRoundSprite(false);
+                var bg = _dock.AddComponent<Image>();
+                bg.color = new Color(0f, 0f, 0f, 0f);
+                var dockShadow = LImg(_dock.transform, "Shadow", new Color(0f, 0f, 0f, 0.35f), LShadowSprite(), 0f);
+                dockShadow.pixelsPerUnitMultiplier = 2f;   // 12 px falloff
+                LStretch(dockShadow.rectTransform, -12f, -16f, -12f, -8f);
+                LStretch(LImg(_dock.transform, "Body", CW_BODY, _dockSprite, 3f).rectTransform, 0f, 0f, 0f, 0f);
+
+                // Restore the last position the player dragged it to.
+                if (_dockSavedPos.HasValue)
+                {
+                    var clamped = ClampDockPos(_dockSavedPos.Value);
+                    if (clamped != _dockSavedPos.Value) Plugin.Logger.LogInfo($"[RestDock] remembered position {_dockSavedPos.Value} was off screen — clamped to {clamped} (H-DOCK-1).");
+                    _dockRT.anchoredPosition = clamped; _dockSavedPos = clamped;
+                }
+
+                // Header band - chat title-bar look; title + red X; DRAG HANDLE.
+                var hdr = MakeGO("Hdr", _dock.transform);
+                _dockHdrRT = hdr.GetComponent<RectTransform>();
+                Stretch(_dockHdrRT, 0f, 0f, 0f, 28f, top: true);
+                var hImg = hdr.AddComponent<Image>();
+                hImg.color = CW_BAR;
+                hImg.sprite = _dockSprite; hImg.type = Image.Type.Sliced; hImg.pixelsPerUnitMultiplier = 10f / 3f;
+                var hLow = LImg(hdr.transform, "Low", CW_BAR, null, 0f).rectTransform;   // squares the bar's bottom corners
+                hLow.anchorMin = Vector2.zero; hLow.anchorMax = new Vector2(1f, 0f); hLow.pivot = new Vector2(0.5f, 0f);
+                hLow.sizeDelta = new Vector2(0f, 4f); hLow.anchoredPosition = Vector2.zero;
+                _dockTitle = MakeLabel(hdr.transform, "", 13, CW_TITLE, 12f, 0f, 520f, 28f, TextAlignmentOptions.Left);
+                ApplyFont(_dockTitle);
+                _dockTitle.fontStyle = FontStyles.Bold;
+                _dockTitle.characterSpacing = 10f;
+                var xImg = LImg(hdr.transform, "Close", CW_CLOSE, _dockSprite, 3f);
+                var xRT = xImg.rectTransform;
+                xRT.anchorMin = xRT.anchorMax = xRT.pivot = new Vector2(1f, 0.5f);
+                xRT.anchoredPosition = new Vector2(-6f, 0f); xRT.sizeDelta = new Vector2(22f, 22f);
+                CwBar(xRT, Color.white, 0f, 0f, 12f, 2f, 45f);
+                CwBar(xRT, Color.white, 0f, 0f, 12f, 2f, -45f);
+                _dockXRT = xRT;
+                xRT.gameObject.SetActive(false);
+
+                // Left column: players header + checklist + match chips.
+                var ph = MakeLabel(_dock.transform, Loc.T("gps_rest_players", "players"), 12, CW_LBL, 14f, -34f, 120f, 14f, TextAlignmentOptions.Left);
+                ApplyFont(ph);
+                _dockPlayers = MakeLabel(_dock.transform, "", 12, C_WHITE, 14f, -52f, 188f, 152f, TextAlignmentOptions.TopLeft);
+                ApplyFont(_dockPlayers);
+                for (int i = 0; i < 3; i++)
+                {
+                    var (mrt, mlbl) = MakeDockButton(Loc.T("gps_rest_match", "match"), default, 56f, CW_BOX, 17f);
+                    mrt.anchorMin = mrt.anchorMax = mrt.pivot = new Vector2(0f, 1f);
+                    mrt.anchoredPosition = new Vector2(144f, -52f - i * 17f);
+                    mlbl.fontSize = 11;
+                    mlbl.color = CW_LBL;
+                    _matchRT[i] = mrt;
+                    mrt.gameObject.SetActive(false);
+                }
+
+                // Divider between players and the time section.
+                var div = MakeGO("Div", _dock.transform);
+                var drt = div.GetComponent<RectTransform>();
+                drt.anchorMin = drt.anchorMax = drt.pivot = new Vector2(0f, 1f);
+                drt.anchoredPosition = new Vector2(212f, -36f);
+                drt.sizeDelta = new Vector2(1.5f, 166f);
+                div.AddComponent<Image>().color = CW_INLINE;
+
+                // Center stack (x 224..686): the clock is the centerpiece.
+                const float CX = 224f, CW = 462f;
+                var until = MakeLabel(_dock.transform, Loc.T("gps_rest_until", "rest until"), 12, CW_LBL, CX, -34f, CW, 14f, TextAlignmentOptions.Center);
+                ApplyFont(until);
+                _dockDay = MakeLabel(_dock.transform, "", 13, CW_LBL, CX, -50f, CW, 18f, TextAlignmentOptions.Center);
+                ApplyFont(_dockDay);
+                _dockTime = MakeLabel(_dock.transform, "", 42, C_WHITE, CX, -64f, CW, 58f, TextAlignmentOptions.Center);
+                ApplyFont(_dockTime);
+                _dockTime.enableWordWrapping = false;
+                _dockTime.overflowMode = TextOverflowModes.Overflow;   // a 42pt line MUST render (48px box truncated it to nothing)
+
+                // Nudges (grey) and presets (blue) - distinct rounded buttons.
+                float bw = 60f, gap = 8f;
+                float rowW = bw * 4 + gap * 3;                       // presets: four buttons
+                float x0 = CX + (CW - rowW) / 2f;
+                float rowW5 = bw * 5 + gap * 4;                      // nudges: five buttons — "+1d" added (user-approved 2026-09-05)
+                float x0n = CX + (CW - rowW5) / 2f;
+                var nudgeCol = CW_BOX;    // REST-UI-3: the game's dark field
+                (_tgtM1h, _) = MakeDockButton("-1h",  new Vector2(x0n,                 68f), bw, nudgeCol, 25f);
+                (_tgtM15, _) = MakeDockButton("-15m", new Vector2(x0n + (bw + gap),     68f), bw, nudgeCol, 25f);
+                (_tgtP15, _) = MakeDockButton("+15m", new Vector2(x0n + (bw + gap) * 2, 68f), bw, nudgeCol, 25f);
+                (_tgtP1h, _) = MakeDockButton("+1h",  new Vector2(x0n + (bw + gap) * 3, 68f), bw, nudgeCol, 25f);
+                (_tgtP1d, _) = MakeDockButton("+1d",  new Vector2(x0n + (bw + gap) * 4, 68f), bw, nudgeCol, 25f);
+                for (int i = 0; i < PresetHours.Length; i++)
+                {
+                    var (prt, plbl) = MakeDockButton($"{PresetHours[i]:D2}:00", new Vector2(x0 + (bw + gap) * i, 38f), bw, CW_BLUE, 25f);
+                    plbl.color = Color.white;
+                    _presetRT[i] = prt;
+                }
+
+                // Toggle - wide, centered.
+                var (tgRT, tgLbl) = MakeDockButton("", new Vector2(CX + (CW - 340f) / 2f, 6f), 340f, CW_BLUE, 27f);
+                _skipToggleRT  = tgRT;
+                _dockSkipLbl   = tgLbl;
+                _skipToggleImg = tgRT.GetComponent<Image>();
+                _dockSkipLbl.fontSize = 15;
+                _dockSkipLbl.fontStyle = FontStyles.Bold;
+                // BOAT-SELL-DOCK (layout user-approved 2026-09-05): bottom-left, the toggle's row, the X's red; the label is the game's
+                // own "Sell" string (key itempanelui_sell — the one SleepActivity uses for its hidden SellBoat button).
+                string sellLbl = "Sell";
+                try { var l = VehicleStoragePanel.Localize("itempanelui_sell"); if (!string.IsNullOrEmpty(l) && l != "itempanelui_sell") sellLbl = l; } catch { }
+                var (sellRT, sellL) = MakeDockButton(sellLbl, new Vector2(14f, 6f), 184f, CW_CLOSE, 27f);
+                sellL.fontSize = 13;
+                _dockSellRT = sellRT;
+                sellRT.gameObject.SetActive(false);   // TickRestUI shows it only while sleeping on an owned boat
+                // POWERNAP (user-approved 2026-09-05): the SAME slot, size and build as Sell — bed and own-boat
+                // never coincide, so the two never fight for it. Background = the nudge buttons' grey.
+                var (napRT, napL) = MakeDockButton(Loc.T("gps_rest_nap", "Power nap"), new Vector2(14f, 6f), 184f, CW_BOX, 27f);
+                napL.fontSize = 13;
+                _dockNapRT  = napRT;
+                _dockNapImg = napRT.GetComponent<Image>();
+                napRT.gameObject.SetActive(false);   // TickRestUI shows it only while lying in a bed with the option on
+
+                _dock.SetActive(false);
+                Plugin.Logger.LogInfo("[RestDock] dock built OK.");
+            }
+            catch (Exception ex)
+            {
+                // A half-built dock trapped a player once (no X, no time) -
+                // never again: log LOUDLY and disable so the hatch (movement
+                // keys) is the only thing that matters.
+                _dockBuildFailed = true;
+                Plugin.Logger.LogError($"[RestDock] BuildDock FAILED: {ex}");
+                try { if (_dock != null) { UnityEngine.Object.Destroy(_dock); _dock = null; } } catch { }
+            }
+        }
+
+        private (RectTransform rt, TextMeshProUGUI lbl) MakeDockButton(string label, Vector2 pos, float w, Color bg, float h = 30f)
+        {
+            var go = MakeGO("BAMP_Dock_" + label + pos.x, _dock!.transform);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = rt.pivot = new Vector2(0f, 0f);
+            rt.anchoredPosition = pos; rt.sizeDelta = new Vector2(w, h);
+            var img = go.AddComponent<Image>();
+            img.color = bg;
+            if (_dockSprite != null) { try { img.sprite = _dockSprite; img.type = Image.Type.Sliced; img.pixelsPerUnitMultiplier = 10f / 3f; } catch { } }   // REST-UI-3: 3 px corners
+            var lbl = MakeLabel(go.transform, label, 12, C_WHITE, 0f, 0f, w, h, TextAlignmentOptions.Center);
+            ApplyFont(lbl);
+            var lrt = lbl.rectTransform; lrt.anchorMin = Vector2.zero; lrt.anchorMax = Vector2.one; lrt.offsetMin = Vector2.zero; lrt.offsetMax = Vector2.zero;
+            return (rt, lbl);
+        }
+
+        // ── F3 test rig REMOVED for public release (2026-06-12): it spawned a
+        // real owned flatbed pre-loaded with sellable stock and was exempt from
+        // the ghost strip, so it persisted into saves — an economy/clutter vector
+        // (sweep finding M1).  The BAMP_TESTRIG strip exemption in
+        // GameStatePatcher is retained as a backstop for any pre-existing save.
+
+        // ── Spawn de-stack v2 (stage-4): every player loads on the SAME spawn
+        // point and the capsules shove each other.  ONE navmesh-validated
+        // sidestep at the WorldReady EVENT — after the game''s placement is
+        // FINAL, so nothing fights it.  The old offset+re-assert pin machinery
+        // (rubberband on first movement; fought save restores) is DELETED.
+        // The spawn is a SIDEWALK strip between road and buildings (user):
+        // candidates ring outward in small steps and only WALKABLE positions
+        // (NavMesh.SamplePosition) qualify — building interiors and bad
+        // directions fail validation and are skipped.
+        private bool _spawnSidestepDone;
+
+        /// <summary>Fresh-character join: warp to the DESIGNATED new-player
+        /// start (gi.LastPlayerPosition's default 215,0,0 — what a normal new
+        /// game uses).  The native placement no-ops on these joins because the
+        /// game's continuous position writer stomps the default during our long
+        /// fenced load (see MPClient.PendingFreshSpawn).</summary>
+        private void ApplyFreshSpawnWarp()
+        {
+            try
+            {
+                if (!MPClient.PendingFreshSpawn) return;
+                MPClient.PendingFreshSpawn = false;
+                var ch = Helpers.PlayerHelper.PlayerController?.Character;
+                if (ch == null) return;
+                var start = new Vector3(215f, 0f, 0f);   // GameInstance.LastPlayerPosition default = designated start
+                if (UnityEngine.AI.NavMesh.SamplePosition(start, out var hit, 25f, -1))
+                {
+                    try { ch.navmeshAgent.Warp(hit.position); }
+                    catch { ch.transform.position = hit.position; }
+                    try { var gi = SaveGameManager.Current; if (gi != null) gi.LastPlayerPosition = hit.position; } catch { }
+                    Plugin.Logger.LogInfo($"[Spawn] fresh join → designated start ({hit.position.x:F1}, {hit.position.y:F1}, {hit.position.z:F1}).");
+                }
+                else Plugin.Logger.LogWarning("[Spawn] fresh join: designated start not on navmesh — left at native placement.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Spawn] fresh-join warp: {ex.Message}"); }
+        }
+
+        private void ApplySpawnSidestep()
+        {
+            try
+            {
+                if (_spawnSidestepDone) return;
+                _spawnSidestepDone = true;
+                // Fresh games only: loaded sessions restore real positions.
+                if (!string.IsNullOrEmpty(MPSaveCoordinator.ActiveSessionName)) return;
+                var players = MPRestSync.AllPlayers();
+                if (players.Count < 2) return;
+                var sorted = new List<string>(players);
+                sorted.Sort(StringComparer.Ordinal);
+                int idx = sorted.IndexOf(MPConfig.PlayerId);
+                if (idx <= 0) { Plugin.Logger.LogInfo($"[Spawn] sidestep: idx={idx} keeps the spot."); return; }
+
+                var ch = Helpers.PlayerHelper.PlayerController?.Character?.transform;
+                if (ch == null) return;
+                var origin = ch.position;
+
+                // Ordered candidates: 8 compass directions × growing rings of
+                // 1.4m; the (idx-1)-th WALKABLE one is this player''s spot.
+                int want = idx - 1, seen = 0;
+                for (int ring = 1; ring <= 3; ring++)
+                {
+                    for (int d = 0; d < 8; d++)
+                    {
+                        float ang = d * Mathf.PI / 4f;
+                        var target = origin + new Vector3(Mathf.Cos(ang), 0f, Mathf.Sin(ang)) * (1.4f * ring);
+                        UnityEngine.AI.NavMeshHit hit;
+                        if (!UnityEngine.AI.NavMesh.SamplePosition(target, out hit, 0.6f, UnityEngine.AI.NavMesh.AllAreas)) continue;
+                        if (Mathf.Abs(hit.position.y - origin.y) > 1f) continue;   // no roofs/basements
+                        if (seen++ < want) continue;
+                        ch.position = hit.position;
+                        try { Physics.SyncTransforms(); } catch { }
+                        Plugin.Logger.LogInfo($"[Spawn] sidestep: idx={idx} → walkable offset ({hit.position.x - origin.x:F1},{hit.position.z - origin.z:F1}) ring={ring}.");
+                        return;
+                    }
+                }
+                Plugin.Logger.LogWarning("[Spawn] sidestep: no walkable candidate found — staying put (stacked spawn).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Spawn] sidestep: {ex.Message}"); }
+        }
+
+        // ── Mid-game join approval (HOST): requests park at the door; this
+        //    RIGHT-SIDE panel lists them — each approved/rejected separately,
+        //    pulsing briefly on arrival (obvious, but out of the action). ────
+        private GameObject? _joinPop;
+        private RectTransform? _joinPopRT;
+        private bool _joinPopHover;
+        private string _joinPopSig = "";
+        private float _joinPopPulseUntil;
+        private readonly List<(RectTransform rt, int peerId, bool accept)> _joinPopBtns = new();
+
+        private void TickJoinPopup()
+        {
+            try
+            {
+                _joinPopHover = false;
+                if (!MPServer.IsRunning) { if (_joinPop != null && _joinPop.activeSelf) _joinPop.SetActive(false); return; }
+                var pending = MPServer.PendingJoinList;
+                if (pending.Count == 0)
+                {
+                    _joinPopSig = "";
+                    if (_joinPop != null && _joinPop.activeSelf) _joinPop.SetActive(false);
+                    return;
+                }
+                if (_canvasGO == null) return;
+                var sprite = IsAlive(_panelSprite) ? _panelSprite : EnsureRoundedSprite();
+                if (_joinPop == null)
+                {
+                    _joinPop = MakeGO("BAMP_JoinPop", _canvasGO.transform);
+                    _joinPopRT = _joinPop.GetComponent<RectTransform>();
+                    _joinPopRT.anchorMin = _joinPopRT.anchorMax = new Vector2(1f, 0.72f);
+                    _joinPopRT.pivot = new Vector2(1f, 1f);
+                    _joinPopRT.anchoredPosition = new Vector2(-14f, 0f);
+                    _joinPopRT.sizeDelta = new Vector2(380f, 80f);
+                    var bg = _joinPop.AddComponent<Image>();
+                    bg.color = new Color(0.10f, 0.11f, 0.15f, 0.97f);
+                    if (sprite != null) { try { bg.sprite = sprite; bg.type = Image.Type.Sliced; } catch { } }
+                }
+                // Rebuild rows when the queue changes. Round-253b: the mismatch marker is
+                // part of the signature so a row rebuilds if the mod-diff state changes.
+                string sig = "";
+                foreach (var p in pending) sig += p.peerId + "|" + p.playerId + "|" + (MPServer.ModMismatchByPlayer.ContainsKey(p.playerId) ? "m" : "") + ";";
+                if (sig != _joinPopSig)
+                {
+                    bool newcomer = sig.Length > _joinPopSig.Length;
+                    _joinPopSig = sig;
+                    if (newcomer) _joinPopPulseUntil = Time.unscaledTime + 2.5f;
+                    _joinPopBtns.Clear();
+                    for (int i = _joinPop!.transform.childCount - 1; i >= 0; i--)
+                        UnityEngine.Object.Destroy(_joinPop.transform.GetChild(i).gameObject);
+                    var hdrLbl = MakeLabel(_joinPop.transform, "<b>JOIN REQUESTS</b>", 13, C_LBLGREY, 14f, -8f, 240f, 20f, TextAlignmentOptions.Left);
+                    ApplyFont(hdrLbl);
+                    int shown = Math.Min(pending.Count, 4);
+                    for (int i = 0; i < shown; i++)
+                    {
+                        float y = -32f - i * 40f;
+                        // Round-253b (user test): the approval row now carries the mod-diff
+                        // verdict inline, so a mid-game host decides with the info in view.
+                        string mm = MPServer.ModMismatchByPlayer.TryGetValue(pending[i].playerId, out var md)
+                            ? $"\n<size=10><color=#E8B858>mods differ: +{md.extra} / -{md.missing}</color></size>" : "";
+                        var nm = MakeLabel(_joinPop.transform, $"<b>{pending[i].playerId}</b>{mm}", 13, C_WHITE, 14f, y - 6f, 176f, mm.Length > 0 ? 34f : 26f, TextAlignmentOptions.Left);
+                        ApplyFont(nm);
+                        var (aRT, aLbl) = MakeHubButton("accept", Vector2.zero, 78f, new Color(0.24f, 0.50f, 0.33f, 1f), 28f, sprite, _joinPop.transform);
+                        SetTopLeft(aRT, 196f, y); aLbl.fontSize = 12;
+                        var (dRT, dLbl) = MakeHubButton("reject", Vector2.zero, 78f, new Color(0.45f, 0.24f, 0.22f, 1f), 28f, sprite, _joinPop.transform);
+                        SetTopLeft(dRT, 282f, y); dLbl.fontSize = 12;
+                        _joinPopBtns.Add((aRT, pending[i].peerId, true));
+                        _joinPopBtns.Add((dRT, pending[i].peerId, false));
+                    }
+                    if (pending.Count > shown)
+                    {
+                        var more = MakeLabel(_joinPop.transform, $"<color=#9AA3B2>… and {pending.Count - shown} more waiting</color>", 12, C_LBLGREY, 14f, -32f - shown * 40f - 4f, 320f, 18f, TextAlignmentOptions.Left);
+                        ApplyFont(more);
+                    }
+                    _joinPopRT!.sizeDelta = new Vector2(380f, 40f + shown * 40f + (pending.Count > shown ? 24f : 0f));
+                }
+                if (!_joinPop!.activeSelf) _joinPop.SetActive(true);
+                // Attention = COLOR glow, not scale: a scale pulse moved the
+                // buttons under the cursor (user feedback, 2026-06-11).
+                var bgImg = _joinPop.GetComponent<Image>();
+                if (bgImg != null)
+                {
+                    float k = Time.unscaledTime < _joinPopPulseUntil
+                        ? (0.5f + 0.5f * Mathf.Sin(Time.unscaledTime * 7f)) * 0.8f : 0f;
+                    bgImg.color = Color.Lerp(new Color(0.10f, 0.11f, 0.15f, 0.97f),
+                                             new Color(0.17f, 0.32f, 0.55f, 0.99f), k);
+                }
+                _joinPop.transform.localScale = Vector3.one;
+
+                var mp = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+                _joinPopHover = RectHit(_joinPopRT, mp);
+                if (!Input.GetMouseButtonDown(0) || !_joinPopHover) return;
+                foreach (var (rt, peerId, accept) in _joinPopBtns)
+                    if (RectHit(rt, mp))
+                    {
+                        if (accept) MPServer.AcceptPendingJoin(peerId);
+                        else MPServer.RejectPendingJoin(peerId);
+                        _joinPopSig = "";   // force row rebuild
+                        return;
+                    }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[JoinPop] {ex.Message}"); }
+        }
+        // (Legacy-pane lobby kick removed 2026-06-11 — the real kick [X] lives in the native lobby window roster rows.)
+
+        // ── Honorary-degree training dialog (user spec 2026-06-12) ────────────
+        // School door → confirm GUI with course + FULL cost; Accept charges the
+        // whole remaining course (native tuition transaction, tax deductible)
+        // and credits completion through the same fields + event the game's own
+        // StudyActivity.Finish uses.  Cancel walks away free.
+        private static object? _trainPending;            // intercepted StudyActivity
+        public  static void RequestTrainingDialog(object studyActivity) => _trainPending = studyActivity;
+        private GameObject?    _trainPop;
+        private RectTransform? _trainPopRT, _trainAcceptRT, _trainCancelRT;
+        private object?        _trainShownFor;
+
+        private void TickTrainingPopup()
+        {
+            try
+            {
+                if (_trainPending == null)
+                {
+                    if (_trainPop != null && _trainPop.activeSelf) _trainPop.SetActive(false);
+                    _trainShownFor = null;
+                    return;
+                }
+                var act = _trainPending;
+                var settings = MPReflect.Get(act.GetType(), act, "_diplomaData") as DiplomaData;   // 1.0: DiplomaSettings became DiplomaData
+                var diploma  = MPReflect.Get(act.GetType(), act, "_diploma") as Diploma;
+                if (settings == null || diploma == null) { _trainPending = null; return; }
+                // Prerequisite gate: an advanced course can't be taken until its
+                // required diploma is held.  Native StudyActivity.StartStudying (and
+                // BizManSettings) enforce exactly this; our honorary-degree dialog
+                // bypasses the native start, so mirror the check here for the local
+                // player or a client could buy a course out of order.
+                if (settings.requiredDiploma != DiplomaName.Undefined
+                    && !EducationHelper.HasCompletedDiploma(settings.requiredDiploma))
+                {
+                    try { UI.Notification.Notifications.Show(UI.Notification.NotificationType.Error,
+                        $"Requires the {settings.requiredDiploma} course first."); } catch { }
+                    _trainPending = null; return;
+                }
+                int remaining = settings.requiredMinutes - diploma.minutesStudied;   // 1.0: minutes are stored directly
+                if (remaining <= 0)
+                {
+                    try { UI.Notification.Notifications.Show(UI.Notification.NotificationType.Info, "Course already completed."); } catch { }
+                    _trainPending = null; return;
+                }
+                int cost = Mathf.CeilToInt(remaining / 60f * settings.pricePerHour);
+                string course = diploma.name.ToString();
+
+                if (!ReferenceEquals(_trainShownFor, act))
+                {
+                    _trainShownFor = act;
+                    var sprite = IsAlive(_panelSprite) ? _panelSprite : EnsureRoundedSprite();
+                    if (_trainPop == null)
+                    {
+                        _trainPop = MakeGO("BAMP_TrainPop", _canvasGO.transform);
+                        _trainPopRT = _trainPop.GetComponent<RectTransform>();
+                        _trainPopRT.anchorMin = _trainPopRT.anchorMax = new Vector2(0.5f, 0.55f);
+                        _trainPopRT.pivot = new Vector2(0.5f, 0.5f);
+                        _trainPopRT.anchoredPosition = Vector2.zero;
+                        _trainPopRT.sizeDelta = new Vector2(430f, 150f);
+                        var bg = _trainPop.AddComponent<Image>();
+                        bg.color = new Color(0.10f, 0.11f, 0.15f, 0.97f);
+                        if (sprite != null) { try { bg.sprite = sprite; bg.type = Image.Type.Sliced; } catch { } }
+                    }
+                    for (int i = _trainPop.transform.childCount - 1; i >= 0; i--)
+                        UnityEngine.Object.Destroy(_trainPop.transform.GetChild(i).gameObject);
+                    var hdr = MakeLabel(_trainPop.transform, $"<b>TRAINING — {course}</b>", 14, C_WHITE, 16f, -10f, 398f, 22f, TextAlignmentOptions.Left);
+                    ApplyFont(hdr);
+                    var body = MakeLabel(_trainPop.transform,
+                        $"Full course: {remaining / 60}h {remaining % 60:D2}m studied instantly\nTotal cost: <b>${cost:N0}</b> (honorary degree)",
+                        13, C_LBLGREY, 16f, -36f, 398f, 44f, TextAlignmentOptions.Left);
+                    ApplyFont(body);
+                    var (aRT, aLbl) = MakeHubButton("accept", Vector2.zero, 120f, new Color(0.24f, 0.50f, 0.33f, 1f), 32f, sprite, _trainPop.transform);
+                    SetTopLeft(aRT, 85f, -102f); aLbl.fontSize = 13;
+                    var (cRT, cLbl) = MakeHubButton("cancel", Vector2.zero, 120f, new Color(0.45f, 0.24f, 0.22f, 1f), 32f, sprite, _trainPop.transform);
+                    SetTopLeft(cRT, 225f, -102f); cLbl.fontSize = 13;
+                    _trainAcceptRT = aRT; _trainCancelRT = cRT;
+                }
+                if (!_trainPop!.activeSelf) _trainPop.SetActive(true);
+                _trainPop.transform.localScale = Vector3.one;
+
+                if (!Input.GetMouseButtonDown(0)) return;
+                var mp = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+                if (_trainCancelRT != null && RectHit(_trainCancelRT, mp)) { _trainPending = null; return; }
+                if (_trainAcceptRT == null || !RectHit(_trainAcceptRT, mp)) return;
+
+                // Mirror StudyActivity.Finish()'s bookkeeping for the FULL course.
+                var data = new System.Collections.Generic.Dictionary<string, string>
+                {
+                    { "diplomaName", course },
+                    { "hours",   (remaining / 60).ToString() },
+                    { "minutes", (remaining % 60).ToString() },
+                    { "taxDeductibleName", "ba:businesstype_school" },   // 1.0 added the "ba:" prefix (StudyActivity.cs:202 SetTaxDeductibleName); 0.11 had none. Consumer TaxHelper.cs:285 uses this string verbatim as the deduction bucket key, so the old value filed tuition into an orphan bucket with no localization — silently, no exception.
+                };
+                bool paid = false;
+                try
+                {
+                    paid = GameManager.ChangeMoneySafe(-cost,
+                        new TransactionInfo("ba:transaction_tuitionfee", data, isTaxDeductible: true),
+                        null, null, force: false, showNotification: true);   // H-TRAIN-1 (bundle 20260903-142107): the GAME's own insufficient-money notice — the silent decline read as "Accept does nothing"
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Train] charge: {ex.Message}"); }
+                if (paid)
+                {
+                    diploma.minutesStudied = settings.requiredMinutes;   // 1.0: minutes stored directly
+                    diploma.completed = true;
+                    try { GameEvent.Invoke("ba:gameevent_diplomagranted"); } catch { }
+                    try { UI.Notification.Notifications.Show(UI.Notification.NotificationType.Success, $"Honorary degree purchased — {course}"); } catch { }
+                    Plugin.Logger.LogInfo($"[Train] honorary degree '{course}' purchased: ${cost} for {remaining} course-minute(s).");
+                }
+                else Plugin.Logger.LogInfo($"[Train] purchase declined (insufficient funds for ${cost}).");
+                _trainPending = null;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Train] {ex.Message}"); _trainPending = null; }
+        }
+
+        private void SetTopLeft(RectTransform? rt, float x, float y)
+        {
+            if (rt == null) return;
+            rt.anchorMin = rt.anchorMax = rt.pivot = new Vector2(0f, 1f);
+            rt.anchoredPosition = new Vector2(x, y);
+        }
+
+        private (RectTransform rt, TextMeshProUGUI lbl) MakeHubButton(string label, Vector2 pos, float w, Color bg, float h, Sprite? sprite, Transform? parent = null)
+        {
+            // Explicit parent for non-hub callers (join popup etc.) — the _hub
+            // default threw when the hub hadn't been built yet (popup no-show).
+            var host = parent ?? _hub?.transform ?? _canvasGO!.transform;
+            var go = MakeGO("BAMP_Hub_" + label + pos.x, host);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = rt.pivot = new Vector2(0f, 0f);
+            rt.anchoredPosition = pos; rt.sizeDelta = new Vector2(w, h);
+            var img = go.AddComponent<Image>();
+            img.color = bg;
+            if (sprite != null) { try { img.sprite = sprite; img.type = Image.Type.Sliced; } catch { } }
+            var lbl = MakeLabel(go.transform, label, 11, C_WHITE, 0f, 0f, w, h, TextAlignmentOptions.Center);
+            ApplyFont(lbl);
+            var lrt = lbl.rectTransform; lrt.anchorMin = Vector2.zero; lrt.anchorMax = Vector2.one; lrt.offsetMin = Vector2.zero; lrt.offsetMax = Vector2.zero;
+            return (rt, lbl);
+        }
+
+        private static void WriteWorldClock(double totalHours)
+        {
+            if (totalHours < 0) totalHours = 0;
+            int   day  = (int)(totalHours / 24.0);
+            float hour = (float)(totalHours - day * 24.0);
+            GameStateReader.SetGameTime(day, hour);
+        }
+
+        // ── Game-load detection & player sync ─────────────────────────────────
+
+        private static bool IsInGame()
+        {
+            try { return SaveGameManager.Current != null && PlayerHelper.PlayerController != null; }
+            catch { return false; }
+        }
+
+#if BAMP_DEV
+        private float _animProbeNext;
+        private Vector3 _animProbeLastPos;
+        private Vector3 _animProbeLastPosH;
+        private Vector3 _animProbeLastPosA;
+        /// <summary>DEV anim probe — every 0.5s in-game (tagged SP/HOST/CLIENT), logs
+        /// the local player's run-animation pipeline: NavMeshAgent (is it moving?) →
+        /// Animator state (enabled/speed/cull/updateMode) → every FLOAT param (the
+        /// locomotion drivers) → current state per layer (hash + normalizedTime, so
+        /// we can see if it's frozen).  Run in SP (works) then host (broken) and diff
+        /// the lines: the field that differs is where the chain breaks.</summary>
+        // DIAG:INVESTIGATION(anim-norun) — open "no running animation" host bug. Called only
+        //   under #if BAMP_DEV; remove when that bug is closed. See docs/DIAGNOSTICS.md.
+        private void TickAnimProbe()
+        {
+            if (!IsInGame()) return;
+            if (Time.unscaledTime < _animProbeNext) return;
+            _animProbeNext = Time.unscaledTime + 0.5f;
+            try
+            {
+                var ch = PlayerHelper.PlayerController?.Character;
+                if (ch == null) return;
+                var model = ch.transform.Find("Model");
+                var anim  = (model != null ? model.GetComponent<Animator>() : null) ?? ch.GetComponentInChildren<Animator>();
+                var agent = ch.GetComponent<UnityEngine.AI.NavMeshAgent>();
+                string role = MPServer.IsRunning ? "HOST" : (MPClient.IsConnected ? "CLIENT" : "SP");
+
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[AnimProbe/{role}] ");
+                sb.Append(agent == null ? "agent=NULL"
+                    : $"agent(en={agent.enabled},onMesh={agent.isOnNavMesh},vel={agent.velocity.magnitude:F2},hasPath={agent.hasPath})");
+                if (anim == null) { sb.Append(" anim=NULL"); Plugin.Logger.LogInfo(sb.ToString()); return; }
+                sb.Append($" anim(en={anim.enabled},speed={anim.speed:F2},root={anim.applyRootMotion},upd={anim.updateMode},cull={anim.cullingMode})");
+                // Did the character actually translate, and is the game suppressing input?
+                // Three position sources: the Character root (what locomotion/the
+                // probe read), the game's reported player pos, and the Animator's
+                // own transform (the visible Model).  The one that moves while the
+                // others don't is where the disconnect is.  chId catches a stale ref.
+                var pos = ch.transform.position;
+                float movedC = _animProbeLastPos == default ? 0f : (pos - _animProbeLastPos).magnitude;
+                _animProbeLastPos = pos;
+                Vector3 posH = pos; try { posH = PlayerHelper.GetPosition(); } catch { }
+                float movedH = _animProbeLastPosH == default ? 0f : (posH - _animProbeLastPosH).magnitude;
+                _animProbeLastPosH = posH;
+                var posA = anim.transform.position;
+                float movedA = _animProbeLastPosA == default ? 0f : (posA - _animProbeLastPosA).magnitude;
+                _animProbeLastPosA = posA;
+                bool hasInput = false; try { hasInput = GameManager.HasInputSelected(); } catch { }
+                sb.Append($" chId={ch.GetInstanceID()} movedRoot={movedC:F2} movedPlayerPos={movedH:F2} movedModel={movedA:F2} posRoot=({pos.x:F1},{pos.z:F1}) posPlayer=({posH.x:F1},{posH.z:F1}) input(supp={MPChat.SuppressGameInput},hasInput={hasInput})");
+                var ps = anim.parameters;
+                for (int i = 0; i < ps.Length; i++)
+                    if (ps[i].type == AnimatorControllerParameterType.Float)
+                        sb.Append($" {ps[i].name}={anim.GetFloat(ps[i].name):F2}");
+                for (int l = 0; l < anim.layerCount && l < 3; l++)
+                {
+                    var st = anim.GetCurrentAnimatorStateInfo(l);
+                    sb.Append($" L{l}(hash={st.fullPathHash},nt={(st.normalizedTime % 1f):F2},w={anim.GetLayerWeight(l):F2})");
+                }
+                Plugin.Logger.LogInfo(sb.ToString());
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[AnimProbe] {ex.Message}"); }
+        }
+#endif
+
+        private static float _rivalStatsNextPush;
+        private void TickRivalStatsPush()
+        {
+            if (Time.unscaledTime < _rivalStatsNextPush) return;
+            _rivalStatsNextPush = Time.unscaledTime + 120f;
+            if (!IsInGame()) return;
+            try
+            {
+                if (MPClient.IsConnected)     MPClient.SendRivalsStatsRequest();       // self-report; host broadcasts merged snapshot on receipt
+                else if (MPServer.IsRunning)  MPServer.BroadcastRivalsStatsSnapshot(); // host-only session: push host stats to any joiners
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[UI] TickRivalStatsPush: {ex.Message}"); }
+        }
+
+        private void TickGameLoadDetect()
+        {
+            bool inGame = IsInGame();
+            if (inGame && !_wasInGame)
+            {
+                Plugin.Logger.LogInfo("[UI] Game scene loaded — player sync active.");
+                MPSaveCoordinator.EnsurePortraitFolderForWorld("scene-loaded");   // DISK-JUNK: switch the portrait redirect on BEFORE the top bar's self-heal draws (Topbar.LoadPortrait runs off the game-loaded callback)
+                // Quiesce ends a few seconds LATER: resuming the stream the
+                // same frame killed the game's load-finish fade (2 GM NREs at
+                // exactly quiesce-OFF; loading screen never faded, 2026-06-11).
+                // (4s quiesce timer retired — WorldReady event owns it now)
+
+                // Fresh world-clock skip detector + appearance state for this session.
+                ResetWorldClock();
+                TimeSync.ResetClockState();   // drop any leftover MP clock catch-up / ahead-hold so a fresh game (SP or a new MP session) doesn't inherit it
+            OptionsGuard.OnSceneReset();  // SPEED-SHARED: drop the previous session's clock speed; out of a session, hand this machine its own Game speed preference back
+                TrafficSync.Reset();
+                ParkedVehicleSync.Reset();
+                MPRegisterSync.Reset();   // duty posts die with the scene
+                // Audit 2026-08-26: this Reset EXISTED, said "reset state on host shutdown / new game
+                // start", and was called by NOTHING — so OwnerOpenByAddress (owner-open truth, keyed by
+                // ADDRESS) survived into the next session, BEAT the real schedule check in
+                // Patch_IsBusinessOpen_OwnerTruth, and was re-published as authoritative by
+                // BusinessSync.ReadInfo. Clearing is FAIL-SAFE: an absent entry falls through to the
+                // game's own check (MPPatches.cs:3561) and the 30s re-assert refills the table. NOT
+                // clearing is fail-WRONG. Unlike GrantSync below, nothing here is a durable restored
+                // store — every field is a send-side cache or re-asserted sync data.
+                BusinessSync.Reset();
+                MPFreezeProbe.Reset();    // freeze-episode state dies with the scene
+                MPPatches.Patch_LoudSpeakers_FailureLatch.ResetForScene();   // the shield's latch is per-process; what it disables dies with the scene (audit 2026-08-26)
+                MPHousingMorale.Reset();  // morale-reconcile log state dies with the scene
+                HamptonsAccess.Reset();   // registration→address cache, per-address log latches and the tenancy flip die with the scene
+                PassengerSync.Reset();    // passenger seats/locks die with the scene
+                MergerSync.ResetSceneState(); // merger runtime + pending-proposal UI state (same lifecycle as grants)
+                MergerFlip.Reset();           // H-MERGEROWNFLIP-1: flip table cleared only if a DIFFERENT save is loaded (same save = regs survived, parked ids kept)
+                MergerEmployeeSync.Reset();   // schedule write-back baselines die with the regs too (slice 5)
+                SharedShopSchedule.Reset();   // shared-shop editing baselines + sessions die with the regs (permission feature)
+                SharedShopStaff.Reset();      // shared-shop staffing state (permission feature)
+                SharedShopPrices.Reset();     // shared-shop pricing state (permission feature)
+                SharedShopWorkTabs.Reset();   // shared-shop warehouse/factory tab state (permission feature)
+                MPNetStats.Reset();           // T0 byte counters die with the scene
+                GrantSync.ResetSceneState();  // runtime grants + local caches die with the scene; the DURABLE store
+                                              // survives — its lifecycle is session boundaries (StartNewGame /
+                                              // manifest restore), NOT scene loads. The old full Reset() here fired
+                                              // after the load-time restore and wiped every restored grant → "shares
+                                              // lost on load" + the join-refresh persisted 0 over the manifest (2026-06-30).
+                MPServer.RebuildGrantsAfterSceneReset();  // host: immediate store→runtime rebuild + re-broadcast, so
+                                              // enforcement never depends on which machine's scene finishes first
+                InteriorSync.Reset();     // interior subs + owner-snapshot caches die with the scene — a prior session's Authoritative=true snapshot must not bleed into a new world (was never wired up)
+                ContestedTenancy.ResetSession();   // round-238: claims/resolutions/pending adoptions are per-world — declared in round-162, never wired until now (a client's 2nd world in one launch never re-reported; stale claims could fake contests)
+                GameStatePatcher.SweepPurchaserPollution("scene ready");   // heal saves polluted by the pre-round-34 purchaser injectio
+                GameStatePatcher.SweepRivalFieldContamination("scene ready");   // heal renters written into the DEED field (rent-vs-deed split 2026-07-09)
+                _worldHealthAt = Time.unscaledTime + 30f;   // world-integrity line AFTER the rival cache fills (30s)
+                _postSyncHealthDone = false; _postSyncHealthAt = -1f;   // round-50: re-arm the post-sync census for this load
+                StorageSync.ResetMirrorNested();                        // CARTBAG-1: the mirror-take contents memory is per world
+                GameStatePatcher.ResetTenancyConflictLog();             // round-50b: conflict lines are once-per-address-per-load
+                // Round-35: a save can carry a STALE BAMP_ proxy id in ActiveVehicleId (borrowed cart
+                // despawned mid-push before the round-34b exit guard existed). IsUsingVehicle then reads
+                // true forever with no resolvable vehicle → box clicks NRE at ItemController.Interact:509
+                // ("owner couldn't access the shelf"). BAMP_ ids are ours and never valid across sessions.
+                try
+                {
+                    var av = SaveGameManager.Current?.ActiveVehicleId;
+                    if (!string.IsNullOrEmpty(av) && av.StartsWith("BAMP_", StringComparison.Ordinal))
+                    {
+                        SaveGameManager.Current.ActiveVehicleId = null;
+                        Plugin.Logger.LogWarning($"[Vehicle] scene-ready sweep: cleared stale proxy ActiveVehicleId='{av}' from the loaded save.");
+                    }
+                    // Round-37m: normalize EMPTY to NULL — the native on-foot contract is null; a persisted ""
+                    // (written by the pre-37m take-repair) passes ShelfCtaBehavior's `!= null` check and NREs
+                    // the hover chain on every storage shelf. Heals poisoned saves at load.
+                    else if (av != null && av.Length == 0)
+                    {
+                        SaveGameManager.Current.ActiveVehicleId = null;
+                        Plugin.Logger.LogWarning("[Vehicle] scene-ready sweep: normalized empty ActiveVehicleId to null (dead-shelf-hover poison, round-37m).");
+                    }
+                }
+                catch { }
+                // Round-39: in MP the pause is network-arbitrated (startup hold / votes) — a save carrying
+                // LastPlayerPause=true makes GameSpeedController boot playerGameSpeed PAUSED on every load
+                // (GSC :64 reads it), an SP pause preference restoring into an MP session as a half-pause.
+                // Saves got poisoned by the pre-39 corpse-invoke bug (TogglePause on a destroyed GSC wrote
+                // the flag before throwing); a save written mid-vote-pause carries it legitimately too.
+                try
+                {
+                    if (SaveGameManager.Current != null && SaveGameManager.Current.LastPlayerPause)
+                    {
+                        SaveGameManager.Current.LastPlayerPause = false;
+                        Plugin.Logger.LogWarning("[GSC] scene-ready sweep: cleared LastPlayerPause=true (MP pause is network-arbitrated; a restored SP pause preference reads as a half-pause).");
+                    }
+                }
+                catch { }
+                MPAudit.Reset();          // divergence streaks/throttle die with the session (else stale [Audit] state pollutes the bug-report log across same-process sessions)
+                MPFrameRhythm.Reset();    // round-207: frame ring + beat registry are per-session
+                MPLoadWindow.ResetForScene();   // round-225: the clone borrows menu-scene assets
+                CustomerPuppets.Reset();  // round-41: puppet bodies + authority table die with the scene
+                MPStockSync.Reset();      // per-shop stock digests die with the session
+                ShopValuation.Reset();    // H-BIZ-1: owner-answered estimates die with the session
+                GameStatePatcher.ResetDemandState();   // round-102 statics are per-session: a held market payload must
+                                                       // not reach a different world, and the have-authoritative flag
+                                                       // must not suppress demand computation in the NEXT session
+                GameStatePatcher.ResetVehicleIdHealth();   // round-109 net: timer + heal counter are per-session
+                GameStatePatcher.ResetHeldBusinessSnapshot();   // field 20260829-222154: a held snapshot must not cross sessions
+                RivalStaffSync.Reset();                         // AI-staff slice: pending poach claims + window state die with the session
+                _appearanceSig = ""; _appearanceNextAt = 0f;
+                _blackOverlayCanvas = null;     // re-scan on fresh game load (#6)
+                _blackOverlayFindTimer = 0f;
+
+                // Startup pause hold — frontload the world sync the moment our scene
+                // loads (report in-game so the host serves snapshots NOW), but DEFER
+                // the actual freeze until our loading OVERLAY has cleared.  The native
+                // overlay fades at normal time; freezing before it clears could stall
+                // its own fade-out (timeScale=0) → deadlock.  TickOverlayFreezeGate
+                // does the BeginStartupHold + world-ready report once the overlay is
+                // gone — so the freeze holds until every player (especially the host,
+                // usually last to finish loading) has TRULY entered the game.
+
+                if (MPServer.IsRunning || MPClient.IsConnected)
+                {
+                    MPClient.InMpGame = true;   // sticky: entering an MP game world (survives transient drops)
+                    MPLifecycle.NoteLocalSceneLoaded();   // M1: the stuck-load clock restarts HERE, not at the lobby transition
+                    _sceneLoadedPendingFreeze = true;
+                    _pendingFreezeElapsed = 0f;
+                    _freezeGateDiagNext = 0f;   // heartbeat restarts with the gate
+                    if (MPServer.IsRunning)
+                        MPServer.MarkPlayerInGame(MPConfig.PlayerId);   // host serves snapshots now
+                    else
+                        MPClient.SendPlayerInGame();
+                }
+
+                if (MPServer.IsRunning)
+                {
+                    // Delay so all clients have time to finish loading their scene
+                    _worldSnapshotTimer = 4f;
+                    Plugin.Logger.LogInfo("[UI] WorldSnapshot scheduled in 4 s.");
+                }
+
+                // Trigger a time sync and market sync shortly after game loads.
+                _timeSyncTimer     = 5f;
+                _marketSyncNextAt  = Time.unscaledTime + 8f;   // round-102h: real time, not scaled
+            }
+            else if (!inGame && _wasInGame)
+            {
+                Plugin.Logger.LogInfo("[UI] Left game scene — cleaning up remote players.");
+                GameStatePatcher.EnqueueOnMainThread(() => RemotePlayerManager.RemoveAll());
+                _sceneLoadedPendingFreeze = false;
+                ReleaseHostSoftHold("left game scene");   // round-205: state must not survive the world
+                TimeSync.ClearClockCorrection();   // TIMESYNC-TEARDOWN-1 (C4): a stored catch-up gap / ahead hold dies with the world
+                // Per-world apply caches: the CBC objects die with the scene and
+                // the next world's sign states start fresh — stale entries would
+                // wrongly skip (or target dead controllers for) the first repaints.
+                GameStatePatcher.ResetCBCCache();
+                GameStatePatcher.ResetVisualSigCache();
+                TrafficSync.InvalidateVehiclePool();   // pool objects die with the scene
+                MPPhoneButton.Reset();                 // re-inject in the next game scene
+                MPHandIk.Reset();                      // cached refs die with the scene
+                MPPriceSync.Reset();                   // price hashes are per-session
+                MPRestSync.Reset();                    // votes/skip die with the session
+                MPHub.Reset(); _hubVisible = false;    // hub ledger is per-session
+                Friends.Reset();                       // FRIENDS-1: the next host sends its own state
+                MPHubNativePage.Reset(); BizOnSceneReset();   // page died with the scene (MPBusinessPage.cs)
+                RadioPhonePage.Reset();                       // RADIO-TAB-1: so did the Radio page
+                _spawnSidestepDone = false;   // next session de-stacks again
+                // The session-over lock is for the in-game world only — back at
+                // the menu the player is free to host/join again.
+                MPClient.SessionEnded = false;
+                MPClient.InMpGame    = false;   // left the MP game world → native time allowed again (SP/menu)
+                MPClient.OfflineFork = false;   // H-BIZ-1 r3: the offline fork ends with the scene
+
+                // Leaving the game scene ends the MP session (exit to main menu).
+                // Tear the network down so the next Host/Join starts clean — a
+                // zombie server otherwise keeps the port bound and the next
+                // Start() fails with AddressAlreadyInUse while IsRunning still
+                // reads true (host loads alone; client's join times out).
+                // NOTE: if a future flow reloads a save MID-session (scene drops
+                // out of game while staying connected), gate this on a
+                // load-in-progress flag.
+                try
+                {
+                    if (MPServer.IsRunning)
+                    {
+                        Plugin.Logger.LogInfo("[UI] Exited to menu — stopping host session.");
+                        MPServer.Stop();
+                    }
+                    else if (MPClient.IsConnected || MPClient.IsConnecting)
+                    {
+                        Plugin.Logger.LogInfo("[UI] Exited to menu — disconnecting from host.");
+                        MPClient.Disconnect();
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[UI] MP teardown on scene exit: {ex.Message}"); }
+            }
+            _wasInGame = inGame;
+        }
+
+        /// <summary>Toggle the in-game MP window (F9 key + BizPhone Chat button).</summary>
+        private void ToggleMpWindow()
+        {
+            _mpWinVisible = !_mpWinVisible;
+            StyleMpWindow();
+            if (_mpWinVisible) CwPlaceWindow();            // the remembered place (U2) or the default next to the phone (U1)
+            _mpWin!.SetActive(_mpWinVisible);
+            CwCloseDrop();
+            if (_mpWinVisible) SetMpOpacity(_mpOpacity);   // re-assert opacity on show
+            else { _mpChatFocus = false; _chatSuppress = false; _mpDragging = false; _mpOpacityDragging = false; _mpResizing = false; SyncChatNavBlock(false); MPChat.SuppressGameInput = false; }
+        }
+
+#if BAMP_DEV
+        // DEV screenshot lever (2026-09-28, Chat redesign reference): TestDrive `chatview`. Opening and closing go through
+        // the chat icon's own request flag (Update above); this only reads state. The Business page's levers: MPBusinessPage.cs.
+        internal bool DevChatVisible => _mpWinVisible;
+
+#endif
+
+        // ── Camera audit (highlight wrong-target investigation) ───────────────
+        // The hover pick ray is cast FROM A CAMERA; if a cloned ghost smuggled an
+        // enabled camera into the scene, picking happens from the wrong eye and
+        // highlights land on buildings away from the cursor.  Log the enabled-
+        // camera set whenever it changes.
+
+        // ── Overlay-aware freeze gate ─────────────────────────────────────────
+        // Our scene has loaded (PlayerController exists) but the native loading
+        // OVERLAY may still be fading.  We freeze (and report ourselves truly in
+        // the game) only once that overlay is gone — so nobody unfreezes onto a
+        // half-loaded world and the hold survives until the host (usually last to
+        // finish loading) has fully entered.  Deferring the freeze past the overlay
+        // also avoids stalling the overlay's own fade-out under timeScale=0.
+        private bool  _sceneLoadedPendingFreeze;
+        private float _pendingFreezeElapsed;
+        private float _freezeGateDiagNext;   // [FreezeGate] heartbeat schedule
+        // Fail-safe only.  A real staggered load took ~57s, so 20s released far too
+        // soon; this just guarantees we can never hang forever if detection breaks.
+        private const float PENDING_FREEZE_MAX = 180f;
+
+        // "World is populated" thresholds — the host won't declare itself ready until
+        // it has actually spawned at least this many driving + parked vehicles, so
+        // nobody unpauses onto an empty street.  Counts are logged each second so we
+        // can tune these from real data.
+        private const int CARS_PARKED_MIN  = 5;
+        private const int CARS_TRAFFIC_MIN = 3;
+        private static float _carCheckNext;
+        private static int   _carParkedCached;
+        private static int   _carTrafficCached;
+        private float        _hostReadyDiagNext;
+
+#if BAMP_DEV
+        /// <summary>F10: in-process fragmentation round-trip (2MB random buffer →
+        /// WrapFragment chunks → SteamReassembly, in order and shuffled) with a
+        /// byte-exact compare.  One-rig validation of the framing logic.</summary>
+        private static void DevRunSteamFrameSelfTest()
+        {
+            try
+            {
+                var rng = new System.Random(12345);
+                var payload = new byte[2_000_000];
+                rng.NextBytes(payload);
+                int count = SteamFrames.FragmentCount(payload.Length);
+                var frames = new System.Collections.Generic.List<byte[]>(count);
+                for (int i = 0, off = 0; i < count; i++)
+                {
+                    int len = System.Math.Min(SteamFrames.ChunkSize, payload.Length - off);
+                    frames.Add(SteamFrames.WrapFragment(4242, i, count, payload, off, len));
+                    off += len;
+                }
+                bool Pass(System.Collections.Generic.IEnumerable<byte[]> order, string label)
+                {
+                    var re = new SteamReassembly("SelfTest");
+                    byte[]? full = null;
+                    foreach (var f in order)
+                        if (re.TryAccept(f, out var done) && done != null) full = done;
+                    bool ok = full != null && full.Length == payload.Length;
+                    if (ok) for (int i = 0; i < payload.Length; i++) if (full![i] != payload[i]) { ok = false; break; }
+                    Plugin.Logger.LogInfo($"[SelfTest] fragmentation {label}: {(ok ? "PASS" : "FAIL")} ({count} chunks, {payload.Length}B).");
+                    return ok;
+                }
+                var shuffled = new System.Collections.Generic.List<byte[]>(frames);
+                for (int i = shuffled.Count - 1; i > 0; i--)
+                { int j = rng.Next(i + 1); (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]); }
+                bool a = Pass(frames, "in-order");
+                bool b = Pass(shuffled, "shuffled");
+                Plugin.Logger.LogInfo($"[SelfTest] overall: {(a && b ? "PASS" : "FAIL")}.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogError($"[SelfTest] fragmentation: {ex}"); }
+        }
+#endif
+
+        /// <summary>Round-205: true while the HOST's movement is locked during its
+        /// populate window (overlay gone → group release). Time runs; only WASD is
+        /// held, so vehicles can spawn while nobody gets a head start.</summary>
+        internal static bool HostSoftHoldActive;
+
+        internal static void ReleaseHostSoftHold(string why)
+        {
+            if (!HostSoftHoldActive) return;
+            HostSoftHoldActive = false;
+            try
+            {
+                PlayerHelper.PlayerController?.UnsetNavigationBlocker(NavigationBlocker.CasinoEntrySequence);
+                Plugin.Logger.LogInfo($"[FreezeGate] host soft-hold RELEASED ({why}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[FreezeGate] soft-hold release: {ex.Message}"); }
+        }
+
+        private void TickOverlayFreezeGate()
+        {
+            if (!_sceneLoadedPendingFreeze) return;
+            if (!(MPServer.IsRunning || MPClient.IsConnected))
+            {
+                // LOUD: this is the gate's only silent kill — if it fires, the
+                // 180s fail-safe dies with it (2026-06-11 stuck-load suspect #1).
+                Plugin.Logger.LogWarning(
+                    $"[FreezeGate] pendingFreeze CLEARED by connection check (IsRunning={MPServer.IsRunning} " +
+                    $"IsConnected={MPClient.IsConnected}) at elapsed={_pendingFreezeElapsed:F0}s — fail-safe disarmed.");
+                _sceneLoadedPendingFreeze = false;
+                ReleaseHostSoftHold("connection check cleared the gate");
+                return;
+            }
+
+            _pendingFreezeElapsed += Time.unscaledDeltaTime;
+            bool overlayGone = !IsLoadingOverlayUp();
+            bool fallback    = _pendingFreezeElapsed >= PENDING_FREEZE_MAX;
+
+            // Heartbeat every 15s while pending — proves the gate is alive and
+            // shows exactly why it hasn't fired (2026-06-11: fail-safe never
+            // fired in 10 min with no evidence of which early-return ate it).
+            if (_pendingFreezeElapsed >= _freezeGateDiagNext)
+            {
+                _freezeGateDiagNext = _pendingFreezeElapsed + 15f;
+                Plugin.Logger.LogInfo(
+                    $"[FreezeGate] pending elapsed={_pendingFreezeElapsed:F0}s overlayGone={overlayGone} " +
+                    $"fallback@{PENDING_FREEZE_MAX:F0}s host={MPServer.IsRunning}");
+            }
+
+            if (MPServer.IsRunning)
+            {
+                // The HOST is the authoritative "everyone starts here" trigger.  Do NOT
+                // declare it in-world until BOTH its game loading-screen overlay is gone
+                // AND the world is actually populated (driving + parked cars spawned) —
+                // so clients unpause onto a live, fully-loaded world, all together.  The
+                // host runs at normal speed until then (cars can't spawn while frozen).
+                //
+                // Round-205 Fix B (user obs: "host gets released before clients"): the
+                // host used to PLAY unfrozen through this populate window while every
+                // client sat frozen — and when the host loads last (common), the group
+                // release fires the instant it becomes ready, so it never waited at
+                // all.  Soft-hold: lock MOVEMENT via the game's own blocker registry
+                // while time runs so the world can still populate; released at the
+                // group release.  CasinoEntrySequence: never legitimately active at
+                // session start, untouched by the rounds-195/198 blocker heals.
+                //
+                // M2 (2026-09-21, bundle 20260919-232628, 2/2 worlds): the engage used to run while the
+                // game's own loading overlay was still up, and native PlayerController.SetNavigationBlocker
+                // (PlayerController.cs:501-517) ADDS the blocker and THEN throws in that window — the hold
+                // was really on, HostSoftHoldActive was not, and only the next tick's "already set"
+                // early-return healed it.  Little is lost by waiting for overlayGone: the gate ticks every
+                // frame (IsLoadingOverlayUp caches its answer for 0.25 s, so the hold lands at most that long
+                // after the overlay really clears), and this still sits ABOVE the
+                // world-ready branch, so even when overlayGone && carsReady are true on the very first tick
+                // the hold is engaged before the release that has to release it.
+                if (!HostSoftHoldActive && overlayGone)
+                {
+                    try
+                    {
+                        var pcHold = PlayerHelper.PlayerController;
+                        if (pcHold != null)
+                        {
+                            pcHold.SetNavigationBlocker(NavigationBlocker.CasinoEntrySequence);
+                            HostSoftHoldActive = true;
+                            Plugin.Logger.LogInfo("[FreezeGate] host soft-hold ENGAGED — movement locked while the world populates (round-205).");
+                        }
+                    }
+                    catch (Exception ex)
+                    {   // Review M-4: native ADDS the blocker before the statement that can throw, so after a throw
+                        // the hold is really ON. Own it, or - when this is also the release tick - the gate stops
+                        // ticking, ReleaseHostSoftHold early-returns on the false flag and the blocker is never
+                        // unset. Unsetting a blocker that is not set only logs (PlayerController.cs:519-525).
+                        HostSoftHoldActive = true;
+                        // M2: the type and the throwing frame, or the field log cannot tell WHERE native died
+                        string frame0 = ""; try { frame0 = (ex.StackTrace ?? "").Split('\n')[0].Trim(); } catch { }
+                        Plugin.Logger.LogWarning($"[FreezeGate] soft-hold engage: {ex.GetType().Name}: {ex.Message} — at {frame0}");
+                    }
+                }
+                bool carsReady = HostWorldHasVehicles();
+                DiagHostReadiness(overlayGone, carsReady);
+                if (!((overlayGone && carsReady) || fallback)) return;
+
+                _sceneLoadedPendingFreeze = false;
+                TimeSync.BeginStartupHold();
+                _startupHoldElapsed = 0f;
+                MPLoadProfiler.Mark(
+                    $"HOST fully loaded → world-ready (overlayGone={overlayGone}, carsReady={carsReady}, " +
+                    $"parkedCity={_carParkedCached}, traffic={_carTrafficCached}, fallback={fallback}, elapsed {_pendingFreezeElapsed:F1}s)");
+                MPServer.SeedHostName();   // host name in the map before any rivals/business snapshot
+                MPServer.MarkWorldReady(MPConfig.PlayerId, hostSelf: true);
+            }
+            else
+            {
+                // The CLIENT freezes as soon as its OWN overlay clears, then waits on the
+                // MP screen until the host reports fully loaded.  WorldReady is sent once
+                // the world sync is also applied (here or from ApplyBusinessSnapshot).
+                if (!(overlayGone || fallback)) return;
+
+                _sceneLoadedPendingFreeze = false;
+                TimeSync.BeginStartupHold();
+                _startupHoldElapsed = 0f;
+                MPLoadProfiler.Mark(
+                    $"CLIENT overlay gone → frozen, waiting for host (overlayGone={overlayGone}, fallback={fallback}, elapsed {_pendingFreezeElapsed:F1}s)");
+                MPClient.TickWorldReadyGate();   // round-205: readiness now also waits for the parked-car receipt
+            }
+        }
+
+        /// <summary>Host-only: true once the host has spawned enough driving + parked
+        /// vehicles that the world looks alive.  Counts are throttled + cached.</summary>
+        private static bool HostWorldHasVehicles()
+        {
+            float now = Time.unscaledTime;
+            if (now >= _carCheckNext)
+            {
+                _carCheckNext = now + 0.5f;
+                try { _carParkedCached  = ParkedVehicleSync.HostTrackedCount; } catch { }
+                try { _carTrafficCached = TrafficSync.HostTrafficCount();     } catch { }
+            }
+            return _carParkedCached >= CARS_PARKED_MIN && _carTrafficCached >= CARS_TRAFFIC_MIN;
+        }
+
+        private void DiagHostReadiness(bool overlayGone, bool carsReady)
+        {
+            float now = Time.unscaledTime;
+            if (now < _hostReadyDiagNext) return;
+            _hostReadyDiagNext = now + 1f;
+            MPLoadProfiler.Mark(
+                $"HOST loading… overlayGone={overlayGone} parkedCity={_carParkedCached}/{CARS_PARKED_MIN} " +
+                $"traffic={_carTrafficCached}/{CARS_TRAFFIC_MIN} carsReady={carsReady} elapsed={_pendingFreezeElapsed:F1}s");
+        }
+
+        /// <summary>True while the game's loading-screen overlay is still visibly up.
+        /// Tracks the actual <c>LoadingScreen</c> object + its CanvasGroup fade — NOT the
+        /// <c>LoadScene.isLoading</c> flag, which the loadprof showed stays stuck true and
+        /// never reports "gone".  Throttled (FindObjectOfType isn't free).</summary>
+        private static float _overlayCheckNext;
+        private static bool  _overlayCheckCached = true;
+        // Once the world is live AND the overlay has gone, the loading screen
+        // cannot reappear without a fresh load — so we latch "gone" and STOP the
+        // per-0.25s full-scene FindObjectOfType walk.  That walk (a whole-city
+        // object-table scan, worst-case because in-game there's no LoadingScreen
+        // to find) was a ~58ms main-thread hitch every 0.25s = the razor-sharp
+        // ~257ms MP-only stutter.  Re-arms on the next load (PlayerController→null).
+        // (The sibling menu scan in TickMenuIntegration was already guarded the
+        //  same way — "twice a second, forever … rhythmic car stutter"; this is
+        //  the twin that was missed.)
+        private static bool _overlayConfirmedGone;
+        private static LoadingScreen? _overlayLs;   // round-207f: cached singleton + fade group
+        private static CanvasGroup?   _overlayCg;
+
+        internal static bool IsLoadingOverlayUp()
+        {
+            bool worldUp = false;
+            try { worldUp = Helpers.PlayerHelper.PlayerController != null; } catch { }
+            if (!worldUp) _overlayConfirmedGone = false;   // fresh load → re-arm the scan
+            if (_overlayConfirmedGone) return false;       // latched gone → skip the scan
+
+            float now = Time.unscaledTime;
+            if (now < _overlayCheckNext) return _overlayCheckCached;
+            _overlayCheckNext = now + 0.25f;
+
+            bool up;
+            try
+            {
+                // Round-207f — THE SAWTOOTH ROOT CAUSE. This used FindObjectOfType
+                // (whole-scene search, ~60ms in a loaded city) at the 0.25s recheck
+                // cadence — 4 scans/second = exactly the period≈0.24s hitch rhythm
+                // the frame telemetry measured, mod-heavy on BOTH machines, worst on
+                // weak hardware where the settle phase (and the scans) run longest.
+                // LoadingScreen is the game's OWN singleton — no search was ever
+                // needed. The fade CanvasGroup is cached per instance too.
+                var ls = InstanceBehavior<LoadingScreen>.Instance;
+                if (ls == null) up = false;                     // no LoadingScreen → gone
+                else
+                {
+                    var go = ls.gameObject;
+                    if (!go.activeInHierarchy) up = false;
+                    else
+                    {
+                        // Present — but a fully faded-out CanvasGroup means it's gone.
+                        if (!ReferenceEquals(ls, _overlayLs) || _overlayCg == null)
+                        { _overlayLs = ls; _overlayCg = go.GetComponentInChildren<CanvasGroup>(true); }
+                        up = (_overlayCg == null) ? true : (_overlayCg.alpha >= 0.05f);
+                    }
+                }
+            }
+            catch { up = false; }    // never hang the startup on a detection error
+            _overlayCheckCached = up;
+            if (!up && worldUp) _overlayConfirmedGone = true;   // confirmed gone with world live → latch off
+            return up;
+        }
+
+        // (LoadTrace v2 removed 2026-06-12 dead-code sweep — stuck-load was
+        //  localized + fixed: overlay watchdog demoted, fence fallback added.)
+
+        // ── Overlay watchdog: the game's loading screen can survive its own
+        // load-finish step (a transient GameManager hiccup kills the fade) and
+        // sit forever over a perfectly healthy world.  Force-dismiss. ─────────
+        // (_quiesceOffAt retired — stage-4 migration #1)
+        private float _overlayStuckSince;
+
+        private void TickOverlayWatchdog()
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsConnected) { _overlayStuckSince = 0f; return; }
+                bool worldUp = false;
+                try { worldUp = Helpers.PlayerHelper.PlayerController != null; } catch { }
+                if (!worldUp || !IsLoadingOverlayUp()) { _overlayStuckSince = 0f; return; }
+                if (_overlayStuckSince == 0f) { _overlayStuckSince = Time.unscaledTime; return; }
+                if (Time.unscaledTime - _overlayStuckSince < 30f) return;
+                _overlayStuckSince = 0f;
+                // DIAGNOSTIC ONLY.  The force-dismiss variant KILLED the game's
+                // load-finish coroutine on EVERY host load (PlayerController
+                // spawns long before the overlay legitimately drops, so the 12s
+                // "stuck" check tripped on normal loads; killing LoadingScreen
+                // killed its coroutine → controller dead, clock frozen, HUD
+                // half-bound — localized via LoadTrace + fired-count,
+                // 2026-06-11).  NEVER touch the LoadingScreen object.
+                Plugin.Logger.LogWarning("[UI] overlay still up 30s after world spawn (diagnostic only — no action taken).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[UI] overlay watchdog: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Host-side watchdog: if the startup hold lasts longer than the timeout
+        /// (a player stuck loading and never reporting in-game), force-release so
+        /// the game can never freeze permanently.
+        /// </summary>
+        private void TickStartupTimeout()
+        {
+            if (!TimeSync.IsStartupHeld) { _startupHoldElapsed = 0f; return; }
+            if (!MPServer.IsRunning) return;   // only the host decides the release
+
+            _startupHoldElapsed += Time.unscaledDeltaTime;
+            if (_startupHoldElapsed >= STARTUP_HOLD_TIMEOUT)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[UI] Startup hold exceeded {STARTUP_HOLD_TIMEOUT}s — force-releasing.");
+                MPServer.ForceReleaseStartupHold();
+                _startupHoldElapsed = 0f;
+            }
+        }
+
+        /// <summary>Sends the local player's appearance whenever it CHANGES
+        /// (5s hash-gated poll).  The old one-shot captured the model's DEFAULT
+        /// wardrobe before the save dressed the character — both machines
+        /// broadcast identical defaults and ghosts looked like mirror copies
+        /// (2026-06-11); it also never re-sent after a clothing change.</summary>
+        private string _appearanceSig = "";
+        private float _appearanceNextAt;
+
+        private void TrySendLocalAppearance()
+        {
+            if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+            if (Time.unscaledTime < _appearanceNextAt) return;
+            _appearanceNextAt = Time.unscaledTime + 5f;
+            if (IsLoadingOverlayUp()) return;     // mid-load reads = default outfit
+            var dto = RemotePlayerManager.ReadLocalAppearance();
+            if (dto == null) return;              // character not ready — retry next poll
+            // FULL signature (variants + colors + blends): Summary() missed
+            // color changes, so post-load tint corrections never re-sent.
+            string sig = RemotePlayerManager.FullSig(dto);
+            if (sig == _appearanceSig) return;
+            bool resend = _appearanceSig != "";
+            _appearanceSig = sig;
+            Plugin.Logger.LogInfo($"[Appearance] Local appearance {(resend ? "RE-sent (changed)" : "sent")}: {RemotePlayerManager.Summary(dto)} ({dto.Colors.Count} colors, {dto.Blends.Count} blends)");
+            if (MPServer.IsRunning) MPServer.RegisterHostAppearance(dto);
+            else                    MPClient.SendAppearance(dto);
+        }
+
+        private void TickWorldSnapshot()
+        {
+            if (_worldSnapshotTimer <= 0f) return;
+            _worldSnapshotTimer -= Time.deltaTime;
+            if (_worldSnapshotTimer > 0f) return;
+
+            _worldSnapshotTimer = 0f;
+            MPServer.BroadcastWorldSnapshotToAll();
+            Plugin.Logger.LogInfo("[UI] WorldSnapshot broadcast fired.");
+        }
+
+        // ── Intro-scene name pre-fill (#2) ───────────────────────────────────
+        // When the character-creation screen is created, pre-fill its name field
+        // with the name the user set in the F8 lobby panel (MPConfig.PlayerId) so
+        // they don't retype it.  EVENT-DRIVEN: a Harmony Postfix on
+        // IntroCharacterCustomizer.Start (MPPatches) calls this ONCE when the screen
+        // appears.  Replaces a per-frame FindObjectsOfType that, after a save load
+        // (char-gen never runs), scanned the whole object table forever — a 90->12fps
+        // single-player drain (perf log 2026-06-14).
+        internal static void PrefillIntroName(IntroCharacterCustomizer customizer)
+        {
+            try
+            {
+                if (customizer == null) return;
+                var fields = customizer.GetComponentsInChildren(typeof(TMP_InputField), true);
+                if (fields == null || fields.Length == 0) return;
+
+                var preferred = MPConfig.PlayerId;
+                if (string.IsNullOrWhiteSpace(preferred)) return;
+
+                // Split on first space for first/last-name dual-field forms.
+                string first = preferred, last = "";
+                int sp = preferred.IndexOf(' ');
+                if (sp > 0) { first = preferred.Substring(0, sp); last = preferred.Substring(sp + 1); }
+
+                int filled = 0;
+                for (int i = 0; i < fields.Length && filled < 2; i++)
+                {
+                    // Round-57 (Rialgame report): per-field guard — an inactive/not-yet-initialized
+                    // TMP_InputField (fetched with includeInactive) can NRE inside its text accessors;
+                    // one bad field must not abort the rest or warn-spam reports.
+                    try
+                    {
+                        var f = fields[i] as TMP_InputField;
+                        if (f == null || f.textComponent == null) continue;
+                        // Only fill if the field is currently empty / placeholder — never clobber typed text.
+                        var cur = f.text;
+                        if (!string.IsNullOrWhiteSpace(cur)) continue;
+                        string fill = filled == 0 ? first : last;
+                        if (string.IsNullOrEmpty(fill)) { filled++; continue; }
+                        f.text = fill;
+                        Plugin.Logger.LogInfo($"[IntroName] pre-filled field[{i}] '{f.gameObject.name}' ← '{fill}'");
+                        filled++;
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[IntroName] prefill: {ex.Message}"); }
+        }
+
+        // (Legacy diagnostic F-key suite REMOVED 2026-06-10 — F3 exit-bandaid
+        //  toggle, F4 master kill switch, F5/F6 parked-vehicle toggles, F11
+        //  traffic suppression.  All were enter/exit-investigation tooling;
+        //  the bandaid is retired and no test toggles ship with the mod.)
+
+        // ── Backlog #6 fix: keep 'BlackOverlay' canvas suppressed on client ──
+        //
+        // OBSERVED 2026-05-20 MARK_BEFORE vs MARK_BLACK diff: a Canvas named
+        // 'BlackOverlay' (mode=ScreenSpaceOverlay, sort=3) is enabled only in
+        // the broken state.  In SP and on host the game disables it after the
+        // building-entry transition completes; on the client the disable step
+        // never runs, leaving an opaque black overlay covering the world.
+        // BAMP_Canvas (sort=999) is above it, which is why the F8 panel stays
+        // visible.
+        //
+        // Fix: cache the canvas on first sighting, then disable it whenever
+        // it's enabled.  Cheap (~one assignment per frame in the worst case);
+        // disabling the Canvas component preserves the GameObject so the
+        // game's own state machine isn't disturbed.
+        private static Canvas? _blackOverlayCanvas;
+        private static float _blackOverlayFindTimer;
+        // The BlackOverlay only gets stuck-on right after a (broken) client building-entry transition. Without a
+        // stop condition the uncached scan below walked the whole object table every 2s FOREVER on a normal
+        // client (anti-pattern Class 1). Arm a short scan window on each building entry instead; idle otherwise.
+        private static int _blackOverlayScanTriesLeft;
+        internal static void ArmBlackOverlayScan() => _blackOverlayScanTriesLeft = 4;  // ~8s of 2s-throttled scans post-entry
+        private void TickSuppressBlackOverlay()
+        {
+            if (!MPClient.IsConnected) return;
+            if (!IsInGame()) return;
+
+            // If we've lost the cached reference (Unity destroyed the canvas
+            // on scene change, etc.), rescan periodically.
+            if (_blackOverlayCanvas == null)
+            {
+                // Only scan within a window armed by a building entry — no entry, no forever-poll.
+                if (_blackOverlayScanTriesLeft <= 0) return;
+                _blackOverlayFindTimer -= Time.unscaledDeltaTime;
+                if (_blackOverlayFindTimer > 0f) return;
+                _blackOverlayFindTimer = 2f;
+                _blackOverlayScanTriesLeft--;
+
+                try
+                {
+                    var canvases = UnityEngine.Object.FindObjectsOfType(typeof(Canvas));
+                    if (canvases == null) return;
+                    for (int i = 0; i < canvases.Length; i++)
+                    {
+                        var c = canvases[i] as Canvas;
+                        if (c == null) continue;
+                        if (c.gameObject.name == "BlackOverlay")
+                        {
+                            _blackOverlayCanvas = c;
+                            Plugin.Logger.LogInfo("[ClientFix] Found BlackOverlay canvas; will keep disabled on client.");
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogWarning($"[ClientFix] BlackOverlay search: {ex.Message}");
+                }
+                return;
+            }
+
+            // Cached — re-disable if the game turned it back on.
+            try
+            {
+                if (_blackOverlayCanvas != null && _blackOverlayCanvas.enabled)
+                    _blackOverlayCanvas.enabled = false;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[ClientFix] BlackOverlay suppress: {ex.Message}");
+                _blackOverlayCanvas = null;  // rescan next pass
+            }
+        }
+
+        private void TickPositionSync()
+        {
+            // Review 2026-08-26 MAJOR-1: _loiterUiHover is set only inside TickLoiterButton, which
+            // dies with the gates below — a disconnect with the cursor on the button would latch
+            // SuppressGameInput (WASD + driving dead) with nothing left running to clear it.
+            // Reset BEFORE the gates; TickLoiterButton recomputes it when it runs.
+            _loiterUiHover = false;
+            if (!IsInGame())
+            {
+                if (_loiterTip != null && _loiterTip.activeSelf) _loiterTip.SetActive(false);
+                if (_loiterBtn != null && _loiterBtn.activeSelf) _loiterBtn.SetActive(false);   // review N2: no dead raycast zone after a mid-world disconnect
+                return;
+            }
+            // Everything below is multiplayer machinery (sync ticks + MP UI ticks).
+            // It must NOT run in single-player — it was leaking ~12ms/frame with
+            // 100ms+ spikes into SP (perf log 2026-06-14).  One gate covers it all.
+            if (!MPServer.IsRunning && !MPClient.IsConnected)
+            {
+                TrafficSync.TickDisconnected();   // H-SVC-116 r4: the reconnect-window belt + the offline hand-back retry. THIS is the first return without a link (review r3 #1: the r3 call sat behind it, unreachable).
+                if (_loiterTip != null && _loiterTip.activeSelf) _loiterTip.SetActive(false);
+                if (_loiterBtn != null && _loiterBtn.activeSelf) _loiterBtn.SetActive(false);   // review N2: no dead raycast zone after a mid-world disconnect
+                BizOnLinkLost();   // business-page re-check: no stuck typing focus / merger click catcher after the link drops
+                return;
+            }
+
+            // (Discovery-probe block removed 2026-06-12 dead-code sweep: all
+            //  verified log-only with missions complete — see .modding/04-probes.md.)
+            long _pt = MPPerf.Begin(); ParkedVehicleSync.Tick();    MPPerf.End("Parked",   _pt);   // backlog #3 phase 3a — host capture
+            _pt = MPPerf.Begin(); BusinessSync.Tick();         MPPerf.End("BizHost",  _pt);   // host change detection (time-boxed sweep)
+            _pt = MPPerf.Begin(); BusinessSync.TickClient();   MPPerf.End("BizClient",_pt);   // client pushes own businesses up
+            _pt = MPPerf.Begin(); MPPriceSync.Tick();          MPPerf.End("Price",    _pt);   // live retail prices of own businesses (both roles)
+            _pt = MPPerf.Begin(); MPStockSync.Tick();          MPPerf.End("Stock",    _pt);   // own shops' stocked-shelf digest (so un-entered shops aren't judged "full")
+            _pt = MPPerf.Begin(); MPAudit.Tick();              MPPerf.End("Audit",    _pt);   // client → host state-hash audit (30s); host logs [Audit] MISMATCH on divergence (Release-enabled 2026-06-24 for bug-report evidence)
+            _pt = MPPerf.Begin(); MPRestSync.Tick();           MPPerf.End("Rest",     _pt);   // votes, seated state, watchdog (0.5s)
+            MPRestSync.TickSkipFrame();   // per-frame skip executor (host + clients) — drives the sim fast to the goal
+            MPHub.HostTick();             // loan ledger: daily interest/payment drafts
+            MPServer.TickFencePrune();    // excuse menu-bailed clients from the load fence
+            TickRestBanner();
+            TickRestUI();
+            TickLoiterButton();           // loitering: standing skip vote (user feature 2026-08-26)
+            TickHudDodge();               // HUD-DODGE-1: version line and the button beside the game's key hints
+            MPHubNativePage.Tick();       // "Business" in the native full menu
+            RadioPhonePage.Tick();        // RADIO-TAB-1: "Radio" in the native full menu
+            GoingOnlineModule.Tick();     // GOING-ONLINE-1: the cable provider (module 8)
+            try { CarLiveries.Tick(); } catch (Exception ex) { CarWraps.WarnOnce("tick: " + ex.Message); }   // CAR-LIVERY-1: each vehicle's own livery
+            OwnershipReporter.Tick();     // BUILDING-LIST-2: my bought and rented buildings for the ranking page
+            // (spawn sidestep moved to the WorldReady event — OnLifecyclePhase)
+            TickJoinPopup();              // host approval panel for mid-game joiners
+            TickTrainingPopup();          // honorary-degree confirm dialog (school doors)
+            TickHubWindow();
+            _pt = MPPerf.Begin(); InteriorSync.Tick();         MPPerf.End("Interior", _pt);   // diff-push to subscribed clients
+            _pt = MPPerf.Begin(); InteriorSync.TickClientOwner(); MPPerf.End("InteriorOwner", _pt);   // owner pushes their own shop interior to host
+            _pt = MPPerf.Begin(); InteriorSync.TickOwedResyncs(); MPPerf.End("IntOwed", _pt);   // Stage 0 belt: re-asks owed after a mid-edit discard if the edit-end events missed (self-throttled 2s)
+            InteriorSync.TickDirtWatch();   // [DirtWatch] diagnostic — does a shop's dirt ever go down, or only up? (throttled 60s, anomaly-gated, removable)
+            _pt = MPPerf.Begin(); GameStatePatcher.DrainPendingLogoRefreshes(); MPPerf.End("LogoRefresh", _pt);
+            _pt = MPPerf.Begin(); GameStatePatcher.DrainDeferredRepaints(); MPPerf.End("Repaint", _pt);   // JOIN-SMOOTH-1
+
+            // Send our character appearance once the character is ready.
+            // (Round-98: named sub-bracket — it polls a full appearance read every 5s.)
+            _pt = MPPerf.Begin(); TrySendLocalAppearance(); MPPerf.End("Appearance", _pt);
+
+            if (!MPServer.IsRunning && !MPClient.IsConnected)
+            {
+                // RideProbe ground-truth capture works in single-player too.
+                return;
+            }
+
+            // Smooth remote vehicles toward their networked transform (every frame).
+            _pt = MPPerf.Begin(); VehicleManager.TickSmoothing(); MPPerf.End("Smooth", _pt);
+
+            // Traffic sync foundation (host enumerates / client disables local traffic).
+            _pt = MPPerf.Begin(); TrafficSync.Tick(); MPPerf.End("Traffic", _pt);
+
+            _posSyncTimer += Time.deltaTime;
+            if (_posSyncTimer < NetRate.MoveInterval) return; // NET-RATE-1: 10-60 Hz, the server's level (was a fixed ~10 Hz)
+            _posSyncTimer = 0f;
+
+            try
+            {
+                var pc = PlayerHelper.PlayerController;
+                if (pc == null) return;
+
+                var pos  = PlayerHelper.GetPosition();
+                float rotY = pc.Character != null
+                    ? pc.Character.transform.eulerAngles.y
+                    : 0f;
+
+                // Field 20260830-170644: the building tag must come from the game's own authority,
+                // not the mod's shop-context note. The old source (CurrentShopAddress) is cleared
+                // at exit START, while the native exit teleports the body to the street only AFTER
+                // its fade — so for ~0.3s we broadcast "" (outdoors) with interior-island
+                // coordinates, and the receiver's round-87 mask ("outdoors ⇒ street coords")
+                // showed the avatar inside any same-island interior ("host sees me exiting from
+                // HIS building"). BuildingManager.building clears only AFTER the street teleport
+                // (ResetIndoors, BuildingManager.cs:1455), so deriving the tag from
+                // IsInsideBuilding guarantees the first "" ships with street coordinates.
+                // (Entry side: the tag now flips at load start, before the body arrives — the
+                // receiver hides the avatar early, which is benign and closes the mirror-image
+                // entry-side pop as well.)
+                string bldgTag = "";
+                try
+                {
+                    if (BuildingManager.IsInsideBuilding)
+                    {
+                        var breg = InstanceBehavior<BuildingManager>.Instance?.buildingRegistration;
+                        if (breg != null) bldgTag = GameStateReader.AddressKey(breg);
+                    }
+                    else
+                    {
+                        // H-CARSTACK-1 fold G1 (2026-09-28): an UNDERGROUND GARAGE is not a building to the game - its
+                        // layout loads like an interior and the player is teleported onto it, but IsInsideBuilding stays
+                        // false; the only mark is the current address (UndergroundParkingManager.IsInsideParking reads
+                        // CurrentStreetName == "ba:street_parking"). "" here shipped garage coordinates as "outdoors",
+                        // so the host recorded them as this player's last street position. The garage now ships its own
+                        // tag, "<number> ba:street_parking" - the form VehicleManager.IsStreetParking already reads.
+                        // Entry and exit set the address in the same frame as the teleport (UndergroundParkingManager
+                        // Enter/ExitParkingCoroutine), so the tag and the coordinates never disagree.
+                        try
+                        {
+                            if (Parking.UndergroundParking.UndergroundParkingManager.IsInsideParking)
+                            {
+                                var sgp = SaveGameManager.Current;
+                                if (sgp != null) bldgTag = $"{sgp.CurrentStreetNumber} {sgp.CurrentStreetName}";
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+
+                var payload = new PlayerPositionPayload
+                {
+                    PlayerId = MPConfig.PlayerId,
+                    X = pos.x, Y = pos.y, Z = pos.z,
+                    RotY = rotY,
+                    T = Time.unscaledTime,
+                    Bldg = bldgTag   // "" outdoors; cross-interior mask
+                };
+                RemotePlayerManager.ReadLocalAnimState(payload);
+                payload.Sit = RemotePlayerManager.LocalSitKind(pc);   // SIT-SYNC-1
+                MPHandIk.FillPayload(payload);   // hand-IK mirror while pushing
+
+                if (MPServer.IsRunning)
+                    MPServer.BroadcastPlayerPosition(payload);
+                else if (MPClient.IsConnected)
+                    MPClient.SendPlayerPosition(payload);
+
+                // Vehicle fleet — wave-2 (audit T4): the driven set streams at 10 Hz; parked
+                // vehicles travel only on change + a 5 s full-truth heartbeat.
+                var vp = VehicleManager.ReadLocalFleet();
+                if (vp != null) VehicleManager.SplitAndSend(vp);
+                VehicleManager.TickDriveSync();   // handoff: broadcast the pose of a borrowed car I'm driving
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError($"[UI] TickPositionSync error: {ex.Message}");
+            }
+        }
+
+        // ── Periodic host sync ticks ──────────────────────────────────────────
+
+        /// <summary>
+        /// Host broadcasts current day/time/speed every 3 seconds as a drift-alignment heartbeat.
+        /// This is a safety net — with timeScale sync, drift should be sub-second.
+        /// The first broadcast fires 5 s after entering the game (set in TickGameLoadDetect).
+        /// </summary>
+        private void TickTimeSync()
+        {
+            if (!IsInGame() || !MPServer.IsRunning) return;
+
+            _timeSyncTimer -= Time.unscaledDeltaTime; // use unscaled so pauses don't delay it
+            if (_timeSyncTimer > 0f) return;
+            _timeSyncTimer = 3f;
+
+            try { MPServer.BroadcastGameTime(); }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError($"[UI] TickTimeSync error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Host broadcasts market prices to all clients every ~60 seconds to prevent price divergence.
+        /// </summary>
+        private void TickMarketSync()
+        {
+            if (!IsInGame() || !MPServer.IsRunning) return;
+
+            // Round-102h (field-measured): this counted down with Time.deltaTime — SCALED game
+            // time, which STOPS while the host is paused (menus/phone/startup hold) and slows with
+            // game speed. Every other sync channel uses real time (MPPriceSync/MPStockSync:
+            // unscaledTime; BusinessSync market events: realtimeSinceStartup). A field client's
+            // 40-minute session got FOUR market updates — gaps of 250s, 950s and 60s, then 810s of
+            // silence — so its demand table sat uncorrected for most of the session. Real time now.
+            if (Time.unscaledTime < _marketSyncNextAt) return;
+            _marketSyncNextAt = Time.unscaledTime + 60f;
+
+            try
+            {
+                var json = GameStateReader.GetMarketEntriesJson();
+                if (json != "[]")
+                {
+                    MPServer.BroadcastMarketSnapshot(json);
+                    Plugin.Logger.LogInfo("[UI] Periodic market snapshot broadcast.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError($"[UI] TickMarketSync error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// The character portrait PNG/JPG is written to disk lazily — AFTER the
+        /// initial profile broadcast — so that first send carries no portrait.
+        /// Once the file appears, re-send the profile (with portrait + age) so
+        /// remote players get the real face.  Sends once, then stops; gives up
+        /// after a couple of minutes.  Resets when leaving the game.
+        /// </summary>
+        private void TickProfileResend()
+        {
+            bool connected = MPClient.IsConnected || MPServer.IsRunning;
+            if (!IsInGame() || !connected)
+            {
+                // Reset on leave/disconnect so a RECONNECT re-sends the profile —
+                // the reconnecting client's name map (and others' view of it) was
+                // wiped by the world reload.
+                GameStatePatcher.LocalPortraitSent = false;
+                _profileNameConfirmed = false;
+                _profileResendElapsed = 0f; _profileResendTimer = 5f; return;
+            }
+            // Done only once BOTH a real character name AND the portrait have gone out.
+            if (GameStatePatcher.LocalPortraitSent && _profileNameConfirmed) return;
+
+            _profileResendTimer -= Time.unscaledDeltaTime;
+            _profileResendElapsed += Time.unscaledDeltaTime;
+            if (_profileResendTimer > 0f) return;
+            _profileResendTimer = 3f;
+            if (_profileResendElapsed > 600f) { GameStatePatcher.LocalPortraitSent = true; _profileNameConfirmed = true; return; }   // give up after ~10 min
+
+            try
+            {
+                // Decoupled name vs portrait (the old gate waited for the portrait,
+                // so a late character name — player still in char-gen at first send —
+                // never propagated and the PlayerId fallback stuck).  Re-send when
+                // EITHER becomes newly available; stop when both are confirmed.
+                bool nameReal      = MPNames.LocalCharacterName() != MPConfig.PlayerId;
+                bool portraitReady = !string.IsNullOrEmpty(GameStatePatcher.ReadLocalPortraitBase64());
+                bool nameNew     = nameReal      && !_profileNameConfirmed;
+                bool portraitNew = portraitReady && !GameStatePatcher.LocalPortraitSent;
+                if (!nameNew && !portraitNew) return;   // nothing new yet — wait, don't spam
+
+                if (MPClient.IsConnected) MPClient.SendPlayerProfile();
+                else if (MPServer.IsRunning) MPServer.BroadcastHostProfile();
+                if (nameReal) _profileNameConfirmed = true;
+                Plugin.Logger.LogInfo($"[UI] Re-sent player profile (nameReady={nameReal}, portrait={portraitReady}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[UI] TickProfileResend: {ex.Message}"); }
+        }
+
+        // ── Phase 4: coordinated MP save ─────────────────────────────────────────
+
+        private float _autosaveTimer = -1f;   // <0 = uninitialised (don't fire on entry)
+
+        /// <summary>While in an MP session: suppress the game's own (SP-folder)
+        /// autosave, ship any finished client save up to the host, and — on the
+        /// host — drive the coordinated autosave on the SP-mirrored cadence.</summary>
+        private void TickMpSave()
+        {
+            // SessionEnded counts as "in MP": the connection is gone but the MP
+            // character is still loaded — native autosave must STAY suppressed or
+            // it would write the MP character into the single-player folder.
+            bool inMp = (MPServer.IsRunning || MPClient.IsConnected || MPClient.SessionEnded) && IsInGame();
+            if (!inMp) { _autosaveTimer = -1f; return; }
+
+            // (Version folder is cached unconditionally at the top of Update so the
+            //  poll thread never calls IL2CPP via MpCharacterFolder.)
+
+            // Native autosave suppression moved to Patch_GameManager_CheckAutoSave_
+            // SuppressInMp (field 20260830-205553) — the per-frame preventAutoSave
+            // hold broke 1.0's quicksave hotkey. The patch gates on IsRunning ||
+            // IsClientInWorld (doctrine + review F2), which covers `inMp` above and
+            // the drop windows; IsInGame() is implicit (CheckAutoSave only runs from
+            // the in-game GameManager).
+
+            // Client side: ship a just-finished local save to the host.
+            MPSaveCoordinator.TickPendingUploads();
+
+            // Overlay any host-restored cash once a freshly-loaded game has settled.
+            MPSaveCoordinator.TickCashApply();
+
+            if (!MPServer.IsRunning) return;   // only the host schedules autosaves
+            // DEDICATED-HOST-1: while the world waits for players nothing changes - the last player's leave already saved
+            // ('-disconnect'), so idle autosaves would only rotate good older slots out with identical copies.
+            if (MPServer.PausedByIdle) { _autosaveTimer = -1f; return; }
+            if (_autosaveTimer < 0f) { _autosaveTimer = MPSaveCoordinator.AutosaveIntervalSeconds(); return; }
+            _autosaveTimer -= Time.unscaledDeltaTime;
+            if (_autosaveTimer > 0f) return;
+            _autosaveTimer = MPSaveCoordinator.AutosaveIntervalSeconds();
+            try { MPSaveCoordinator.HostSaveNow("autosave"); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[UI] TickMpSave autosave: {ex.Message}"); }
+        }
+
+        // ── Phase 4: live cash stream (loss-minimization) ────────────────────────
+
+        private float _cashSyncTimer;
+        private float _lastCash = float.NaN;
+
+        /// <summary>Reports the local player's current money to the host every few
+        /// seconds (on change), so the host always holds a near-current cash figure
+        /// to restore on reconnect — a crash then costs at most a few seconds of
+        /// earnings rather than everything since the last autosave.</summary>
+        private void TickCashSync()
+        {
+            bool inMp = (MPServer.IsRunning || MPClient.IsConnected) && IsInGame();
+            if (!inMp) { _lastCash = float.NaN; return; }
+            _cashSyncTimer -= Time.unscaledDeltaTime;
+            if (_cashSyncTimer > 0f) return;
+            _cashSyncTimer = 3f;
+
+            float money;
+            try { var gi = SaveGameManager.Current; if (gi == null) return; money = gi.Money; }
+            catch { return; }
+            if (!float.IsNaN(_lastCash) && Math.Abs(money - _lastCash) < 0.005f) return;   // unchanged
+            _lastCash = money;
+
+            if (MPServer.IsRunning)        MPServer.RecordCash(MPConfig.PlayerId, money);   // host records its own
+            else if (MPClient.IsConnected) MPClient.SendCashSync(money);
+        }
+
+        // ── Phase 5: native main-menu integration ───────────────────────────────
+        // Inject a "Multiplayer" button into the game's own main menu, cloned from a
+        // real menu button so it matches the game's styling — the native entry point
+        // that replaces the floating F8 panel as the way in.
+
+        private enum MpView { Main, Submenu, Lobby }
+        private MpView _view = MpView.Main;
+        private bool  _mpMenuInjected;
+        private float _menuCheckTimer;
+        private GameObject? _mpButton;                       // the purple "Multiplayer" entry
+        private GameObject? _mpVersionTag;                   // round-91b: bottom-left mod-version tag (MP views only)
+        private readonly List<GameObject> _origMenuButtons = new();   // the game's normal buttons (hidden in MP view)
+        private readonly List<GameObject> _mpSubmenu       = new();   // Host New / Host Saved / Join / Back
+        private readonly List<GameObject> _mpLobby         = new();   // lobby view: status + Start + Leave
+        private TMP_Text?  _lobbyText;       // status + player list
+        private GameObject? _lobbyStartGO;   // host-only "Start Game"
+        private bool        _lobbyLoadMode;  // true = Host Saved (load), false = Host New
+        /// <summary>True once the native font/sprite have been captured from the main
+        /// menu.  The autopilot waits for this before auto-hosting so launcher-driven
+        /// runs style their UI identically to manual play.</summary>
+        internal static bool ThemeReady;
+
+        private TMP_FontAsset? _gameFont;    // captured from a menu button so our windows look native
+        private float _menuFontSize = 15f;   // the menu buttons' text size, so our window buttons match
+        private Button? _menuTemplate;       // a real menu button, for cloning native-styled buttons into our windows
+        private Sprite? _panelSprite;        // the menu button's rounded sprite, reused for rounded window backgrounds
+
+        // ── Join a Game dialog (redesign, user-approved 2026-09-28) ───────────────
+        private GameObject? _joinDialog;                 // full-screen transparent blocker holding the card
+        private LCard? _joinCard;
+        private LField? _joinIpF, _joinPortF, _joinTelF;   // DEDICATED-KEY-1: third box = server key
+        private LBtn? _joinConnectB, _joinBackB;
+        private TextMeshProUGUI? _joinErrLbl;
+        private int    _joinFocus;                       // 0=none, 1=address, 2=port, 3=server key
+        private string _joinTel  = "";                   // DEDICATED-KEY-1: the Server key box
+        private string _joinIp   = "127.0.0.1";
+        private string _joinPort = "7777";
+        private string _joinErr  = "";                   // validation error shown INSIDE the dialog (it stays open)
+        private int    _joinBad;                         // 0 none, 1 address box red, 2 port box red
+        private bool   _joinDirty, _joinCaretOn, _joinTickErrLogged;
+
+        // ── Lobby window (redesign, user-approved 2026-09-28: look v3, wording, port option A) ──
+        // Layout v4 (user-approved 2026-09-28): the player list runs from under the column header down to the footer
+        // divider; the row count is DERIVED from that space at the 56-unit row pitch -> 8 rows, the scrollbar from player 9.
+        // Fold 2 (manager's screenshot check 2026-09-28): the 8 rows FILL that space - row 8 ends one list margin (the gap
+        // between the column header and row 1) above the divider; the row HEIGHT grows, the 6-unit gap stays.
+        private const float LW_HDR_Y = 64f, LW_HDR_H = 15f, LW_LIST_Y = 87f, LW_DIVIDER_Y = 575f, LW_ROW_GAP = 6f;
+        private const int   LW_SLOTS = 8;                                                    // player rows visible without scrolling
+        private const float LW_LIST_MARGIN = LW_LIST_Y - (LW_HDR_Y + LW_HDR_H);              // 8: over row 1 = under row 8
+        private const float LW_LIST_H = LW_DIVIDER_Y - LW_LIST_MARGIN - LW_LIST_Y;           // 480: row 1 top .. row 8 bottom
+        private const float LW_ROW_PITCH = (LW_LIST_H + LW_ROW_GAP) / LW_SLOTS;              // 60.75
+        private const float LW_ROW_H = LW_ROW_PITCH - LW_ROW_GAP;                           // 54.75
+        private const float LW_ROW_CTL_Y = (LW_ROW_H - 30f) / 2f;                            // a 30-high box / button, centred in its row
+        // Couldn't join: shown for any disconnect reason that is not one of the mod's own sentences (raw transport names
+        // like "Timeout" are logged, never shown). ONE constant: the wording is awaiting the user.
+        private const string JoinLostText = "Lost connection to the host.";
+        private GameObject? _lobbyWindow;                // full-screen transparent blocker holding the cards below
+        private LCard? _lwMain, _lwConn, _lwFail, _lwPortCard;
+        private readonly LRow?[] _lwRows = new LRow?[LW_SLOTS];
+        private RectTransform? _rtLwList, _lwThumb, _rtLwSettings, _rtLwInvite, _rtLwWaiting, _rtLwSpin;
+        private GameObject? _lwTrack;
+        private LBtn? _lwModsAllowB, _lwModsRefuseB;   // MODS-GATE-1: host-only 'Different mods' row
+        private TextMeshProUGUI? _lwModsLbl;
+        private TextMeshProUGUI? _lwHdrCash, _lwHdrAge, _lwNotice, _lwDiffLbl, _lwSavedLbl, _lwDirectLbl, _lwAddrLbl, _lwHintLbl, _lwWaitLbl, _lwConnLbl, _lwFailLbl, _ppErrLbl;
+        private LBtn? _lwMoreB, _lwSaveSetB, _lwDiffEasyB, _lwDiffNormalB, _lwDiffHardB, _lwInviteB, _lwShowIpB, _lwPortB, _lwLeaveB, _lwStartB;
+        private LBtn? _lwConnCancelB, _lwFailBackB, _lwFailRetryB, _lwFailModsB, _ppCancelB, _ppSaveB;
+        private LField? _ppField;
+        private int    _lwScroll, _lwCard, _lwLayoutKey = -1, _lwThumbKey = -1;
+        // Starting cash = host-dictated (host edits any row); age = self-edited (own row only). These hold the
+        // PLAYER index (not the row slot) of the focused box, -1 = none; _lwEditBuf is that box's typed digits.
+        private int    _lwRowCashFocus = -1, _lwRowAgeFocus = -1;
+        private string _lwEditBuf = "";
+        private bool   _lwCaretOn, _lwCaretDirty, _lwPortOpen, _ppFocus, _lwHostFailed, _lwRefreshErrLogged, _lwTickErrLogged;
+        private string _ppText = "", _ppErr = "", _lwFailShown = "\u0001", _lwSteamAddrKey = "", _lwSteamAddrShown = "";
+        // Review item 14: the focused cash / age box follows the PLAYER (by id), not the row; "" = none.
+        private string _lwCashFocusId = "", _lwAgeFocusId = "", _lwRawReasonLogged = "\u0001";
+        // Review item 13: scrollbar track click pages, thumb drag scrolls. Review item 15: the size the lobby was fitted to.
+        private RectTransform? _rtLwTrackHit;
+        private bool  _lwThumbDrag;
+        private float _lwDragStartY, _lwFitScale;
+        // Fold 2: the right column's fitted layout (LwFitRightColumn) and the texts / layout it was measured for.
+        private float  _lwAddrY = 46f, _lwAddrFallbackH = 18f, _lwInviteTop = 184f;
+        private bool   _lwSteamOnly, _lwFitErrLogged;
+        private int    _lwRcLayout = -1;
+        private string _lwRcAddr = "", _lwRcHint = "", _lwRcWait = "";
+        private int   _lwDragStartScroll, _lwFitW, _lwFitH;
+        private bool _showIp;   // IP hidden by default (streamer-safe USER RULE): reset on every lobby open, never saved
+
+        // ── "Host Saved Game" save picker — grouped by playthrough, scrollable ──
+        private GameObject? _savePicker;
+        private TextMeshProUGUI? _spInfo;
+        private RectTransform? _rtSpLoad, _rtSpBack, _rtSpRecov;
+        private RectTransform? _spViewport, _spContent, _spTrack, _spThumb;
+        private float  _spScroll, _spContentH;
+        private string _spExpanded   = "";   // round-221: CARD KEY (worldId|base) of the expanded playthrough — base name alone stopped being unique once two worlds could headline the same save name
+        private string _spSelSession = "";   // session selected to host
+        private string _spSelPid     = "";   // round-219: WHICH world the selected row belongs to — the click carries the identity, like vanilla's row-is-the-file
+        // Store v2: what the picker LISTED each session name as (name → playthrough id;
+        // "" = ambiguous, two playthroughs list the same name). Pinned at load-click so
+        // the load resolves to the world the player was actually shown.
+        private readonly System.Collections.Generic.Dictionary<string, string> _spPidBySession =
+            new(StringComparer.OrdinalIgnoreCase);
+        private bool   _spShowRecovery;      // native-parity: automatic saves hidden behind a toggle,
+                                             // like vanilla's "show recover saves" (2026-07-07)
+        // Plain ref type (NOT a [Serializable] ValueTuple) — a List<ValueTuple<RectTransform,string>>
+        // field on a MonoBehaviour trips Unity's type processing at load and the whole mod assembly
+        // fails to load.  A non-serializable class field is skipped cleanly.
+        private sealed class SpHit { public readonly RectTransform Rt; public readonly string Key; public readonly string Pid; public SpHit(RectTransform rt, string key, string pid = "") { Rt = rt; Key = key; Pid = pid; } }
+        private readonly System.Collections.Generic.List<SpHit> _spHeaderHits = new();
+        private readonly System.Collections.Generic.List<SpHit> _spVarHits   = new();
+
+        private static readonly Color MpPurple = new Color(0.64f, 0.36f, 0.95f, 1f);   // brighter, more saturated violet
+
+        private float _themeScanTimer;
+
+        /// <summary>Frontloads the native look: grabs the game's font + a rounded
+        /// 9-sliced sprite from ANY loaded UI, as early as possible and independent of
+        /// the menu injection / what the player clicks.  Runs from startup until both
+        /// are captured (then stops), so our windows (esp. the in-game F9 window) style
+        /// themselves natively no matter how fast anyone — or the autopilot — proceeds.
+        /// The menu injection later refines _panelSprite to the exact menu-button sprite.</summary>
+        private void TickThemeCapture()
+        {
+            // Captured assets are game-owned and can be DESTROYED by scene/view
+            // unloads (Addressables) — detect that (managed ref set but native
+            // object dead), clear, and let the scan re-capture.  `is not null`
+            // bypasses the overloaded ==, so this also fires when interop
+            // null-equality already reports the object as gone.
+            if (_gameFont is not null && !IsAlive(_gameFont))
+            { _gameFont = null; Plugin.Logger.LogInfo("[MenuUI] Captured font was unloaded — recapturing."); }
+            if (_panelSprite is not null && !IsAlive(_panelSprite))
+            { _panelSprite = null; Plugin.Logger.LogInfo("[MenuUI] Captured sprite was unloaded — recapturing."); }
+
+            if (_gameFont != null && _panelSprite != null) { ThemeReady = true; return; }
+            // No scanning IN-GAME: the menu sources aren't there, and the scans
+            // (FindObjectOfType/FindObjectsOfType) walk the object table — a
+            // periodic main-thread hitch.  If assets died mid-game our windows
+            // fall back to the owned sprite/default font until back at the menu.
+            if (IsInGame()) return;
+            _themeScanTimer -= Time.unscaledDeltaTime;
+            if (_themeScanTimer > 0f) return;
+            _themeScanTimer = 0.5f;
+            try
+            {
+                // PREFERRED source: the main menu's own buttons (same template the
+                // injection refinement uses).  The generic "first 9-sliced sprite
+                // anywhere" scan below never completes at the menu (the menu sprites
+                // carry no border data), so under the bat autopilot it used to fire
+                // only IN-GAME — grabbing a random HUD sprite that left the F9
+                // window transparent/unrounded.  Capturing from the menu button
+                // directly completes within ~1s of the menu appearing instead.
+                if (_gameFont == null || _panelSprite == null)
+                {
+                    var mmc = UnityEngine.Object.FindObjectOfType<MainMenuController>();
+                    var startView = mmc != null ? mmc.startView : null;
+                    if (startView != null)
+                    {
+                        foreach (var b in startView.GetComponentsInChildren<Button>(true))
+                        {
+                            if (b == null) continue;
+                            if (_gameFont == null)
+                            {
+                                var t = b.GetComponentInChildren<TMP_Text>(true);
+                                if (t != null && t.font != null) { _gameFont = t.font; if (t.fontSize > 4f) _menuFontSize = t.fontSize; }
+                            }
+                            if (_panelSprite == null)
+                            {
+                                var img = b.image ?? b.GetComponentInChildren<Image>(true);
+                                if (img != null && img.sprite != null) _panelSprite = img.sprite;
+                            }
+                            if (_gameFont != null && _panelSprite != null) break;
+                        }
+                    }
+                }
+
+                // Fallbacks: any font is safe anywhere; a generic sprite is only
+                // trustworthy OUTSIDE the game scene (in-game the first 9-sliced
+                // sprite is some random HUD element — worse than no styling).
+                if (_gameFont == null)
+                {
+                    foreach (var t in UnityEngine.Object.FindObjectsOfType<TextMeshProUGUI>())
+                        if (t != null && t.font != null) { _gameFont = t.font; break; }
+                }
+                if (_panelSprite == null && !IsInGame())
+                {
+                    foreach (var img in UnityEngine.Object.FindObjectsOfType<Image>())
+                        if (img != null && img.sprite != null && img.sprite.border != Vector4.zero) { _panelSprite = img.sprite; break; }
+                }
+                if (_gameFont != null && _panelSprite != null)
+                {
+                    ThemeReady = true;
+                    Plugin.Logger.LogInfo("[MenuUI] Theme frontloaded (font + rounded sprite captured eagerly).");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] theme scan: {ex.Message}"); }
+        }
+
+        private void TickMenuIntegration()
+        {
+            _menuCheckTimer -= Time.unscaledDeltaTime;
+            if (_menuCheckTimer > 0f) return;
+            _menuCheckTimer = 0.5f;   // 2×/sec at the MENU — keeps the lobby list fresh
+
+            // In-game there is no main menu — but FindObjectOfType still walks
+            // the object table to prove it, twice a second, forever (a measured
+            // periodic main-thread hitch = rhythmic car stutter).  Skip the
+            // search entirely in-game; reset the injected flag so returning to
+            // the menu re-injects.  MUST also hide our menu windows here: a
+            // session LOAD jumps straight into the game (no intro scene), so
+            // the mmc-null hide below never ran and the lobby window sat over
+            // the loaded world on BOTH machines (2026-06-11).
+            if (IsInGame())
+            {
+                _mpMenuInjected = false;
+                if (_lobbyWindow != null && _lobbyWindow.activeSelf) { try { _lobbyWindow.SetActive(false); } catch { } }
+                if (_joinDialog != null && _joinDialog.activeSelf)  { try { _joinDialog.SetActive(false);  } catch { } }
+                if (_savePicker != null && _savePicker.activeSelf)  { try { _savePicker.SetActive(false);  } catch { } }
+                _view = MpView.Main;
+                return;
+            }
+
+            MainMenuController? mmc = null;
+            try { mmc = UnityEngine.Object.FindObjectOfType<MainMenuController>(); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] find MainMenuController: {ex.Message}"); }
+
+            if (mmc == null)   // not on the menu → forget the (now-destroyed) UI so we re-inject next visit
+            {
+                _mpMenuInjected = false; _mpButton = null; _lobbyText = null; _view = MpView.Main;
+                _origMenuButtons.Clear(); _mpSubmenu.Clear(); _mpLobby.Clear(); LwClearFocus();
+                if (_joinDialog != null)  { try { _joinDialog.SetActive(false);  } catch { } }
+                if (_lobbyWindow != null) { try { _lobbyWindow.SetActive(false); } catch { } }
+                if (_savePicker != null)  { try { _savePicker.SetActive(false);  } catch { } }
+                return;
+            }
+
+            if (!_mpMenuInjected)
+            {
+                _mpMenuInjected = true;   // attempt once per menu visit (success or fail) — no spam
+                try { InjectMultiplayerMenu(mmc); }
+                catch (Exception ex) { Plugin.Logger.LogError($"[MenuUI] InjectMultiplayerMenu: {ex}"); }
+            }
+            else if (_view == MpView.Lobby)
+            {
+                RefreshLobbyWindow();   // keep the player list current while in the lobby
+            }
+        }
+
+        private void InjectMultiplayerMenu(MainMenuController mmc)
+        {
+            var startView = mmc.startView;
+            if (startView == null) { Plugin.Logger.LogWarning("[MenuUI] startView is null."); return; }
+
+            // Find the main button column by locating LoadGameButton — its parent is
+            // the container the menu buttons live in.
+            var buttons = startView.GetComponentsInChildren<Button>(true);
+            Button? template = null;
+            for (int i = 0; i < buttons.Length; i++)
+            {
+                if (buttons[i].gameObject.name == "LoadGameButton") { template = buttons[i]; break; }
+            }
+            if (template == null) { Plugin.Logger.LogWarning("[MenuUI] LoadGameButton not found."); return; }
+
+            // Capture the game's font + a rounded button sprite so our custom windows
+            // (connect dialog, lobby) render with native styling.
+            try { var t = template.GetComponentInChildren<TMP_Text>(true); if (t != null) { _gameFont = t.font; if (t.fontSize > 4f) _menuFontSize = t.fontSize; } } catch { }
+            _menuTemplate = template;
+            try { var img = template.image ?? template.GetComponentInChildren<Image>(true); if (img != null && img.sprite != null) _panelSprite = img.sprite; } catch { }
+            // Signal that the native font/sprite are captured.  The autopilot waits for
+            // this before auto-hosting so bat-launched runs go through the same theme-
+            // capture path as manual play (otherwise the F9 window etc. stay unstyled).
+            if (_gameFont != null || _panelSprite != null) ThemeReady = true;
+
+            var container = template.transform.parent;
+
+            // Capture the game's normal column buttons (siblings of LoadGameButton) so
+            // we can hide/restore them when toggling the MP submenu.
+            _origMenuButtons.Clear();
+            for (int i = 0; i < container.childCount; i++)
+            {
+                var ch = container.GetChild(i).gameObject;
+                if (ch.GetComponent<Button>() != null) _origMenuButtons.Add(ch);
+            }
+
+            // The purple "Multiplayer" entry, placed right after Load Game.
+            _mpButton = CloneMenuButton(template, "BAMP_Multiplayer", Loc.T("gps_ui_multiplayer", "Multiplayer"), OnMultiplayerClicked, MpPurple);
+            _mpButton.transform.SetSiblingIndex(template.transform.GetSiblingIndex() + 1);
+
+            // The MP submenu (built hidden) — shown when Multiplayer is clicked.
+            _mpSubmenu.Clear();
+            // Submenu buttons keep the normal gray styling (only the top-level
+            // Multiplayer entry is purple).
+            // DEDICATED-ONLY-1 (Going Public Server 1.0.12, user ruling 2026-10-30): multiplayer is played on dedicated servers
+            // only - players no longer host. The dedicated server starts its world itself (DedicatedHost / OnHost), not
+            // through these buttons.
+            _mpSubmenu.Add(CloneMenuButton(template, "BAMP_Join",      Loc.T("gps_ui_join_game", "Join Game"),       OnMpJoin,      null));
+            // BUG-REPORT-OFF-1 (user ruling 2026-10-31): no "Report a Bug" entry - its reports went to the original
+            // Going Public's Discord.
+            _mpSubmenu.Add(CloneMenuButton(template, "BAMP_Back",      Loc.T("gps_ui_back", "Back"),            OnMpBack,      null));
+            foreach (var b in _mpSubmenu) b.SetActive(false);
+
+            // (The lobby is a proper window built lazily under our canvas — see
+            //  BuildLobbyWindow — not a button-column view.)
+
+            _view = MpView.Main;
+            Plugin.Logger.LogInfo($"[MenuUI] Injected Multiplayer menu ({_origMenuButtons.Count} original buttons captured).");
+        }
+
+        /// <summary>Clone a real menu button so it matches the game's styling, set its
+        /// label + click action, optional tint.  Returns the clone GameObject.</summary>
+        private GameObject CloneMenuButton(Button template, string name, string label, Action onClick, Color? tint)
+        {
+            var clone = UnityEngine.Object.Instantiate(template.gameObject, template.transform.parent);
+            clone.name = name;
+            clone.SetActive(true);
+
+            // Label — set TMP text and disable any localization component that would
+            // otherwise revert it to the original key.
+            try
+            {
+                var mbs = clone.GetComponentsInChildren<MonoBehaviour>(true);
+                for (int i = 0; i < mbs.Length; i++)
+                {
+                    var c = mbs[i];
+                    try { if (c != null && c.GetType().Name.Contains("Localization")) c.enabled = false; } catch { }
+                }
+                var tmp = clone.GetComponentInChildren<TMP_Text>(true);
+                if (tmp != null) tmp.text = label;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] label '{label}': {ex.Message}"); }
+
+            // Tint
+            if (tint.HasValue)
+            {
+                try { var b = clone.GetComponent<Button>(); if (b != null && b.targetGraphic != null) b.targetGraphic.color = tint.Value; }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] tint '{label}': {ex.Message}"); }
+            }
+
+            // Click — replace the whole event so the original prefab's persistent
+            // listeners (e.g. open Load Game) don't also fire.  Force interactable:
+            // the LoadGameButton template is disabled by the game when the player has
+            // no saved games (MainMenuController), and an Instantiate clone inherits
+            // that darkened, un-clickable state — which dead-clicked the Multiplayer
+            // button for any brand-new player.  This is our own button; keep it live.
+            var btn = clone.GetComponent<Button>();
+            if (btn != null)
+            {
+                btn.interactable = true;
+                btn.enabled = true;
+                btn.onClick = new Button.ButtonClickedEvent();
+                btn.onClick.AddListener(new UnityEngine.Events.UnityAction(onClick.Invoke));
+            }
+            return clone;
+        }
+
+        /// <summary>Clone a menu button but make it a non-interactive label (keeps
+        /// the game's font/background, no click).  Used for the lobby status line.</summary>
+        private GameObject CloneMenuLabel(Button template, string name, string text)
+        {
+            var go = CloneMenuButton(template, name, text, () => { }, null);
+            try { var b = go.GetComponent<Button>(); if (b != null) { b.interactable = false; b.enabled = false; } } catch { }
+            return go;
+        }
+
+        /// <summary>Clone a real menu button into any parent at a fixed position/size
+        /// (native rounded styling + game font).  Click works via onClick where a
+        /// raycaster exists, and via RectHit in our window ticks regardless.</summary>
+        private GameObject? CloneButtonInto(Transform parent, string name, string label, Action onClick, float x, float y, float w, float h)
+        {
+            if (_menuTemplate == null) return null;
+            var clone = UnityEngine.Object.Instantiate(_menuTemplate.gameObject, parent);
+            clone.name = name;
+            clone.SetActive(true);
+            SetAnchored(clone.GetComponent<RectTransform>(), x, y, w, h);
+            try
+            {
+                var mbs = clone.GetComponentsInChildren<MonoBehaviour>(true);
+                for (int i = 0; i < mbs.Length; i++) { var c = mbs[i]; try { if (c != null && c.GetType().Name.Contains("Localization")) c.enabled = false; } catch { } }
+                var tmp = clone.GetComponentInChildren<TMP_Text>(true);
+                if (tmp != null)
+                {
+                    tmp.text = label;
+                    // The clone was resized to our window's button size; force the label
+                    // to fill + center so it's always visible (the original layout was
+                    // sized for the much larger menu button → text ended up off/clipped).
+                    var trt = tmp.rectTransform;
+                    trt.anchorMin = Vector2.zero; trt.anchorMax = Vector2.one;
+                    trt.offsetMin = new Vector2(6f, 0f); trt.offsetMax = new Vector2(-6f, 0f);
+                    tmp.alignment = TextAlignmentOptions.Center;
+                    // Use the menu's own button font size so our window buttons match the
+                    // menu buttons (HOST NEW GAME) instead of auto-filling (which rendered
+                    // too big).  Fixed size, no auto-fill.
+                    tmp.enableAutoSizing = false;
+                    tmp.fontSize = UnityEngine.Mathf.Clamp(_menuFontSize, 10f, 17f);
+                    tmp.overflowMode = TextOverflowModes.Overflow;
+                    if (tmp.gameObject != clone) tmp.gameObject.SetActive(true);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] CloneButtonInto '{label}': {ex.Message}"); }
+            try { var btn = clone.GetComponent<Button>(); if (btn != null) { btn.interactable = true; btn.enabled = true; btn.onClick = new Button.ButtonClickedEvent(); btn.onClick.AddListener(new UnityEngine.Events.UnityAction(onClick.Invoke)); } } catch { }
+            return clone;
+        }
+
+        private void ShowView(MpView v)
+        {
+            var prevView = _view;
+            _view = v;
+            bool main = v == MpView.Main, sub = v == MpView.Submenu, lob = v == MpView.Lobby;
+            foreach (var o in _origMenuButtons) { try { o.SetActive(main); } catch { } }
+            if (_mpButton != null) { try { _mpButton.SetActive(main); } catch { } }
+            foreach (var m in _mpSubmenu) { try { m.SetActive(sub); } catch { } }
+            // User-approved 2026-08-21 (replaces P9): with nothing loadable, Host Saved
+            // Game greys out exactly like vanilla's Load Game button — the empty window
+            // becomes unreachable. Re-probed every time the submenu shows (live read).
+            if (sub)
+            {
+                try
+                {
+                    var hs = _mpSubmenu.Find(b => b != null && b.name == "BAMP_HostSaved");
+                    var hsBtn = hs != null ? hs.GetComponent<Button>() : null;
+                    if (hsBtn != null) hsBtn.interactable = MPSaveManager.AnyLoadableSaves();
+                }
+                catch { }
+            }
+            if (lob && _lobbyWindow == null) BuildLobbyWindow();
+            if (lob && _lobbyWindow == null)
+            {   // Review item 3: the lobby window could not be built (logged there, blocker torn down). Never strand the player
+                // behind nothing: end the session this view belonged to and go back to the multiplayer submenu.
+                Plugin.Logger.LogWarning("[MenuUI] lobby window unavailable - leaving the session, back to the multiplayer submenu.");
+                try { if (MPServer.IsRunning) OnStop(); else if (MPClient.IsConnected || MPClient.IsConnecting) OnDisc(); }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] lobby fallback leave: {ex.Message}"); }
+                ShowView(MpView.Submenu);
+                return;
+            }
+            if (lob && prevView != MpView.Lobby) OnLobbyOpening();   // lobby redesign 2026-09-28: IP hidden again every open
+            if (lob) ShowJoinDialog(false);
+            if (_lobbyWindow != null) { try { _lobbyWindow.SetActive(lob); } catch { } }
+            if (lob) RefreshLobbyWindow();
+            // Round-91b (user-placed): the MP mod's version, screen bottom-left just ABOVE the game's
+            // own version line, visible from the moment the Multiplayer button is clicked (submenu +
+            // lobby views; hidden on the plain main menu). Bound to the compiled-in constants the join
+            // handshake enforces and package.ps1 reads — correct by construction, no second copy of
+            // the truth anywhere.
+            try
+            {
+                if (_mpVersionTag == null && _canvasGO != null)
+                {
+                    _mpVersionTag = MakeGO("BAMP_VersionTag", _canvasGO.transform);
+                    var vrt = _mpVersionTag.GetComponent<RectTransform>();
+                    vrt.anchorMin = vrt.anchorMax = vrt.pivot = new Vector2(0f, 0f);
+                    vrt.sizeDelta = new Vector2(620f, 24f);
+                    vrt.anchoredPosition = new Vector2(14f, 50f);   // +8px (half the font size) — 42 partially overlapped the native version line (user, 2026-07-26)
+                    var vt = _mpVersionTag.AddComponent<TextMeshProUGUI>();
+                    vt.text = $"GPS-MM v. {MyPluginInfo.PLUGIN_VERSION}" + (MyPluginInfo.BuildId.Length > 0 ? $" ({MyPluginInfo.BuildId})" : "");   // user 2026-11-01: short (GPS-MM = Going Public Server multiplayer mod); BUILD-ID-1
+                    vt.fontSize = 15;
+                    vt.color = new Color(0.75f, 0.78f, 0.90f, 0.95f);
+                    vt.alignment = TextAlignmentOptions.BottomLeft;
+                    ApplyFont(vt);
+                }
+                if (_mpVersionTag != null) _mpVersionTag.SetActive(!main);
+            }
+            catch { }
+        }
+
+        private void OnMultiplayerClicked() { Plugin.Logger.LogInfo("[MenuUI] Multiplayer → submenu"); ShowView(MpView.Submenu); }
+        private void OnMpBack()             { Plugin.Logger.LogInfo("[MenuUI] Back → main menu");   ShowView(MpView.Main); }
+
+        private void OnMpHostNew()
+        {
+            Plugin.Logger.LogInfo("[MenuUI] Host New Game → hosting");
+            _lobbyLoadMode = false;
+            RestorePreLoadSettings();   // SAVED-SETTINGS-1: a saved world's seeded values never carry into a new game
+            try { OnHost(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] host: {ex.Message}"); }
+            ShowView(MpView.Lobby);
+        }
+
+        private void OnMpHostSaved()
+        {
+            // Round-225: the native-style load window (vanilla layout + delete). The
+            // classic picker stays as the loud fallback if the clone can't build.
+            // Live read at commitment (user-approved 2026-08-21): the grey-out decides at
+            // submenu-show time; this guard re-decides at the click itself.
+            if (!MPSaveManager.AnyLoadableSaves())
+            { Plugin.Logger.LogInfo("[MenuUI] Host Saved Game ignored — no loadable MP saves (the button greys for this)."); return; }
+            if (MPLoadWindow.Open()) { Plugin.Logger.LogInfo("[MenuUI] Host Saved Game → native-style load window"); return; }
+            Plugin.Logger.LogInfo("[MenuUI] Host Saved Game → classic save picker (fallback)");
+            ShowSavePicker(true);   // choose WHICH save first (local disk; no server needed yet)
+        }
+
+        /// <summary>Round-225: the load window picked a save — reuse the classic flow
+        /// (pin → tuning mirror → host → lobby) with the exact (name, world) pair.</summary>
+        internal void LoadPickedSession(string session, string pid)
+        {
+            _spSelSession = session;
+            _spSelPid     = pid ?? "";
+            OnSpLoad();
+        }
+
+        /// <summary>Round-225: load window closed without picking — back to the MP submenu.</summary>
+        internal void OnLoadWindowClosed() { try { ShowView(MpView.Submenu); } catch { } }
+
+        /// <summary>Round-225e: the load window sits at the NATIVE canvas layer (below
+        /// BAMP_Canvas) so vanilla dialogs stack above it — hide our submenu while it is
+        /// open so nothing of ours draws over it; restoring replays the current view.</summary>
+        internal void SetMpMenuHiddenForLoadWindow(bool hidden)
+        {
+            if (hidden) { foreach (var m in _mpSubmenu) { try { m.SetActive(false); } catch { } } }
+            else { try { ShowView(_view); } catch { } }
+        }
+
+        // ── Save picker (lists MP sessions to choose which to host) ────────────
+
+        private void ShowSavePicker(bool show)
+        {
+            if (show && _savePicker == null) BuildSavePicker();
+            if (show) RefreshSavePicker();
+            if (_savePicker != null) { try { _savePicker.SetActive(show); } catch { } }
+        }
+
+        private static Sprite? _triSprite;
+        /// <summary>A small right-pointing white triangle sprite, generated once — the playthrough
+        /// expand/collapse chevron (the game font lacks ▾/▸ glyphs, so a font glyph renders as "?").</summary>
+        private static Sprite TriangleSprite()
+        {
+            if (_triSprite != null) return _triSprite;
+            const int s = 32;
+            var tex = new Texture2D(s, s, TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp };
+            var px = new Color32[s * s];
+            float mid = (s - 1) / 2f;
+            for (int yy = 0; yy < s; yy++)
+                for (int xx = 0; xx < s; xx++)
+                {
+                    float t = (float)xx / (s - 1);          // 0 left .. 1 right
+                    float halfH = (1f - t) * (s / 2f);      // base at the left edge, apex at the right
+                    px[yy * s + xx] = (Mathf.Abs(yy - mid) <= halfH) ? new Color32(255, 255, 255, 255)
+                                                                     : new Color32(255, 255, 255, 0);
+                }
+            tex.SetPixels32(px); tex.Apply();
+            _triSprite = Sprite.Create(tex, new Rect(0, 0, s, s), new Vector2(0.5f, 0.5f), 100f);
+            return _triSprite;
+        }
+
+        // ── Load-picker palette ──
+        // Solid, PRE-COMPOSITED equivalents of the mockup's translucent layers.  The alpha versions
+        // muddied/over-brightened in-game (glossy button sprite + alpha stacking), losing the layer
+        // differentiation, so these flat colours reproduce the mockup's APPEARANCE exactly.
+        private static readonly Color C_LD_PANEL = new Color(0.078f, 0.098f, 0.149f, 0.98f); // #141926 dialog (darkest)
+        private static readonly Color C_LD_LIST  = new Color(0.133f, 0.165f, 0.247f, 1f);    // #222a3f list container
+        private static readonly Color C_LD_CARD  = new Color(0.184f, 0.212f, 0.282f, 1f);    // #2f3648 playthrough card (lighter float)
+        private static readonly Color C_LD_VAR   = new Color(0.149f, 0.169f, 0.227f, 1f);    // #262b3a variant row (recessed, darker)
+        private static readonly Color C_LD_SEL   = new Color(0.192f, 0.278f, 0.400f, 1f);    // #314766 selected variant (muted blue)
+        private static readonly Color C_LD_ACC   = new Color(0.373f, 0.627f, 0.902f, 1f);    // #5fa0e6 accent
+        private static readonly Color C_LD_TXT   = new Color(0.933f, 0.945f, 0.965f, 1f);    // #eef1f6 text
+        private static readonly Color C_LD_MUT   = new Color(0.545f, 0.592f, 0.643f, 1f);    // #8b97a4 muted
+        private static readonly Color C_LD_SBTRK = new Color(0.208f, 0.227f, 0.275f, 1f);    // scrollbar track (subtle)
+        private static readonly Color C_LD_SBTHB = new Color(0.49f,  0.506f, 0.525f, 0.90f); // #7d8186 scrollbar thumb
+
+        /// <summary>Friendly playthrough title: the auto MP name "MP 2026-06-23 1614" → "MP Jun 23, 4:14 PM"
+        /// (the time disambiguates same-day runs); custom names (hqtest, …) pass through unchanged.</summary>
+        internal static string FriendlyName(string b)
+        {
+            try {
+                if (!string.IsNullOrEmpty(b) && b.StartsWith("MP ") && b.Length >= 18)
+                {
+                    var rest = b.Substring(3).Trim();   // "2026-06-23 1614"
+                    if (DateTime.TryParseExact(rest, "yyyy-MM-dd HHmm", System.Globalization.CultureInfo.InvariantCulture,
+                                               System.Globalization.DateTimeStyles.None, out var dt))
+                        return "MP " + dt.ToString("MMM d, h:mm tt", System.Globalization.CultureInfo.InvariantCulture);
+                }
+            } catch { }
+            return b ?? "";
+        }
+
+        /// <summary>Recolour a cloned native button to an accent fill with a contrasting label (the mockup's
+        /// primary "Host this save").  normalColor stays white so Image.color shows through.</summary>
+        private static void TintButton(GameObject go, Color bg, Color fg)
+        {
+            if (go == null) return;
+            try {
+                var img = go.GetComponent<Image>() ?? go.GetComponentInChildren<Image>(true);
+                if (img != null) img.color = bg;
+                var btn = go.GetComponent<Button>();
+                if (btn != null) { var cb = btn.colors; cb.normalColor = Color.white; cb.highlightedColor = new Color(1f, 1f, 1f, 0.92f); cb.pressedColor = new Color(0.88f, 0.88f, 0.88f, 1f); cb.selectedColor = Color.white; btn.colors = cb; }
+                var txt = go.GetComponentInChildren<TMP_Text>(true); if (txt != null) txt.color = fg;
+            } catch { }
+        }
+
+        private static readonly System.Collections.Generic.Dictionary<string, Sprite> _iconCache = new();
+        /// <summary>A small monochrome icon per variant kind, drawn as a sprite (the game font has no icon glyphs):
+        /// Main=disk, Autosave=clock, Disconnect=X, Recover=alert triangle.  Caller tints via Image.color.</summary>
+        private static Sprite IconSprite(string kind)
+        {
+            string key = kind ?? "";
+            if (_iconCache.TryGetValue(key, out var cached)) return cached;
+            const int s = 28;
+            var px = new Color32[s * s];
+            var ON = new Color32(255, 255, 255, 255); var OFF = new Color32(255, 255, 255, 0);
+            float c = (s - 1) / 2f;
+            for (int yy = 0; yy < s; yy++)
+                for (int xx = 0; xx < s; xx++)
+                {
+                    float dx = xx - c, dy = yy - c;
+                    float r = Mathf.Sqrt(dx * dx + dy * dy);
+                    bool on;
+                    switch (kind)
+                    {
+                        case "Autosave":   // clock: ring + minute/hour hands
+                            on = (r <= c * 0.92f && r >= c * 0.60f)
+                                 || (Mathf.Abs(dx) <= 1.3f && dy >= 0f && dy <= c * 0.62f)
+                                 || (Mathf.Abs(dy) <= 1.3f && dx >= 0f && dx <= c * 0.42f);
+                            break;
+                        case "Disconnect": // X
+                            on = (Mathf.Abs(dx - dy) <= 2.0f || Mathf.Abs(dx + dy) <= 2.0f) && r <= c * 0.95f;
+                            break;
+                        case "Recover":    // up-pointing alert triangle
+                        {
+                            float t = yy / (float)(s - 1);        // 0 bottom .. 1 top (texture y is up)
+                            float half = (1f - t) * (c * 0.95f);  // wide base at bottom, apex at top
+                            on = Mathf.Abs(dx) <= half && yy >= 3;
+                            break;
+                        }
+                        case "Checkpoint": // bookmark: solid ribbon with a V-notch cut from the bottom
+                        {
+                            bool inRibbon = Mathf.Abs(dx) <= c * 0.50f && Mathf.Abs(dy) <= c * 0.88f;
+                            bool notch    = yy < s * 0.34f && Mathf.Abs(dx) <= (s * 0.34f - yy) * 0.5f;
+                            on = inRibbon && !notch;
+                            break;
+                        }
+                        case "Auto checkpoint": // small clock ring + center dot (kin of Autosave, visibly lighter)
+                            on = (r <= c * 0.88f && r >= c * 0.64f) || r <= c * 0.18f;
+                            break;
+                        default:           // "Main" — disk/floppy: rounded square, clipped top-right, label slot
+                        {
+                            float hs = c * 0.80f;
+                            bool inSq = Mathf.Abs(dx) <= hs && Mathf.Abs(dy) <= hs;
+                            bool notch = dx > hs - c * 0.36f && dy > hs - c * 0.36f;
+                            on = inSq && !notch;
+                            if (on && dy < -c * 0.10f && Mathf.Abs(dx) <= hs * 0.60f) on = false;
+                            break;
+                        }
+                    }
+                    px[yy * s + xx] = on ? ON : OFF;
+                }
+            var tex = new Texture2D(s, s, TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp };
+            tex.SetPixels32(px); tex.Apply();
+            var sp = Sprite.Create(tex, new Rect(0, 0, s, s), new Vector2(0.5f, 0.5f), 100f);
+            _iconCache[key] = sp; return sp;
+        }
+
+        // ── Flat, rounded 9-slice sprite — gives FLAT colour fills with rounded corners (the mockup look).
+        // The game's own button sprite has a gloss/gradient that muddied the flat shading. ──
+        private static Sprite _roundSprite;
+        private static Sprite RoundedRectSprite()
+        {
+            if (_roundSprite != null) return _roundSprite;
+            const int s = 40; const float rad = 10f;
+            var px = new Color32[s * s];
+            for (int y = 0; y < s; y++)
+                for (int x = 0; x < s; x++)
+                {
+                    float dx = Mathf.Max(rad - x, x - (s - 1 - rad), 0f);
+                    float dy = Mathf.Max(rad - y, y - (s - 1 - rad), 0f);
+                    float dist = Mathf.Sqrt(dx * dx + dy * dy);
+                    byte a = (byte)(Mathf.Clamp01(rad - dist + 0.5f) * 255f);
+                    px[y * s + x] = new Color32(255, 255, 255, a);
+                }
+            var tex = new Texture2D(s, s, TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp };
+            tex.SetPixels32(px); tex.Apply();
+            _roundSprite = Sprite.Create(tex, new Rect(0, 0, s, s), new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect, new Vector4(rad, rad, rad, rad));
+            return _roundSprite;
+        }
+
+        private static float SegDist(Vector2 p, Vector2 a, Vector2 b)
+        {
+            var ab = b - a; var ap = p - a;
+            float t = Mathf.Clamp01(Vector2.Dot(ap, ab) / Mathf.Max(Vector2.Dot(ab, ab), 0.0001f));
+            return Vector2.Distance(p, a + ab * t);
+        }
+
+        // Thin ">" chevron (matches the mockup's ti-chevron) — rotated to point down when expanded.
+        private static Sprite _chevSprite;
+        private static Sprite ChevronSprite()
+        {
+            if (_chevSprite != null) return _chevSprite;
+            const int s = 32; const float th = 2.6f;
+            var px = new Color32[s * s];
+            Vector2 a1 = new Vector2(s * 0.36f, s * 0.24f), a2 = new Vector2(s * 0.36f, s * 0.76f), b = new Vector2(s * 0.66f, s * 0.5f);
+            for (int y = 0; y < s; y++)
+                for (int x = 0; x < s; x++)
+                {
+                    var p = new Vector2(x, y);
+                    float d = Mathf.Min(SegDist(p, a1, b), SegDist(p, a2, b));
+                    byte a = (byte)(Mathf.Clamp01(th - d + 0.5f) * 255f);
+                    px[y * s + x] = new Color32(255, 255, 255, a);
+                }
+            var tex = new Texture2D(s, s, TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp };
+            tex.SetPixels32(px); tex.Apply();
+            _chevSprite = Sprite.Create(tex, new Rect(0, 0, s, s), new Vector2(0.5f, 0.5f), 100f);
+            return _chevSprite;
+        }
+
+        private static Image AddRoundedBG(GameObject go, Color c)
+        {
+            var img = go.AddComponent<Image>();
+            img.sprite = RoundedRectSprite(); img.type = Image.Type.Sliced; img.color = c;
+            return img;
+        }
+
+        private RectTransform MakeFlatButton(Transform parent, string name, string label, float x, float y, float w, float h, Color bg, Color fg, int fontSize, bool bold)
+        {
+            var go = MakeGO(name, parent); var rt = go.GetComponent<RectTransform>();
+            SetAnchored(rt, x, y, w, h);
+            AddRoundedBG(go, bg);
+            var lbl = MakeLabel(go.transform, label, fontSize, fg, 0f, 0f, w, h, TextAlignmentOptions.Center);
+            if (bold) lbl.fontStyle = FontStyles.Bold;
+            ApplyFont(lbl);
+            return rt;
+        }
+
+        private void BuildSavePicker()
+        {
+            if (_savePicker != null || _canvasGO == null) return;
+            _savePicker = MakeGO("BAMP_SavePicker", _canvasGO.transform);
+            var prt = _savePicker.GetComponent<RectTransform>();
+            prt.anchorMin = prt.anchorMax = prt.pivot = new Vector2(0.5f, 0.5f);
+            prt.sizeDelta = new Vector2(640f, 540f);
+            prt.anchoredPosition = Vector2.zero;
+            prt.localScale = new Vector3(1.5f, 1.5f, 1f);   // 50% bigger all around (uniform — keeps layout + hit-testing correct)
+            AddRoundedBG(_savePicker, C_LD_PANEL);
+
+            // Title + subtitle — LEFT-aligned at the top-left (mockup), not centered.
+            var spTitle = MakeLabel(_savePicker.transform, "Load multiplayer save", 19, C_LD_TXT, 20f, -16f, 600f, 26f, TextAlignmentOptions.Left);
+            spTitle.fontStyle = FontStyles.Bold; ApplyFont(spTitle);
+            _spInfo = MakeLabel(_savePicker.transform, "Choose a playthrough to host.", 12, C_LD_MUT, 20f, -44f, 600f, 18f, TextAlignmentOptions.Left); ApplyFont(_spInfo);
+
+            // List container — FLAT #222a3f, rounded, clipped.
+            var vp = MakeGO("SpViewport", _savePicker.transform);
+            _spViewport = vp.GetComponent<RectTransform>();
+            SetAnchored(_spViewport, 18f, -72f, 604f, 410f);
+            AddRoundedBG(vp, C_LD_LIST);
+            vp.AddComponent<RectMask2D>();
+
+            var ct = MakeGO("SpContent", vp.transform);
+            _spContent = ct.GetComponent<RectTransform>();
+            SetAnchored(_spContent, 0f, 0f, 604f, 410f);
+
+            // Scrollbar (thin flat pills).
+            var tk = MakeGO("SpTrack", _savePicker.transform);
+            _spTrack = tk.GetComponent<RectTransform>();
+            SetAnchored(_spTrack, 609f, -80f, 6f, 394f);
+            tk.AddComponent<Image>().color = C_LD_SBTRK;
+            var th = MakeGO("SpThumb", tk.transform);
+            _spThumb = th.GetComponent<RectTransform>();
+            SetAnchored(_spThumb, 0f, 0f, 6f, 80f);
+            th.AddComponent<Image>().color = C_LD_SBTHB;
+
+            // Buttons — right-aligned at the bottom: [Back] [Host this save], Host rightmost (mockup).
+            // Bottom-left: the recovery-saves toggle (native load screen hides "Recover" saves the same way).
+            _rtSpLoad = MakeFlatButton(_savePicker.transform, "BAMP_SpLoad", "Host this save", 462f, -498f, 160f, 34f, C_LD_ACC, new Color(0.04f, 0.086f, 0.149f, 1f), 13, true);
+            _rtSpBack = MakeFlatButton(_savePicker.transform, "BAMP_SpBack", Loc.T("gps_ui_back", "Back"), 362f, -498f, 88f, 34f, new Color(0.196f, 0.227f, 0.298f, 1f), C_LD_MUT, 13, false);
+            _rtSpRecov = MakeFlatButton(_savePicker.transform, "BAMP_SpRecov", "Show recovery saves", 8f, -498f, 190f, 34f, new Color(0.196f, 0.227f, 0.298f, 1f), C_LD_MUT, 13, false);
+            _savePicker.SetActive(false);
+        }
+
+        private void RefreshSavePicker()
+        {
+            if (_spContent == null) return;
+            _spHeaderHits.Clear(); _spVarHits.Clear(); _spPidBySession.Clear();
+            for (int i = _spContent.childCount - 1; i >= 0; i--)
+            { try { var c = _spContent.GetChild(i).gameObject; c.SetActive(false); Destroy(c); } catch { } }
+
+            List<MPSaveManager.MpPlaythrough> runs;
+            try { runs = MPSaveManager.ListPlaythroughs(); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] ListPlaythroughs: {ex.Message}"); runs = new(); }
+
+            if (_spInfo != null)
+                _spInfo.text = runs.Count == 0 ? "No multiplayer saves found."
+                                               : "Choose a playthrough to host — expand to pick a save.";
+            if (_rtSpRecov != null)
+            {
+                var t = _rtSpRecov.GetComponentInChildren<TextMeshProUGUI>(true);
+                if (t != null) t.text = _spShowRecovery ? "Hide recovery saves" : "Show recovery saves";
+            }
+
+            if (runs.Count > 0)
+            {
+                if (string.IsNullOrEmpty(_spExpanded) || !runs.Exists(r => CardKeyOf(r) == _spExpanded)) _spExpanded = CardKeyOf(runs[0]);
+                // Round-221: a still-listed (name, world) selection is NEVER re-aimed —
+                // the old repair re-derived the pid on every refresh and silently
+                // re-targeted the selection to whichever same-named row the newly
+                // expanded card held (the rig wrong-world load).
+                if (string.IsNullOrEmpty(_spSelSession) || !PairListed(runs, _spSelSession, _spSelPid))
+                {
+                    _spSelSession = FirstVariantOf(runs, _spExpanded);
+                    _spSelPid     = PidOfListed(runs, _spSelSession, _spExpanded);
+                }
+            }
+            else { _spExpanded = ""; _spSelSession = ""; _spSelPid = ""; }
+
+            const float CARD_X = 8f, CARD_W = 576f, HROW = 52f, VINDENT = 28f, VROW = 36f, VGAP = 5f, VPAD_TOP = 4f, VPAD_BOT = 8f, CARD_GAP = 8f;
+            float rowW = CARD_W - VINDENT - 12f;
+            float y = -8f;   // top inset inside the list
+            foreach (var run in runs)
+            {
+                bool expanded = CardKeyOf(run) == _spExpanded;
+                var vis = VisibleVariants(run);
+                int nv = expanded ? vis.Count : 0;
+                float cardH = HROW + (nv > 0 ? VPAD_TOP + nv * VROW + (nv - 1) * VGAP + VPAD_BOT : 0f);
+
+                // Playthrough card — a FLAT, lighter float on the darker list (the mockup's hierarchy).
+                var cardGO = MakeGO("SpCard", _spContent); var cardRT = cardGO.GetComponent<RectTransform>();
+                SetAnchored(cardRT, CARD_X, y, CARD_W, cardH);
+                AddRoundedBG(cardGO, C_LD_CARD);
+
+                // Header — the click target that expands/collapses this playthrough.
+                var hgo = MakeGO("SpHdr", cardGO.transform); var hrt = hgo.GetComponent<RectTransform>();
+                SetAnchored(hrt, 0f, 0f, CARD_W, HROW);
+                var chGO = MakeGO("SpChev", hgo.transform); var chRT = chGO.GetComponent<RectTransform>();
+                chRT.anchorMin = chRT.anchorMax = new Vector2(0f, 1f); chRT.pivot = new Vector2(0.5f, 0.5f);
+                chRT.sizeDelta = new Vector2(16f, 16f); chRT.anchoredPosition = new Vector2(22f, -HROW / 2f);
+                chRT.localRotation = Quaternion.Euler(0f, 0f, expanded ? -90f : 0f);
+                var chImg = chGO.AddComponent<Image>(); chImg.sprite = ChevronSprite(); chImg.color = C_LD_MUT;
+                string players = (run.Players ?? "").Replace("—", "-"); if (string.IsNullOrEmpty(players)) players = "-";
+                // Handoff slice 2: a store whose last host is ANOTHER member is a shared
+                // world this machine holds via the mirror — say who ran it last, so
+                // "host the shared world" and "host my own world" are distinguishable.
+                string shared = "";
+                if (!string.IsNullOrEmpty(run.LastHostStableId) && run.LastHostStableId != MPConfig.StableId)
+                    shared = $" · <color=#5FA8E0>shared — last hosted by {(string.IsNullOrEmpty(run.LastHostName) ? "another player" : run.LastHostName)}</color>";
+                var hlbl = MakeLabel(hgo.transform,
+                    $"<b>{FriendlyName(run.Base)}</b>\n<size=80%><color=#8B97A4>{players}</color>{shared}</size>",
+                    15, C_LD_TXT, 44f, 0f, CARD_W - 200f, HROW, TextAlignmentOptions.Left);
+                ApplyFont(hlbl); hlbl.enableWordWrapping = false;
+                string dayPart = run.NewestDay >= 1 ? $"Day {run.NewestDay} · " : "";
+                ApplyFont(MakeLabel(hgo.transform, $"{dayPart}{vis.Count} save{(vis.Count == 1 ? "" : "s")}",
+                    12, C_LD_MUT, CARD_W - 152f, 0f, 140f, HROW, TextAlignmentOptions.Right));
+                _spHeaderHits.Add(new SpHit(hrt, CardKeyOf(run)));
+                // Store v2: remember which world each listed name belongs to (all variants,
+                // expanded or not); a name shown by two playthroughs maps to "" = ambiguous.
+                foreach (var pv in run.Variants)
+                {
+                    if (string.IsNullOrEmpty(pv.PlaythroughId)) continue;
+                    if (_spPidBySession.TryGetValue(pv.SessionName, out var prev) && prev != pv.PlaythroughId)
+                        _spPidBySession[pv.SessionName] = "";
+                    else
+                        _spPidBySession[pv.SessionName] = pv.PlaythroughId;
+                }
+
+                if (expanded)
+                {
+                    // Does this card hold more than one save NAME? (playthrough-id grouping can merge
+                    // several named saves of one world — label rows by name where it's ambiguous)
+                    var baseNames = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var v in run.Variants) baseNames.Add(MPSaveManager.StripToBase(v.SessionName));
+                    bool multiName = baseNames.Count > 1;
+
+                    float vy = HROW + VPAD_TOP;
+                    foreach (var v in vis)
+                    {
+                        // Round-220 belt: a row is selected only if BOTH halves match —
+                        // name AND world — so same-named rows can never co-highlight.
+                        bool sel = v.SessionName == _spSelSession
+                                   && (string.IsNullOrEmpty(_spSelPid) || string.IsNullOrEmpty(v.PlaythroughId) || v.PlaythroughId == _spSelPid);
+                        var vgo = MakeGO("SpVar", cardGO.transform); var vrt = vgo.GetComponent<RectTransform>();
+                        SetAnchored(vrt, VINDENT, -vy, rowW, VROW);
+                        AddRoundedBG(vgo, sel ? C_LD_SEL : C_LD_VAR);
+                        if (sel)   // 3px accent bar on the selected row's left edge (mockup)
+                        {
+                            var barGO = MakeGO("SpSelBar", vgo.transform); var barRT = barGO.GetComponent<RectTransform>();
+                            SetAnchored(barRT, 0f, 0f, 3f, VROW); barGO.AddComponent<Image>().color = C_LD_ACC;
+                        }
+                        var icGO = MakeGO("SpIcon", vgo.transform); var icRT = icGO.GetComponent<RectTransform>();
+                        icRT.anchorMin = icRT.anchorMax = new Vector2(0f, 1f); icRT.pivot = new Vector2(0.5f, 0.5f);
+                        icRT.sizeDelta = new Vector2(16f, 16f); icRT.anchoredPosition = new Vector2(18f, -VROW / 2f);
+                        var icImg = icGO.AddComponent<Image>(); icImg.sprite = IconSprite(v.Kind); icImg.color = sel ? C_LD_ACC : C_LD_MUT;
+                        ApplyFont(MakeLabel(vgo.transform, SpRowLabel(v, multiName), 14, C_LD_TXT, 38f, 0f, rowW - 210f, VROW, TextAlignmentOptions.Left));
+                        ApplyFont(MakeLabel(vgo.transform, VariantMeta(v), 12, C_LD_MUT, rowW - 172f, 0f, 162f, VROW, TextAlignmentOptions.Right));
+                        _spVarHits.Add(new SpHit(vrt, v.SessionName, v.PlaythroughId ?? ""));
+                        vy += VROW + VGAP;
+                    }
+                }
+                y -= cardH + CARD_GAP;
+            }
+
+            _spContentH = -y + 8f;
+            float vh = _spViewport != null ? _spViewport.rect.height : 410f;
+            _spContent.sizeDelta = new Vector2(604f, Mathf.Max(_spContentH, vh));
+            ClampScroll(); UpdateSpScrollVisual();
+        }
+
+        private static string VariantLabel(string kind)
+        {
+            if (kind == "Autosave")        return "Autosave";
+            if (kind == "Disconnect")      return "Disconnect checkpoint";
+            if (kind == "Recover")         return "Recover (crash)";
+            if (kind == "Checkpoint")      return "Save point";        // legacy round-37 frozen copy (creation retired 2026-07-07)
+            if (kind == "Auto checkpoint") return "Auto save point";   // legacy round-37 frozen copy (creation retired 2026-07-07)
+            return "Main save";
+        }
+
+        /// <summary>Row label. On a single-name card, kinds label the rows as before. When
+        /// playthrough-id grouping merges several save NAMES into one card, every row carries its
+        /// save's name (native shows the typed name per save row), automatic rows kind-prefixed.</summary>
+        internal static string SpRowLabel(MPSaveManager.MpVariant v, bool multiName)
+        {
+            if (!multiName) return VariantLabel(v.Kind);
+            string name = FriendlyName(MPSaveManager.StripToBase(v.SessionName));
+            return v.Kind == "Main" ? name : VariantLabel(v.Kind) + " · " + name;
+        }
+
+        private static string VariantMeta(MPSaveManager.MpVariant v)
+        {
+            try {
+                var lt = DateTimeOffset.FromUnixTimeSeconds(v.SavedAtUnix).LocalDateTime;
+                return v.Day >= 1 ? $"Day {v.Day} · {lt.ToString("h:mm tt")}" : lt.ToString("MMM d, h:mm tt");
+            } catch { return v.Day >= 1 ? $"Day {v.Day}" : ""; }
+        }
+
+        /// <summary>The variant rows the picker shows for a playthrough. With the recovery toggle
+        /// off, automatic saves (autosave rotation / recover / disconnect — and legacy auto
+        /// checkpoints) are hidden, mirroring the native load screen's collapsed "Recover" list.
+        /// A lineage with ONLY recovery saves shows them regardless — it must stay hostable.</summary>
+        private List<MPSaveManager.MpVariant> VisibleVariants(MPSaveManager.MpPlaythrough run)
+        {
+            if (_spShowRecovery) return run.Variants;
+            var vis = run.Variants.FindAll(v => !IsRecoveryKind(v.Kind));
+            return vis.Count > 0 ? vis : run.Variants;
+        }
+
+        private static bool IsRecoveryKind(string kind)
+            => kind == "Autosave" || kind == "Auto checkpoint" || kind == "Disconnect" || kind == "Recover";
+
+        private string FirstVariantOf(List<MPSaveManager.MpPlaythrough> runs, string cardKey)
+        {
+            foreach (var r in runs) if (CardKeyOf(r) == cardKey && r.Variants.Count > 0) return VisibleVariants(r)[0].SessionName;
+            return runs.Count > 0 && runs[0].Variants.Count > 0 ? VisibleVariants(runs[0])[0].SessionName : "";
+        }
+
+        /// <summary>Round-219: the world id of a listed session — the expanded card's
+        /// copy wins when the same name is listed by several worlds.</summary>
+        private string PidOfListed(List<MPSaveManager.MpPlaythrough> runs, string session, string preferCardKey)
+        {
+            if (string.IsNullOrEmpty(session)) return "";
+            string any = "";
+            foreach (var r in runs)
+                foreach (var v in VisibleVariants(r))
+                    if (v.SessionName == session)
+                    {
+                        if (CardKeyOf(r) == preferCardKey) return v.PlaythroughId ?? "";
+                        if (any.Length == 0) any = v.PlaythroughId ?? "";
+                    }
+            return any;
+        }
+
+        /// <summary>Round-221: a card's unique identity — its world id plus its base
+        /// name. In v2 every variant of a card shares one world id; in v1 stores the
+        /// id half is empty and the key degrades to the base name, as before.</summary>
+        private static string CardKeyOf(MPSaveManager.MpPlaythrough r)
+            => (r.Variants.Count > 0 ? (r.Variants[0].PlaythroughId ?? "") : "") + "|" + r.Base;
+
+        /// <summary>Round-221: is the SELECTED (name, world) pair still listed? A pid-less
+        /// selection (legacy) degrades to a name-only check.</summary>
+        private bool PairListed(List<MPSaveManager.MpPlaythrough> runs, string session, string pid)
+        {
+            foreach (var r in runs)
+                foreach (var v in VisibleVariants(r))
+                    if (v.SessionName == session
+                        && (string.IsNullOrEmpty(pid) || string.IsNullOrEmpty(v.PlaythroughId) || v.PlaythroughId == pid))
+                        return true;
+            return false;
+        }
+
+        private bool SessionListed(List<MPSaveManager.MpPlaythrough> runs, string session)
+        {
+            foreach (var r in runs) foreach (var v in VisibleVariants(r)) if (v.SessionName == session) return true;
+            return false;
+        }
+
+        private float MaxScroll() => Mathf.Max(0f, _spContentH - (_spViewport != null ? _spViewport.rect.height : 388f));
+        private void  ClampScroll() => _spScroll = Mathf.Clamp(_spScroll, 0f, MaxScroll());
+
+        private void UpdateSpScrollVisual()
+        {
+            if (_spContent != null) _spContent.anchoredPosition = new Vector2(0f, _spScroll);
+            if (_spThumb == null) return;
+            float vh  = _spViewport != null ? _spViewport.rect.height : 388f;
+            float th  = _spTrack != null ? _spTrack.rect.height : 388f;
+            float max = MaxScroll();
+            if (_spContentH <= vh + 1f || max <= 0f) { _spThumb.gameObject.SetActive(false); return; }
+            _spThumb.gameObject.SetActive(true);
+            float thumbH = Mathf.Clamp(vh / _spContentH * th, 28f, th);
+            SetAnchored(_spThumb, 0f, -(_spScroll / max) * (th - thumbH), 6f, thumbH);
+        }
+
+        private void TickSavePicker()
+        {
+            if (_savePicker == null || !_savePicker.activeSelf) return;
+            var mp = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+
+            // Mouse-wheel scroll while the cursor is over the list.
+            if (_spViewport != null && RectHit(_spViewport, mp))
+            {
+                float sw = Input.mouseScrollDelta.y;
+                if (sw != 0f) { _spScroll = Mathf.Clamp(_spScroll - sw * 42f, 0f, MaxScroll()); UpdateSpScrollVisual(); }
+            }
+
+            if (!Input.GetMouseButtonDown(0)) return;
+            if (RectHit(_rtSpBack, mp)) { OnSpBack(); return; }
+            if (RectHit(_rtSpLoad, mp)) { OnSpLoad(); return; }
+            if (RectHit(_rtSpRecov, mp)) { _spShowRecovery = !_spShowRecovery; RefreshSavePicker(); return; }
+            if (_spViewport == null || !RectHit(_spViewport, mp)) return;   // list clicks only count inside the viewport
+            foreach (var h in _spHeaderHits)
+                if (RectHit(h.Rt, mp)) { _spExpanded = (_spExpanded == h.Key) ? "" : h.Key; RefreshSavePicker(); return; }
+            foreach (var v in _spVarHits)
+                if (RectHit(v.Rt, mp)) { _spSelSession = v.Key; _spSelPid = v.Pid; RefreshSavePicker(); return; }
+        }
+
+        private void OnSpLoad()
+        {
+            if (string.IsNullOrEmpty(_spSelSession)) { SetStatus(Loc.T("gps_ui_pick_a_save_first", "Pick a save first."), true); return; }
+            string name = _spSelSession;
+            // Store v2: pin the picked save's world BEFORE any manifest read below, so a
+            // name shared by two playthroughs resolves to the one the player clicked.
+            // Round-219: the clicked ROW's identity wins outright (click-exact, vanilla
+            // semantics); the name map is only a fallback for legacy paths, and a name
+            // ambiguous there ("") falls back to newest-wins with a loud log.
+            string pickedPid = _spSelPid;
+            try
+            {
+                if (string.IsNullOrEmpty(pickedPid)) _spPidBySession.TryGetValue(name, out pickedPid);
+                if (!string.IsNullOrEmpty(pickedPid))
+                {
+                    MPSaveManager.NoteSessionPid(name, pickedPid);
+                    MPSaveManager.NoteSessionPid(MPSaveManager.StripToBase(name), pickedPid);
+                }
+            }
+            catch { }
+            Plugin.Logger.LogInfo($"[MenuUI] Save picker → host session '{name}'.");
+            ShowSavePicker(false);
+            _lobbyLoadMode = true;
+            // SAVED-SETTINGS-LOW-1 (d): remember the lobby's own needs tuning before the save's values replace it, so a
+            // following 'Host New Game' gets it back (RestorePreLoadSettings) - once per saved-game visit, like _ssPreLoad.
+            try
+            {
+                if (!_ssPreNeedsHas)
+                {
+                    _ssPreDrain = _hostSettings.NeedsDrainPercent; _ssPreRest = _hostSettings.RestSpeedPercent;
+                    _ssPreMorale = _hostSettings.MoraleTempoPercent; _ssPreNoEnergy = _hostSettings.DisableEnergy;
+                    _ssPreNap = _hostSettings.PowerNapAllowed; _ssPreNeedsHas = true;
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] needs tuning snapshot: {ex.Message}"); }
+            // Round-53: the lobby MIRRORS the save's own tuning settings (save-authoritative);
+            // a pre-field manifest leaves the host's current values as the fallback.
+            try
+            {
+                var m = MPSaveManager.ReadManifest(name);
+                if (m != null && m.TuneNeedsDrain >= 0)
+                {
+                    _hostSettings.NeedsDrainPercent  = m.TuneNeedsDrain;
+                    _hostSettings.RestSpeedPercent   = Math.Max(0, m.TuneRestSpeed);
+                    _hostSettings.MoraleTempoPercent = Math.Max(1, m.TuneMoraleTempo);
+                    _hostSettings.DisableEnergy      = m.TuneNeedsDrain == 0;
+                    Plugin.Logger.LogInfo($"[MenuUI] lobby mirrors save tuning: drain={m.TuneNeedsDrain}% rest={m.TuneRestSpeed}% morale={m.TuneMoraleTempo}% ('{name}').");
+                }
+                // POWERNAP: independent of the tuning percents — a manifest that predates it reads -1 and the
+                // lobby keeps the default (on).
+                if (m != null && m.TunePowerNap >= 0)
+                {
+                    _hostSettings.PowerNapAllowed = m.TunePowerNap == 1;
+                    Plugin.Logger.LogInfo($"[MenuUI] lobby mirrors save power nap: {_hostSettings.PowerNapAllowed} ('{name}').");
+                }
+                SeedSavedWorldSettings(m?.WorldSettings, m?.WorldSettingsRev ?? 0, m?.StartSettings, name);   // SAVED-SETTINGS-1
+                // Handoff slice 4: hosting a SHARED world (someone else hosted it last) from a
+                // mirror that hasn't been refreshed in days — if the group played since, a newer
+                // copy exists on another member's machine. Log-only, report-visible (round-58 style).
+                if (m != null && !string.IsNullOrEmpty(m.LastHostStableId)
+                    && m.LastHostStableId != MPConfig.StableId && m.SavedAtUnix > 0)
+                {
+                    double ageDays = (DateTimeOffset.UtcNow.ToUnixTimeSeconds() - m.SavedAtUnix) / 86400.0;
+                    if (ageDays >= 3)
+                        Plugin.Logger.LogWarning($"[MenuUI] Hosting a SHARED world from a mirror last updated {ageDays:0} day(s) ago — if the group has played since, a newer copy exists on another member's machine (handoff slice 4).");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] save tuning mirror: {ex.Message}"); }
+            try { OnHost(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] host: {ex.Message}"); }
+            MPServer.ChosenLoadSession = name;   // set AFTER OnHost so Start() can't clear it
+            // P1 (user-approved 2026-08-21): Start() just wiped every session pin — re-note
+            // the clicked (name, world) pair AFTER it, the same survival trick as the line
+            // above, so a duplicated name can never resolve to the other world (audit F1).
+            try
+            {
+                if (!string.IsNullOrEmpty(pickedPid))
+                {
+                    MPSaveManager.NoteSessionPid(name, pickedPid);
+                    MPSaveManager.NoteSessionPid(MPSaveManager.StripToBase(name), pickedPid);
+                }
+            }
+            catch { }
+            ShowView(MpView.Lobby);
+        }
+
+        private void OnSpBack() { ShowSavePicker(false); ShowView(MpView.Submenu); }
+
+        // ── Join a Game + lobby — REDESIGN (user-approved 2026-09-28: look v3, wording, port option A) ─────────
+        // Approved visual spec: the mock-up generator lobbyart/gen3.py (1280x720). Every size below is in MOCK-UP units;
+        // the kit multiplies by LS = 1.5 (mock-up -> 1080p canvas units), so the numbers read 1:1 against the mock-up.
+        // Style (from the game's own screens): cards with a light title bar, slate body, 4px corners, soft shadow.
+        // NO dimming behind (the game's own confirm popup does not dim), but every window sits on a full-screen
+        // TRANSPARENT blocker, so clicks never reach the menu behind. Clicks stay on the hand-rolled RectHit dispatch
+        // (the one and only click path: cloned buttons get a no-op onClick), and every control is hit-tested only
+        // while activeInHierarchy (LHit), so a hidden control can never swallow a click (the design-4b trap).
+
+        private const float LS = 1.5f;
+        private static Color LC(int rgb, float a = 1f) => new Color(((rgb >> 16) & 255) / 255f, ((rgb >> 8) & 255) / 255f, (rgb & 255) / 255f, a);
+        private static readonly Color L_BAR = LC(0xC6CFD6), L_BARTXT = LC(0x0D1616), L_BARSUB = LC(0x2B3438);
+        // Body alpha 1.0, not the mock-up's 0.97: the game renders in LINEAR colour space, where a 3% leak shows the menu (and,
+        // under the Hosting port popup, the lobby's own text) clearly through the card (screenshot check 2026-09-28).
+        private static readonly Color L_BODY = new Color(60f / 255f, 69f / 255f, 79f / 255f, 1f);
+        private static readonly Color L_SECT = new Color(35f / 255f, 41f / 255f, 48f / 255f, 0.55f), L_SECTLINE = new Color(1f, 1f, 1f, 0.14f);
+        private static readonly Color L_ROW = new Color(81f / 255f, 90f / 255f, 93f / 255f, 0.9f), L_ROWLINE = new Color(1f, 1f, 1f, 0.10f);
+        private static readonly Color L_HDR = LC(0xD7DDE2), L_MUTED = LC(0xCDD4DA), L_PARA = LC(0xE1E6EA);
+        private static readonly Color L_FIELD = LC(0x2F363D), L_FIELDLINE = new Color(0f, 0f, 0f, 0.35f), L_FIELDFOC = new Color(1f, 1f, 1f, 0.45f), L_BAD = LC(0xF38B89);
+        private static readonly Color L_TRACK = new Color(1f, 1f, 1f, 0.12f), L_THUMB = LC(0xA7A7A8), L_DIVIDER = new Color(1f, 1f, 1f, 0.18f);
+        private static readonly Color L_NOTICE = LC(0xF6C177), L_ERR = LC(0xFFB3AA), L_STAR = LC(0xF2C14E), L_DISTXT = LC(0x8D959C);
+        // Button kinds: 0 grey-blue (the game's menu button), 1 primary blue, 2 Steam blue, 3 negative red, 4 disabled.
+        private static readonly Color[] L_BTN = { LC(0x6F7D88), LC(0x3A5C8F), LC(0x3C8ED3), LC(0xE2615E), LC(0x4A525A) };
+        private const string L_PORT_ERR = "That isn't a valid port. Use a number from 1024 to 65535.";
+        private const string L_ONLY_ALONE = "Only possible before anyone joins.";
+
+        private sealed class LCard
+        {
+            public readonly GameObject go; public readonly RectTransform rt; public readonly TextMeshProUGUI title, sub;
+            public LCard(GameObject g, TextMeshProUGUI t, TextMeshProUGUI s) { go = g; rt = g.GetComponent<RectTransform>(); title = t; sub = s; }
+        }
+        private sealed class LBtn
+        {
+            public readonly GameObject go; public readonly RectTransform rt; public readonly Image? img, line; public readonly TMP_Text? lbl; public int kind = -1;
+            public LBtn(GameObject g, Image? i, Image? l, TMP_Text? t) { go = g; rt = g.GetComponent<RectTransform>(); img = i; line = l; lbl = t; }
+        }
+        private sealed class LField
+        {
+            public readonly RectTransform rt; public readonly Image line; public readonly TextMeshProUGUI lbl; public int state = -1;
+            public LField(RectTransform r, Image l, TextMeshProUGUI t) { rt = r; line = l; lbl = t; }
+        }
+        private sealed class LRow
+        {
+            public GameObject go = null!; public TextMeshProUGUI star = null!, name = null!, ageTxt = null!;
+            public LField cash = null!, age = null!; public LBtn kick = null!, ban = null!;
+        }
+
+        // ── kit: sprites (generated once, white, tinted by Image.color) ──
+        private static Sprite? _lFill, _lRing, _lShadow;
+        private static readonly Sprite?[] _lIcons = new Sprite?[5];
+
+        /// <summary>40px white rounded rect (radius 10, 9-slice border 10). Image.pixelsPerUnitMultiplier = 10/radius picks the
+        /// on-screen corner radius; ring = only a 2.5px outline (1 unit thick at the 4-unit window radius).</summary>
+        private static Sprite LRoundSprite(bool ring)
+        {
+            var cached = ring ? _lRing : _lFill;
+            if (cached != null && IsAlive(cached)) return cached;
+            const int S = 40; const float R = 10f, T = 2.5f, H = S / 2f;
+            var px = new Color32[S * S];
+            for (int y = 0; y < S; y++)
+                for (int x = 0; x < S; x++)
+                {
+                    float qx = Mathf.Abs(x + 0.5f - H) - (H - R), qy = Mathf.Abs(y + 0.5f - H) - (H - R);
+                    float sd = new Vector2(Mathf.Max(qx, 0f), Mathf.Max(qy, 0f)).magnitude + Mathf.Min(Mathf.Max(qx, qy), 0f) - R;
+                    float a = Mathf.Clamp01(0.5f - sd);
+                    if (ring) a -= Mathf.Clamp01(0.5f - (sd + T));
+                    px[y * S + x] = new Color32(255, 255, 255, (byte)(Mathf.Clamp01(a) * 255f));
+                }
+            var tex = new Texture2D(S, S, TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp, hideFlags = HideFlags.HideAndDontSave };
+            tex.SetPixels32(px); tex.Apply();
+            var sp = Sprite.Create(tex, new Rect(0, 0, S, S), new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect, new Vector4(R, R, R, R));
+            sp.hideFlags = HideFlags.HideAndDontSave;
+            if (ring) _lRing = sp; else _lFill = sp;
+            return sp;
+        }
+
+        /// <summary>Soft window shadow: a 6px-rounded core with a 24px quadratic falloff (9-slice, drawn 1:1).</summary>
+        private static Sprite LShadowSprite()
+        {
+            if (_lShadow != null && IsAlive(_lShadow)) return _lShadow;
+            const int S = 96; const float F = 24f, R = 6f, H = S / 2f;
+            var px = new Color32[S * S];
+            for (int y = 0; y < S; y++)
+                for (int x = 0; x < S; x++)
+                {
+                    float qx = Mathf.Abs(x + 0.5f - H) - (H - F - R), qy = Mathf.Abs(y + 0.5f - H) - (H - F - R);
+                    float sd = new Vector2(Mathf.Max(qx, 0f), Mathf.Max(qy, 0f)).magnitude + Mathf.Min(Mathf.Max(qx, qy), 0f) - R;
+                    float k = sd <= 0f ? 1f : Mathf.Clamp01(1f - sd / F);
+                    px[y * S + x] = new Color32(255, 255, 255, (byte)(k * k * 255f));
+                }
+            var tex = new Texture2D(S, S, TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp, hideFlags = HideFlags.HideAndDontSave };
+            tex.SetPixels32(px); tex.Apply();
+            _lShadow = Sprite.Create(tex, new Rect(0, 0, S, S), new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect, new Vector4(36f, 36f, 36f, 36f));
+            _lShadow.hideFlags = HideFlags.HideAndDontSave;
+            return _lShadow;
+        }
+
+        private static Vector2[] LArc(float cx, float cy, float r, float a0, float a1, int n)
+        {
+            var pts = new Vector2[n + 1];
+            for (int i = 0; i <= n; i++) { float t = a0 + (a1 - a0) * i / n; pts[i] = new Vector2(cx + r * Mathf.Cos(t), cy + r * Mathf.Sin(t)); }
+            return pts;
+        }
+
+        /// <summary>The mock-up's small white line icons (24-unit SVG viewBox), rasterised once: 0 people, 1 sliders, 2 mail,
+        /// 3 the connecting spinner arc.</summary>
+        private static Sprite LIconSprite(int which)
+        {
+            var c = _lIcons[which];
+            if (c != null && IsAlive(c)) return c;
+            var polys = new List<Vector2[]>();
+            float hw = 1f;
+            const float PI = Mathf.PI;
+            switch (which)
+            {
+                case 0:
+                    polys.Add(LArc(9f, 8f, 3.5f, 0f, 2f * PI, 24)); polys.Add(LArc(9f, 20f, 6.5f, PI, 2f * PI, 16));
+                    polys.Add(LArc(17f, 9f, 2.8f, 0f, 2f * PI, 20)); polys.Add(LArc(16f, 20f, 5.6f, 1.5f * PI, 2f * PI, 10));
+                    break;
+                case 1:
+                    polys.Add(new[] { new Vector2(4f, 6f), new Vector2(14f, 6f) });   polys.Add(new[] { new Vector2(18f, 6f), new Vector2(20f, 6f) });
+                    polys.Add(new[] { new Vector2(4f, 12f), new Vector2(8f, 12f) });  polys.Add(new[] { new Vector2(12f, 12f), new Vector2(20f, 12f) });
+                    polys.Add(new[] { new Vector2(4f, 18f), new Vector2(16f, 18f) });
+                    polys.Add(LArc(16f, 6f, 2f, 0f, 2f * PI, 16)); polys.Add(LArc(10f, 12f, 2f, 0f, 2f * PI, 16)); polys.Add(LArc(18f, 18f, 2f, 0f, 2f * PI, 16));
+                    break;
+                case 2:
+                    polys.Add(new[] { new Vector2(3f, 5f), new Vector2(21f, 5f), new Vector2(21f, 19f), new Vector2(3f, 19f), new Vector2(3f, 5f) });
+                    polys.Add(new[] { new Vector2(3f, 7f), new Vector2(12f, 13f), new Vector2(21f, 7f) });
+                    break;
+                case 4:   // SAVED-SETTINGS-1: the mock-up's small lock (body 5..19 x 11..21, shackle radius 4 around (12,7))
+                    polys.Add(new[] { new Vector2(5f, 11f), new Vector2(19f, 11f), new Vector2(19f, 21f), new Vector2(5f, 21f), new Vector2(5f, 11f) });
+                    polys.Add(new[] { new Vector2(8f, 11f), new Vector2(8f, 7f) }); polys.Add(new[] { new Vector2(16f, 7f), new Vector2(16f, 11f) });
+                    polys.Add(LArc(12f, 7f, 4f, PI, 2f * PI, 16)); hw = 1.25f;
+                    break;
+                default:
+                    polys.Add(LArc(12f, 12f, 9f, 0f, 1.5f * PI, 36)); hw = 1.25f;
+                    break;
+            }
+            const int S = 48; const float K = S / 24f;
+            var px = new Color32[S * S];
+            for (int y = 0; y < S; y++)
+                for (int x = 0; x < S; x++)
+                {
+                    var p = new Vector2((x + 0.5f) / K, 24f - (y + 0.5f) / K);
+                    float d = 99f;
+                    foreach (var poly in polys)
+                        for (int i = 0; i + 1 < poly.Length; i++) d = Mathf.Min(d, SegDist(p, poly[i], poly[i + 1]));
+                    px[y * S + x] = new Color32(255, 255, 255, (byte)(Mathf.Clamp01((hw - d) * K + 0.5f) * 255f));
+                }
+            var tex = new Texture2D(S, S, TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp, hideFlags = HideFlags.HideAndDontSave };
+            tex.SetPixels32(px); tex.Apply();
+            var sp = Sprite.Create(tex, new Rect(0, 0, S, S), new Vector2(0.5f, 0.5f), 100f);
+            sp.hideFlags = HideFlags.HideAndDontSave;
+            _lIcons[which] = sp;
+            return sp;
+        }
+
+        // ── kit: building blocks (mock-up units in, canvas units out) ──
+        private static void LPos(RectTransform rt, float x, float y, float w, float h) => SetAnchored(rt, x * LS, -y * LS, w * LS, h * LS);
+
+        private static void LStretch(RectTransform rt, float l, float b, float r, float t)
+        {
+            rt.anchorMin = Vector2.zero; rt.anchorMax = Vector2.one; rt.pivot = new Vector2(0.5f, 0.5f);
+            rt.offsetMin = new Vector2(l, b); rt.offsetMax = new Vector2(-r, -t);
+        }
+
+        /// <summary>A non-raycasting image; radius (canvas units) picks the rounded sprite's corner size, 0 = as the sprite is.</summary>
+        private static Image LImg(Transform parent, string name, Color c, Sprite? sp, float radius)
+        {
+            var go = MakeGO(name, parent);
+            var img = go.AddComponent<Image>();
+            img.color = c; img.raycastTarget = false;
+            if (sp != null)
+            {
+                img.sprite = sp; img.type = Image.Type.Sliced;
+                if (radius > 0f) img.pixelsPerUnitMultiplier = 10f / radius;
+            }
+            return img;
+        }
+
+        private TextMeshProUGUI LText(Transform p, string text, float size, Color c, float x, float y, float w, float h,
+            TextAlignmentOptions al, bool bold = false, bool caps = false, float spacing = 0f, bool wrap = false)
+        {
+            var t = MakeLabel(p, text, 10, c, x * LS, -y * LS, w * LS, h * LS, al);
+            ApplyFont(t);
+            t.fontSize = size * LS;
+            t.fontStyle = (bold ? FontStyles.Bold : FontStyles.Normal) | (caps ? FontStyles.UpperCase : FontStyles.Normal);
+            t.characterSpacing = spacing;
+            t.textWrappingMode = wrap ? TextWrappingModes.Normal : TextWrappingModes.NoWrap;
+            if (wrap) t.overflowMode = TextOverflowModes.Overflow;   // never cut
+            t.raycastTarget = false;
+            return t;
+        }
+
+        /// <summary>The window root: a full-screen TRANSPARENT image. No dimming, but it swallows every click behind it.</summary>
+        private GameObject LMakeRoot(string name)
+        {
+            var go = MakeGO(name, _canvasGO.transform);
+            LStretch(go.GetComponent<RectTransform>(), 0f, 0f, 0f, 0f);
+            go.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0f);
+            return go;
+        }
+
+        // NAV-WALK-CLICK-1: the module windows act on the PRESS, the game decides a world click (click-to-walk, doors, cars)
+        // on the RELEASE - and skips it while the pointer is over UI, which the window's full-screen root is. A window that
+        // closed on the press (Walk there, picking a destination, Close) left the release to the world, and the character
+        // walked to the spot under the button. Its close leaves this transparent full-screen shield in place until the
+        // frame after the release, so the release still lands on UI.
+        private GameObject? _clickShield;
+        private bool _clickShieldHeld;
+        private int _clickShieldUntil;
+
+        private void ShieldPressUntilRelease()
+        {
+            if (!Input.GetMouseButton(0) || _canvasGO == null) return;
+            if (_clickShield == null)
+            {
+                _clickShield = MakeGO("BAMP_ClickShield", _canvasGO.transform);
+                LStretch(_clickShield.GetComponent<RectTransform>(), 0f, 0f, 0f, 0f);
+                _clickShield.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0f);   // a raycast target: the game sees UI there
+            }
+            _clickShield.transform.SetAsLastSibling();
+            _clickShield.SetActive(true);
+            _clickShieldHeld = true;
+        }
+
+        private void TickClickShield()
+        {
+            if (_clickShield == null || !_clickShield.activeSelf) return;
+            if (_clickShieldHeld)
+            {
+                if (!Input.GetMouseButton(0)) { _clickShieldHeld = false; _clickShieldUntil = Time.frameCount + 1; }
+                return;
+            }
+            if (Time.frameCount > _clickShieldUntil) _clickShield.SetActive(false);
+        }
+
+        /// <summary>A card window like the game's own: soft shadow, slate body, light title bar with a dark bold UPPERCASE
+        /// letter-spaced title and a right-aligned subtitle. Centred; children are placed from its top-left.</summary>
+        private LCard LMakeCard(Transform root, string name, string title, float w, float h)
+        {
+            var go = MakeGO(name, root);
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = rt.anchorMax = rt.pivot = new Vector2(0.5f, 0.5f);
+            rt.sizeDelta = new Vector2(w * LS, h * LS); rt.anchoredPosition = Vector2.zero;
+            var sh = LImg(go.transform, "Shadow", new Color(0f, 0f, 0f, 0.45f), LShadowSprite(), 0f);
+            sh.pixelsPerUnitMultiplier = 1f;
+            LStretch(sh.rectTransform, -24f, -30f, -24f, -18f);
+            LStretch(LImg(go.transform, "Body", L_BODY, LRoundSprite(false), 4f).rectTransform, 0f, 0f, 0f, 0f);
+            var bar = LImg(go.transform, "Bar", L_BAR, LRoundSprite(false), 4f).rectTransform;
+            bar.anchorMin = new Vector2(0f, 1f); bar.anchorMax = Vector2.one; bar.pivot = new Vector2(0.5f, 1f);
+            bar.sizeDelta = new Vector2(0f, 44f * LS); bar.anchoredPosition = Vector2.zero;
+            var low = LImg(bar, "Low", L_BAR, null, 0f).rectTransform;   // squares the bar's bottom corners
+            low.anchorMin = Vector2.zero; low.anchorMax = new Vector2(1f, 0f); low.pivot = new Vector2(0.5f, 0f);
+            low.sizeDelta = new Vector2(0f, 8f); low.anchoredPosition = Vector2.zero;
+            var t = LText(go.transform, title, 17f, L_BARTXT, 18f, 0f, w - 36f, 44f, TextAlignmentOptions.Left, true, true, 8f);
+            var s = LText(go.transform, "", 14f, L_BARSUB, 18f, 0f, w - 36f, 44f, TextAlignmentOptions.Right);
+            return new LCard(go, t, s);
+        }
+
+        /// <summary>A section box: dark translucent fill, 1px white-14% border, small white icon + UPPERCASE bold title.
+        /// The caller places it with LPos.</summary>
+        private RectTransform LSection(Transform p, string name, int icon, string title, float rowH)
+        {
+            var box = LImg(p, name, L_SECT, LRoundSprite(false), 4f);
+            LStretch(LImg(box.transform, "Line", L_SECTLINE, LRoundSprite(true), 4f).rectTransform, 0f, 0f, 0f, 0f);
+            var ic = LImg(box.transform, "Icon", Color.white, LIconSprite(icon), 0f);
+            ic.type = Image.Type.Simple;
+            LPos(ic.rectTransform, 16f, 14f + (rowH - 18f) / 2f, 18f, 18f);
+            LText(box.transform, title, 15f, C_WHITE, 44f, 14f, 250f, rowH, TextAlignmentOptions.Left, true, true, 7f);
+            return box.rectTransform;
+        }
+
+        private static void LNoClick() { }
+
+        /// <summary>A clone of the game's menu button (its font, its UPPERCASE label, its Button) recoloured to one of the
+        /// approved kinds. The clone's own onClick is a no-op: the window tick's RectHit is the one click path.</summary>
+        private LBtn LButton(Transform p, string name, string label, float x, float y, float w, float h, int kind, float font)
+        {
+            GameObject? go = null;
+            try { go = CloneButtonInto(p, name, label, LNoClick, x * LS, -y * LS, w * LS, h * LS); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] lobby button '{label}': {ex.Message}"); }
+            if (go == null)
+            {   // no menu template captured yet: a plain button of the same look (still RectHit-dispatched)
+                go = MakeGO(name, p);
+                SetAnchored(go.GetComponent<RectTransform>(), x * LS, -y * LS, w * LS, h * LS);
+                go.AddComponent<Image>();
+                MakeLabel(go.transform, label, 10, C_WHITE, 0f, 0f, w * LS, h * LS, TextAlignmentOptions.Center);
+            }
+            Image? img = null;
+            try
+            {
+                var btn = go.GetComponent<Button>();
+                if (btn != null)
+                {
+                    img = btn.targetGraphic as Image;
+                    btn.transition = Selectable.Transition.ColorTint;   // our colour is the Image colour; hover/press only darken it
+                    var cb = ColorBlock.defaultColorBlock;
+                    cb.normalColor = Color.white; cb.selectedColor = Color.white; cb.disabledColor = Color.white;
+                    cb.highlightedColor = new Color(0.90f, 0.90f, 0.90f, 1f); cb.pressedColor = new Color(0.78f, 0.78f, 0.78f, 1f);
+                    cb.colorMultiplier = 1f; cb.fadeDuration = 0.06f;
+                    btn.colors = cb;
+                }
+                if (img == null) img = go.GetComponent<Image>();
+                var an = go.GetComponent<Animator>(); if (an != null) an.enabled = false;
+                if (img != null) { img.sprite = LRoundSprite(false); img.type = Image.Type.Sliced; img.pixelsPerUnitMultiplier = 10f / 3f; }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] lobby button '{label}' style: {ex.Message}"); }
+            var line = LImg(go.transform, "Line", Color.white, LRoundSprite(true), 3f);
+            LStretch(line.rectTransform, 0f, 0f, 0f, 0f);
+            line.transform.SetAsFirstSibling();
+            var lbl = go.GetComponentInChildren<TMP_Text>(true);
+            if (lbl != null)
+            {
+                ApplyFont(lbl);
+                lbl.enableAutoSizing = false; lbl.fontSize = font * LS;
+                lbl.fontStyle = FontStyles.Bold | FontStyles.UpperCase; lbl.characterSpacing = 3f;
+                lbl.textWrappingMode = TextWrappingModes.NoWrap; lbl.alignment = TextAlignmentOptions.Center; lbl.color = Color.white;
+                var lrt = lbl.rectTransform;
+                lrt.anchorMin = Vector2.zero; lrt.anchorMax = Vector2.one; lrt.offsetMin = new Vector2(4f, 0f); lrt.offsetMax = new Vector2(-4f, 0f);
+            }
+            var b = new LBtn(go, img, line, lbl);
+            LSetKind(b, kind);
+            return b;
+        }
+
+        private static void LSetKind(LBtn? b, int kind)
+        {
+            if (b == null || b.kind == kind) return;
+            b.kind = kind;
+            try
+            {
+                if (b.img != null) b.img.color = L_BTN[Mathf.Clamp(kind, 0, 4)];
+                if (b.line != null) b.line.color = new Color(1f, 1f, 1f, kind == 4 ? 0.10f : kind == 0 ? 0.28f : 0.22f);
+                if (b.lbl != null) b.lbl.color = kind == 4 ? L_DISTXT : Color.white;
+            }
+            catch { }
+        }
+
+        private LField LMakeField(Transform p, string name, float x, float y, float w, float h)
+        {
+            var go = MakeGO(name, p);
+            var rt = go.GetComponent<RectTransform>();
+            LPos(rt, x, y, w, h);
+            var line = go.AddComponent<Image>();
+            line.sprite = LRoundSprite(false); line.type = Image.Type.Sliced; line.pixelsPerUnitMultiplier = 10f / 3f;
+            line.color = L_FIELDLINE; line.raycastTarget = false;
+            LStretch(LImg(go.transform, "Fill", L_FIELD, LRoundSprite(false), 3f).rectTransform, 1f, 1f, 1f, 1f);
+            var lbl = LText(go.transform, "", 15f, C_WHITE, 10f, 0f, w - 20f, h, TextAlignmentOptions.Left);
+            lbl.overflowMode = TextOverflowModes.Ellipsis;   // review item 12: never past the box
+            try { go.AddComponent<RectMask2D>(); } catch { }   // the box being typed in scrolls its text: the head is clipped here
+            return new LField(rt, line, lbl);
+        }
+
+        /// <summary>Review item 12: a box's text stays inside the box. Not typing: ellipsized. Typing: when the text is wider
+        /// than the box it is right-aligned so the end (and the caret) stays in view and the start is clipped by the box's
+        /// RectMask2D. Runs only when the text changes (typing / the 2 Hz caret), never per frame.</summary>
+        private static void LFieldText(LField? f, string s, bool typing)
+        {
+            if (f == null || f.lbl.text == s) return;
+            var t = f.lbl;
+            t.text = s;
+            try
+            {
+                var om = typing ? TextOverflowModes.Overflow : TextOverflowModes.Ellipsis;
+                var al = TextAlignmentOptions.Left;
+                if (typing && t.GetPreferredValues(s).x > t.rectTransform.rect.width) al = TextAlignmentOptions.Right;
+                if (t.overflowMode != om) t.overflowMode = om;
+                if (t.alignment != al) t.alignment = al;
+            }
+            catch { }
+        }
+
+        /// <summary>Review item 4: after our window used Escape, Unity's legacy input reads no keys for the rest of this frame.
+        /// The game reads Escape through its own PlayerAction.Cancel (new Input System), which this does NOT reset; that is
+        /// harmless today because MainMenuController.Update reads no Cancel and no vanilla window that does sits under ours.</summary>
+        private static void ConsumeEscape() { try { Input.ResetInputAxes(); } catch { } }
+
+        /// <summary>Border colour: red when invalid, light while focused, dark otherwise. Changes only on a state change.</summary>
+        private static void LFieldState(LField? f, bool bad, bool focus)
+        {
+            if (f == null) return;
+            int st = bad ? 2 : focus ? 1 : 0;
+            if (f.state == st) return;
+            f.state = st;
+            try { f.line.color = bad ? L_BAD : focus ? L_FIELDFOC : L_FIELDLINE; } catch { }
+        }
+
+        private static bool LHit(LBtn? b, Vector2 mp) => b != null && b.go.activeInHierarchy && RectHit(b.rt, mp);
+        private static bool LHitF(LField? f, Vector2 mp) => f != null && f.rt.gameObject.activeInHierarchy && RectHit(f.rt, mp);
+        private static void LShow(LBtn? b, bool on) { if (b != null && b.go.activeSelf != on) b.go.SetActive(on); }
+        private static void LShowGO(GameObject? g, bool on) { if (g != null && g.activeSelf != on) g.SetActive(on); }
+        private static void LSetText(TMP_Text? t, string s) { if (t != null && t.text != s) t.text = s; }
+
+        private void OnMpJoin()
+        {
+            Plugin.Logger.LogInfo("[MenuUI] Join Game → connect dialog");
+            ShowJoinDialog(true);
+        }
+
+        private void ApplyFont(TMP_Text? t) { if (t != null && IsAlive(_gameFont)) { try { t.font = _gameFont; } catch { } } }
+        private void ApplyFontIn(GameObject go) { try { var t = go.GetComponentInChildren<TMP_Text>(true); ApplyFont(t); } catch { } }
+
+        // ── Join a Game (small card; errors stay inside it, the dialog stays open) ──
+
+        private void ShowJoinDialog(bool show)
+        {
+            try
+            {
+                if (show && _joinDialog == null) BuildJoinDialog();
+                if (_joinDialog != null && _joinDialog.activeSelf != show) _joinDialog.SetActive(show);
+                if (show) { _joinFocus = 0; _joinErr = ""; _joinBad = 0; _joinDirty = true; LayoutJoinCard(); }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[MenuUI] join dialog: {ex}");
+                if (show)
+                {   // Review item 3: a half-built dialog's full-screen blocker must not stay up - tear it down, submenu stays.
+                    try { if (_joinDialog != null) UnityEngine.Object.Destroy(_joinDialog); } catch { }
+                    _joinDialog = null; _joinCard = null;
+                    Plugin.Logger.LogWarning("[MenuUI] Join a Game unavailable - back to the multiplayer submenu.");
+                    try { ShowView(MpView.Submenu); } catch { }
+                }
+            }
+        }
+
+        private void BuildJoinDialog()
+        {
+            if (_joinDialog != null || _canvasGO == null) return;
+            _joinIp = MPConfig.HostIP; _joinPort = MPConfig.Port.ToString();   // the JOIN side: last address joined
+            _joinTel = MPConfig.JoinKey;
+            _joinDialog = LMakeRoot("BAMP_JoinDialog");
+            var card = LMakeCard(_joinDialog.transform, "Card", Loc.T("gps_ui_join_a_game", "Join a Game"), 480f, 370f);
+            _joinCard = card;
+            var t = card.go.transform;
+            LText(t, Loc.T("gps_ui_join_server_hint", "Enter the server's address and port. The server key is only needed if the server asks for one (its status page shows it)."), 14f, L_PARA,
+                  22f, 64f, 436f, 42f, TextAlignmentOptions.TopLeft, false, false, 0f, true).lineSpacing = 31f;
+            LText(t, Loc.T("gps_ui_host_address", "Host address"), 15f, C_WHITE, 22f, 120f, 130f, 38f, TextAlignmentOptions.Left, true);
+            LText(t, Loc.T("gps_ui_port", "Port"), 15f, C_WHITE, 22f, 170f, 130f, 38f, TextAlignmentOptions.Left, true);
+            _joinIpF   = LMakeField(t, "Address", 156f, 120f, 300f, 38f);
+            _joinPortF = LMakeField(t, "Port", 156f, 170f, 110f, 38f);
+            // DEDICATED-KEY-1: the key a dedicated server asks for (its status page shows it)
+            LText(t, Loc.T("gps_ui_server_key", "Server key"), 15f, C_WHITE, 22f, 220f, 130f, 38f, TextAlignmentOptions.Left, true);
+            _joinTelF  = LMakeField(t, "ServerKey", 156f, 220f, 300f, 38f);
+            _joinErrLbl = LText(t, "", 14f, L_ERR, 22f, 272f, 436f, 20f, TextAlignmentOptions.TopLeft, false, false, 0f, true);
+            _joinBackB    = LButton(t, "BAMP_JoinBack",    Loc.T("gps_ui_back", "Back"),    84f,  308f, 140f, 42f, 0, 15f);
+            _joinConnectB = LButton(t, "BAMP_JoinConnect", Loc.T("gps_ui_connect", "Connect"), 236f, 308f, 160f, 42f, 1, 15f);
+            _joinDialog.SetActive(false);
+        }
+
+        /// <summary>Error row shown only while there is an error (the card is 34 mock-up units shorter without it).</summary>
+        private void LayoutJoinCard()
+        {
+            var card = _joinCard;
+            if (card == null) return;
+            bool err = _joinErr.Length > 0;
+            float by = err ? 308f : 274f;
+            card.rt.sizeDelta = new Vector2(480f * LS, (err ? 370f : 336f) * LS);
+            if (_joinErrLbl != null) { LShowGO(_joinErrLbl.gameObject, err); LSetText(_joinErrLbl, _joinErr); }
+            if (_joinBackB != null)    LPos(_joinBackB.rt, 84f, by, 140f, 42f);
+            if (_joinConnectB != null) LPos(_joinConnectB.rt, 236f, by, 160f, 42f);
+            LFieldState(_joinIpF,   _joinBad == 1, _joinFocus == 1);
+            LFieldState(_joinPortF, _joinBad == 2, _joinFocus == 2);
+            LFieldState(_joinTelF,  _joinBad == 3, _joinFocus == 3);
+        }
+
+        /// <summary>'host:port' in the address box fills the Port box (typed: on leaving the box or Connect; pasted: at once).
+        /// '[addr]:port' = address addr + that port ('[addr]' alone = just the address). A bare address with 2+ ':' (IPv6,
+        /// e.g. '::1') is the whole address and the Port box is kept. 'host:abc' moves 'abc' to the Port box, so Connect
+        /// shows the port error inside the dialog. The hidden 'steam:&lt;id&gt;' form is left alone.</summary>
+        private void SplitJoinAddress()
+        {
+            string a = (_joinIp ?? "").Trim();
+            if (a.StartsWith("steam:", StringComparison.OrdinalIgnoreCase)) return;
+            if (a.StartsWith("[", StringComparison.Ordinal))
+            {
+                int rb = a.IndexOf(']');
+                if (rb <= 1) return;
+                string rest = a.Substring(rb + 1).Trim();
+                if (rest.Length > 0 && rest[0] != ':') return;
+                _joinIp = a.Substring(1, rb - 1).Trim();
+                string pt = rest.Length > 0 ? rest.Substring(1).Trim() : "";
+                if (pt.Length > 0) _joinPort = pt;
+                _joinDirty = true;
+                return;
+            }
+            int c = a.IndexOf(':');
+            if (c <= 0 || a.LastIndexOf(':') != c) return;   // none, leading ':', or 2+ (IPv6): the whole text is the address
+            string tail = a.Substring(c + 1).Trim();
+            _joinIp = a.Substring(0, c).Trim();
+            if (tail.Length > 0) _joinPort = tail;
+            _joinDirty = true;
+        }
+
+        /// <summary>MAIN THREAD per frame while the dialog is open — click focus + typing. Labels repaint only when the text
+        /// or the caret phase changes (no per-frame string building).</summary>
+        private void TickJoinDialog()
+        {
+            if (_joinDialog == null || !_joinDialog.activeSelf) return;
+            try
+            {
+                // Review item 4: Escape = Back (consumed, so the game's own menu handling never sees it this frame).
+                if (Input.GetKeyDown(KeyCode.Escape)) { Plugin.Logger.LogInfo("[MenuUI] Join a Game → back (Escape)"); OnJoinBack(); ConsumeEscape(); return; }
+                var mp = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+                if (Input.GetMouseButtonDown(0))
+                {
+                    if (LHit(_joinConnectB, mp)) { OnJoinConnect(); return; }
+                    if (LHit(_joinBackB, mp))    { OnJoinBack();    return; }
+                    int nf = LHitF(_joinIpF, mp) ? 1 : LHitF(_joinPortF, mp) ? 2 : LHitF(_joinTelF, mp) ? 3 : 0;
+                    if (_joinFocus == 1 && nf != 1) SplitJoinAddress();
+                    if (nf != _joinFocus) { _joinFocus = nf; _joinDirty = true; LayoutJoinCard(); }
+                }
+
+                // Ctrl+V paste — Input.inputString does not carry clipboard pastes, so read the clipboard explicitly.
+                if (_joinFocus != 0 && (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) && Input.GetKeyDown(KeyCode.V))
+                {
+                    try
+                    {
+                        var sb = new System.Text.StringBuilder();
+                        foreach (char ch in GUIUtility.systemCopyBuffer ?? "") if (!char.IsControl(ch)) sb.Append(ch);
+                        if (_joinFocus == 1) { _joinIp += sb.ToString(); SplitJoinAddress(); }
+                        else if (_joinFocus == 3) _joinTel += sb.ToString();
+                        else _joinPort += sb.ToString();
+                        _joinDirty = true;
+                    }
+                    catch { }
+                }
+
+                if (_joinFocus != 0 && Input.inputString.Length > 0)
+                {
+                    string s = _joinFocus == 1 ? _joinIp : _joinFocus == 3 ? _joinTel : _joinPort;
+                    foreach (char c in Input.inputString)
+                    {
+                        if (c == '\b') { if (s.Length > 0) s = s.Substring(0, s.Length - 1); }
+                        else if (c == '\n' || c == '\r') { SetJoinFocusText(s); OnJoinConnect(); return; }
+                        else if (!char.IsControl(c)) s += c;
+                    }
+                    SetJoinFocusText(s);
+                    _joinDirty = true;
+                }
+                else if (_joinFocus == 0 && (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter))) { OnJoinConnect(); return; }
+
+                // Blinking caret on the focused box.
+                bool on = Mathf.FloorToInt(Time.unscaledTime * 2f) % 2 == 0;
+                if (on != _joinCaretOn || _joinDirty)
+                {
+                    _joinCaretOn = on; _joinDirty = false;
+                    LFieldText(_joinIpF,   _joinFocus == 1 && on ? _joinIp + "|" : _joinIp,     _joinFocus == 1);
+                    LFieldText(_joinPortF, _joinFocus == 2 && on ? _joinPort + "|" : _joinPort, _joinFocus == 2);
+                    // Empty and not focused: say what the box is for.
+                    string tel = _joinFocus == 3 ? (on ? _joinTel + "|" : _joinTel)
+                               : (_joinTel.Length == 0 ? Loc.T("gps_ui_server_key_hint", "only if the server asks for one") : _joinTel);
+                    LFieldText(_joinTelF, tel, _joinFocus == 3);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!_joinTickErrLogged) { _joinTickErrLogged = true; Plugin.Logger.LogWarning($"[MenuUI] join dialog tick: {ex}"); }
+            }
+        }
+
+        private void SetJoinFocusText(string s)
+        {
+            if (_joinFocus == 1) _joinIp = s;
+            else if (_joinFocus == 3) _joinTel = s;
+            else _joinPort = s;
+        }
+
+        private void SetJoinError(string msg, int bad)
+        {
+            _joinErr = msg; _joinBad = bad; _joinDirty = true;
+            LayoutJoinCard();
+            if (msg.Length > 0) Plugin.Logger.LogInfo($"[MenuUI] Join a Game refused: {msg}");
+        }
+
+        private void OnJoinConnect()
+        {
+            try
+            {
+                SplitJoinAddress();
+                string addr = (_joinIp ?? "").Trim(), port = (_joinPort ?? "").Trim();
+                // Hidden form kept: 'steam:<SteamID64>' or a bare 17-digit id = Steam relay (no port).
+                bool steamForm = addr.StartsWith("steam:", StringComparison.OrdinalIgnoreCase);
+                if (steamForm)
+                {   // review item 11: 'steam:' / 'steam:abc' is not an address - the error stays inside the dialog
+                    string sid = addr.Substring(6).Trim();
+                    if (sid.Length != 17 || !ulong.TryParse(sid, out _)) { SetJoinError("Enter the host's address.", 1); return; }
+                }
+                bool steam = steamForm || (addr.Length == 17 && ulong.TryParse(addr, out _));
+                if (addr.Length == 0) { SetJoinError("Enter the host's address.", 1); return; }
+                if (!steam && (!int.TryParse(port, out int p) || p < 1024 || p > 65535)) { SetJoinError(L_PORT_ERR, 2); return; }
+                // DEDICATED-KEY-1: the Server key box - empty (a server without a key) or the key from the server's status page.
+                string key = (_joinTel ?? "").Trim();
+                if (key.Length > 0 && !MPConfig.IsKey(key))
+                { SetJoinError(Loc.T("gps_ui_server_key_invalid", "Server key: 4 to 64 letters or digits, as shown on the server's status page."), 3); return; }
+                if (key != MPConfig.JoinKey)
+                {
+                    MPConfig.SetJoinKey(key);
+                    Plugin.Logger.LogInfo($"[MenuUI] Server key {(key.Length == 0 ? "cleared" : "set")}.");
+                }
+                SetJoinError("", 0);
+                _ip = addr;
+                if (!steam) _port = port;
+                Plugin.Logger.LogInfo($"[MenuUI] Connect → {_ip}{(steam ? "" : ":" + _port)}");
+                ShowJoinDialog(false);
+                try { OnJoin(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] connect: {ex.Message}"); }
+                ShowView(MpView.Lobby);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] join connect: {ex.Message}"); }
+        }
+
+        private void OnJoinBack() { Plugin.Logger.LogInfo("[MenuUI] Join dialog → back"); ShowJoinDialog(false); ShowView(MpView.Submenu); }
+
+        private void OnLobbyStart()
+        {
+            // Field sweep 2026-08-18 (bundles 0803-222126 ×12, 0801-193731 ×36): the start
+            // path had no re-entrancy guard — every extra click re-ran the whole load
+            // (manifest rewrites, the startup fence reset mid-load, fresh-character
+            // fallbacks pushed at clients that were already loading).  IsInLobby is the
+            // existing accepted-start latch: false the moment StartNewGame/StartLoadGame
+            // runs, true again only via lobby re-entry or session Stop — a live read of
+            // authoritative state, no new flags.
+            if (MPServer.IsRunning && !MPServer.IsInLobby)
+            {
+                Plugin.Logger.LogInfo("[MenuUI] Lobby Start ignored — a start is already in flight.");
+                return;
+            }
+            Plugin.Logger.LogInfo($"[MenuUI] Lobby Start (load={_lobbyLoadMode})");
+            try { if (_lobbyLoadMode) OnStartLoad(); else OnStartNew(); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] start: {ex.Message}"); }
+        }
+
+        private void OnLobbyLeave()
+        {
+            Plugin.Logger.LogInfo("[MenuUI] Lobby Leave");
+            _lwHostFailed = false;   // review item 5: a later join never shows a stale host failure
+            try { if (MPServer.IsRunning) OnStop(); else OnDisc(); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] leave: {ex.Message}"); }
+            ShowView(MpView.Submenu);
+        }
+
+        // ── Lobby window: one wide card (players left, Game settings + Invite right, footer) + the small
+        //    Connecting / Couldn't join / Hosting port cards, all under one transparent blocker ──
+
+        private static void SetActiveSafe(GameObject? go, bool a) { if (go != null) { try { go.SetActive(a); } catch { } } }
+
+        private void BuildLobbyWindow()
+        {
+            if (_lobbyWindow != null || _canvasGO == null) return;
+            try
+            {
+                _lobbyWindow = LMakeRoot("BAMP_LobbyWindow");
+                var root = _lobbyWindow.transform;
+
+                // ── main window (mock-up 1080x652) ──
+                var main = LMakeCard(root, "Main", Loc.T("gps_ui_multiplayer_lobby", "Multiplayer Lobby"), 1080f, 652f);
+                _lwMain = main;
+                var m = main.go.transform;
+                LText(m, Loc.T("gps_ui_player", "Player"), 12f, L_HDR, 34f, 64f, 200f, 15f, TextAlignmentOptions.Left, true, true, 7f);
+                _lwHdrCash = LText(m, Loc.T("gps_ui_starting_money", "Starting money"), 12f, L_HDR, 262f, 64f, 150f, 15f, TextAlignmentOptions.Left, true, true, 7f);
+                _lwHdrAge  = LText(m, Loc.T("gps_ui_age", "Age"), 12f, L_HDR, 456f, 64f, 80f, 15f, TextAlignmentOptions.Left, true, true, 7f);
+                var list = MakeGO("List", m);
+                _rtLwList = list.GetComponent<RectTransform>();
+                LPos(_rtLwList, 22f, LW_LIST_Y, 636f, LW_LIST_H);
+                for (int s = 0; s < LW_SLOTS; s++)
+                {
+                    var r = new LRow();
+                    var bg = LImg(list.transform, "Row" + s, L_ROW, LRoundSprite(false), 3f);
+                    r.go = bg.gameObject;
+                    LPos(bg.rectTransform, 0f, s * LW_ROW_PITCH, 620f, LW_ROW_H);
+                    LStretch(LImg(bg.transform, "Line", L_ROWLINE, LRoundSprite(true), 3f).rectTransform, 0f, 0f, 0f, 0f);
+                    r.star   = LText(bg.transform, "★", 15f, L_STAR, 12f, 0f, 20f, LW_ROW_H, TextAlignmentOptions.Left);
+                    r.name   = LText(bg.transform, "", 16f, C_WHITE, 37f, 0f, 233f, LW_ROW_H, TextAlignmentOptions.Left, true);
+                    r.name.overflowMode = TextOverflowModes.Ellipsis;   // review item 12: a long name stops at its column
+                    // BAN-PLAYERS-1 C2 (B5, approved mock-up): columns name | money 240 | age 388 | Kick 480 + Ban 548 (60 wide, 8 apart).
+                    r.cash   = LMakeField(bg.transform, "Cash", 240f, LW_ROW_CTL_Y, 130f, 30f);
+                    r.age    = LMakeField(bg.transform, "Age", 388f, LW_ROW_CTL_Y, 64f, 30f);
+                    r.ageTxt = LText(bg.transform, "", 15f, C_WHITE, 398f, 0f, 70f, LW_ROW_H, TextAlignmentOptions.Left);
+                    r.kick   = LButton(bg.transform, "BAMP_Kick" + s, Loc.T("gps_ui_kick", "Kick"), 480f, LW_ROW_CTL_Y, 60f, 30f, 3, 12f);
+                    r.ban    = LButton(bg.transform, "BAMP_Ban" + s, Loc.T("gps_ui_ban", "Ban"), 548f, LW_ROW_CTL_Y, 60f, 30f, 0, 12f);
+                    LRedline(r.ban);
+                    _lwRows[s] = r;
+                }
+                var track = LImg(m, "Track", L_TRACK, LRoundSprite(false), 3f);
+                _lwTrack = track.gameObject;
+                LPos(track.rectTransform, 652f, LW_LIST_Y, 6f, LW_LIST_H);
+                _lwThumb = LImg(track.transform, "Thumb", L_THUMB, LRoundSprite(false), 3f).rectTransform;
+                // Review item 13: a 22-wide invisible hit area over the 6-wide track (click = page, drag the thumb = scroll).
+                _rtLwTrackHit = MakeGO("Hit", track.transform).GetComponent<RectTransform>();
+                LPos(_rtLwTrackHit, -8f, 0f, 22f, LW_LIST_H);
+                // Notices (orange): transient lobby notices + the live mod-mismatch line. Layout v4 (user-approved 2026-09-28):
+                // the right column under Invite / Waiting (placed by LobbyLayout); wraps, and is ellipsized at its box so it
+                // can never reach the footer divider.
+                _lwNotice = LText(m, "", 14f, L_NOTICE, 678f, 470f, 380f, 90f, TextAlignmentOptions.TopLeft, false, false, 0f, true);
+                _lwNotice.overflowMode = TextOverflowModes.Ellipsis;
+
+                // Game settings (host)
+                _rtLwSettings = LSection(m, "Settings", 1, Loc.T("gps_lobby_settings", "Game settings"), 30f);
+                var st = _rtLwSettings.transform;
+                _lwMoreB    = LButton(st, "BAMP_MoreSettings", Loc.T("gps_ui_more_settings", "More settings"), 214f, 14f, 150f, 30f, 0, 12f);
+                _lwSaveSetB = LButton(st, "BAMP_SaveSettings", Loc.T("gps_ui_save_settings", "Save settings"), 214f, 14f, 150f, 30f, 0, 12f);
+                _lwDiffLbl  = LText(st, Loc.T("gps_ui_difficulty", "Difficulty"), 13f, L_MUTED, 16f, 56f, 70f, 36f, TextAlignmentOptions.Left, true);
+                _lwDiffEasyB   = LButton(st, "BAMP_DiffEasy",   Loc.T("gps_ui_easy", "Easy"),   94f,  56f, 80f, 36f, 0, 13f);
+                _lwDiffNormalB = LButton(st, "BAMP_DiffNormal", Loc.T("gps_ui_normal", "Normal"), 182f, 56f, 92f, 36f, 0, 13f);
+                _lwDiffHardB   = LButton(st, "BAMP_DiffHard",   Loc.T("gps_ui_hard", "Hard"),   282f, 56f, 80f, 36f, 0, 13f);
+                // MODS-GATE-1 (user-approved 2026-09-29): 'Different mods' Allow / Refuse, under Difficulty (new game) or the
+                // save name (saved game) - LobbyLayout places the row; the chosen one is the blue kind, like the difficulty.
+                _lwModsLbl     = LText(st, Loc.T("gps_ui_different_mods", "Different mods"), 13f, L_MUTED, 16f, 102f, 128f, 36f, TextAlignmentOptions.Left, true);
+                _lwModsAllowB  = LButton(st, "BAMP_ModsAllow",  Loc.T("gps_ui_allow", "Allow"),  150f, 102f, 100f, 36f, 0, 13f);
+                _lwModsRefuseB = LButton(st, "BAMP_ModsRefuse", Loc.T("gps_ui_refuse", "Refuse"), 258f, 102f, 104f, 36f, 0, 13f);
+                // BAN-PLAYERS-1 C2 (B5): 'Banned players' + 'Edit ({n})' (opens the Banned players window); LobbyLayout places it.
+                _lwBannedLbl = LText(st, Loc.T("gps_ui_banned_players", "Banned players"), 13f, L_MUTED, 16f, 148f, 200f, 32f, TextAlignmentOptions.Left, true);
+                _lwBannedB   = LButton(st, "BAMP_BannedEdit", Loc.T("gps_lobby_banned_edit", "Edit ({0})", 0), 264f, 148f, 100f, 32f, 0, 12f);
+                _lwBannedN = -1;
+                _lwSavedLbl = LText(st, "", 15f, C_WHITE, 16f, 56f, 348f, 20f, TextAlignmentOptions.Left);
+                _lwSavedLbl.overflowMode = TextOverflowModes.Ellipsis;   // review item 12: a long save name stops at the box
+
+                // Invite (host)
+                _rtLwInvite = LSection(m, "Invite", 2, Loc.T("gps_lobby_invite", "Invite"), 20f);
+                var iv = _rtLwInvite.transform;
+                _lwInviteB   = LButton(iv, "BAMP_InviteFriends", Loc.T("gps_ui_invite_steam_friends", "Invite Steam Friends"), 16f, 46f, 348f, 42f, 2, 15f);
+                _lwDirectLbl = LText(iv, Loc.T("gps_ui_direct_connection", "Direct connection:"), 13f, L_MUTED, 16f, 100f, 348f, 16f, TextAlignmentOptions.Left, true);
+                _lwAddrLbl   = LText(iv, "", 15f, C_WHITE, 16f, 128f, 348f, 18f, TextAlignmentOptions.TopLeft, false, false, 0f, true);
+                _lwAddrLbl.lineSpacing = 41f;
+                _lwShowIpB = LButton(iv, "BAMP_ShowIp", Loc.T("gps_ui_show_ip", "Show IP"), 16f, 158f, 110f, 34f, 0, 13f);
+                _lwPortB   = LButton(iv, "BAMP_ChangePort", Loc.T("gps_ui_change_port", "Change port"), 136f, 158f, 150f, 34f, 0, 13f);
+                _lwHintLbl = LText(iv, "", 13f, L_MUTED, 16f, 204f, 348f, 38f, TextAlignmentOptions.TopLeft, false, false, 0f, true);
+                _lwHintLbl.lineSpacing = 26f;
+
+                // Waiting (joiner)
+                _rtLwWaiting = LSection(m, "Waiting", 0, Loc.T("gps_lobby_waiting", "Waiting"), 20f);
+                LPos(_rtLwWaiting, 678f, 64f, 380f, 150f);
+                _lwWaitLbl = LText(_rtLwWaiting.transform, "", 15f, C_WHITE, 16f, 46f, 348f, 90f, TextAlignmentOptions.TopLeft, false, false, 0f, true);
+                _lwWaitLbl.lineSpacing = 31f;
+                _lwWaitLbl.overflowMode = TextOverflowModes.Ellipsis;   // review item 12: never past the Waiting box
+
+                // Footer: a full-width bar under both columns.
+                LPos(LImg(m, "Divider", L_DIVIDER, null, 0f).rectTransform, 22f, 575f, 1036f, 1f / LS);
+                _lwLeaveB = LButton(m, "BAMP_LwLeave", Loc.T("gps_ui_leave", "Leave"), 22f, 590f, 150f, 44f, 0, 16f);
+                _lwStartB = LButton(m, "BAMP_LwStart", Loc.T("gps_ui_start_game", "Start Game"), 858f, 590f, 200f, 44f, 1, 16f);
+
+                // ── Connecting card ──
+                var conn = LMakeCard(root, "Connecting", Loc.T("gps_ui_multiplayer_lobby", "Multiplayer Lobby"), 440f, 158f);
+                _lwConn = conn;
+                var spin = LImg(conn.go.transform, "Spin", Color.white, LIconSprite(3), 0f);
+                spin.type = Image.Type.Simple;
+                _rtLwSpin = spin.rectTransform;
+                _rtLwSpin.anchorMin = _rtLwSpin.anchorMax = new Vector2(0f, 1f); _rtLwSpin.pivot = new Vector2(0.5f, 0.5f);
+                _rtLwSpin.sizeDelta = new Vector2(20f * LS, 20f * LS); _rtLwSpin.anchoredPosition = new Vector2(32f * LS, -74f * LS);
+                _lwConnLbl = LText(conn.go.transform, "", 15f, C_WHITE, 54f, 64f, 364f, 20f, TextAlignmentOptions.Left);
+                _lwConnLbl.overflowMode = TextOverflowModes.Ellipsis;   // review item 12: a long address stops at the card edge
+                _lwConnCancelB = LButton(conn.go.transform, "BAMP_ConnCancel", Loc.T("gps_ui_cancel", "Cancel"), 150f, 98f, 140f, 40f, 0, 15f);
+
+                // ── Couldn't join card (the reason in FULL: wraps, never cut; the card grows to fit) ──
+                var fail = LMakeCard(root, "Failed", Loc.T("gps_ui_couldn_t_join", "Couldn't join"), 440f, 200f);
+                _lwFail = fail;
+                _lwFailLbl = LText(fail.go.transform, "", 15f, C_WHITE, 22f, 64f, 396f, 60f, TextAlignmentOptions.TopLeft, false, false, 0f, true);
+                _lwFailLbl.lineSpacing = 36f;
+                _lwFailBackB  = LButton(fail.go.transform, "BAMP_FailBack",  Loc.T("gps_ui_back", "Back"),      84f,  140f, 140f, 42f, 0, 15f);
+                _lwFailRetryB = LButton(fail.go.transform, "BAMP_FailRetry", Loc.T("gps_ui_try_again", "Try Again"), 236f, 140f, 160f, 42f, 1, 15f);
+                // SEC-MODS-1: the server's missing Workshop mods, one Steam page per click (hidden unless offered)
+                _lwFailModsB  = LButton(fail.go.transform, "BAMP_FailMods",  "", 84f, 140f, 312f, 42f, 1, 15f);
+                LShowGO(_lwFailModsB.go, false);
+
+                // ── Hosting port popup (over the lobby) ──
+                var pc = LMakeCard(root, "HostingPort", Loc.T("gps_ui_hosting_port", "Hosting port"), 440f, 269f);
+                _lwPortCard = pc;
+                var pt = pc.go.transform;
+                LText(pt, Loc.T("gps_ui_port", "Port"), 15f, C_WHITE, 22f, 64f, 50f, 36f, TextAlignmentOptions.Left, true);
+                _ppField = LMakeField(pt, "Port", 76f, 64f, 120f, 36f);
+                LText(pt, Loc.T("gps_ui_use_a_number_from_1024_to", "Use a number from 1024 to 65535. Direct-IP friends type this after your address."), 14f, L_PARA,
+                      22f, 114f, 396f, 42f, TextAlignmentOptions.TopLeft, false, false, 0f, true).lineSpacing = 31f;
+                LText(pt, Loc.T("gps_ui_steam_invites_don_t_need_a", "Steam invites don't need a port."), 14f, L_PARA, 22f, 170f, 396f, 21f, TextAlignmentOptions.TopLeft, false, false, 0f, true);
+                _ppErrLbl  = LText(pt, "", 14f, L_ERR, 22f, 205f, 396f, 20f, TextAlignmentOptions.TopLeft, false, false, 0f, true);
+                _ppCancelB = LButton(pt, "BAMP_PortCancel", Loc.T("gps_ui_cancel", "Cancel"), 84f,  209f, 130f, 40f, 0, 15f);
+                _ppSaveB   = LButton(pt, "BAMP_PortSave",   Loc.T("gps_ui_save", "Save"),   226f, 209f, 130f, 40f, 1, 15f);
+
+                LShowGO(conn.go, false); LShowGO(fail.go, false); LShowGO(pc.go, false);
+                _lwLayoutKey = -1; _lwThumbKey = -1;
+                _lobbyWindow.SetActive(false);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError($"[MenuUI] BuildLobbyWindow: {ex}");
+                // Review item 3: a half-built window's transparent blocker would swallow every click with no way out.
+                try { if (_lobbyWindow != null) UnityEngine.Object.Destroy(_lobbyWindow); } catch { }
+                _lobbyWindow = null; _lwMain = null; _lwConn = null; _lwFail = null; _lwPortCard = null;
+                _lwPortOpen = false; _ppFocus = false; _lwThumbDrag = false;
+            }
+        }
+
+        /// <summary>Every time the lobby opens: the IP is hidden again (streamer safety, user rule; the shown state is never
+        /// saved), the list scrolls to the top, the port popup is closed, and the window fits a small screen / big UI zoom.</summary>
+        private void OnLobbyOpening()
+        {
+            _showIp = false;
+            _lwScroll = 0; LwClearFocus();
+            ClosePortPopup();
+            _lwFailShown = "\u0001";
+            _lwThumbDrag = false;
+            LwFit(true);
+        }
+
+        /// <summary>Fits the main card to a small screen / big UI zoom. Review item 15: also re-fits when the screen size or
+        /// the UI scale changed while the lobby is open (checked on the 0.5 s refresh, not per frame).</summary>
+        private void LwFit(bool force)
+        {
+            try
+            {
+                var main = _lwMain;
+                if (main == null) return;
+                float sc = Mathf.Max(0.01f, UiScale);
+                int sw = Screen.width, shh = Screen.height;
+                if (!force && sw == _lwFitW && shh == _lwFitH && Mathf.Approximately(sc, _lwFitScale)) return;
+                _lwFitW = sw; _lwFitH = shh; _lwFitScale = sc;
+                float cw = sw / sc, ch = shh / sc;
+                float s = Mathf.Min(1f, Mathf.Min((cw - 24f) / (1080f * LS), (ch - 24f) / (652f * LS)));
+                s = Mathf.Clamp(s, 0.3f, 1f);
+                main.rt.localScale = new Vector3(s, s, 1f);
+                if (!force) Plugin.Logger.LogInfo($"[MenuUI] lobby re-fitted: screen {sw}x{shh}, UI scale {sc:0.##} -> card scale {s:0.##}");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] lobby fit: {ex.Message}"); }
+        }
+
+        private void LwClearFocus() { _lwRowCashFocus = -1; _lwRowAgeFocus = -1; _lwCashFocusId = ""; _lwAgeFocusId = ""; }
+
+        /// <summary>Review item 14: map the focused boxes' player ids to their current roster index; a player who left
+        /// clears the focus. No allocation (a linear scan of the roster).</summary>
+        private void LwSyncFocus(IReadOnlyList<string>? roster, int n)
+        {
+            int ci = -1, ai = -1;
+            if (roster != null)
+                for (int i = 0; i < n; i++)
+                {
+                    if (_lwCashFocusId.Length > 0 && roster[i] == _lwCashFocusId) ci = i;
+                    if (_lwAgeFocusId.Length > 0 && roster[i] == _lwAgeFocusId) ai = i;
+                }
+            if (_lwCashFocusId.Length > 0 && ci < 0) { _lwCashFocusId = ""; Plugin.Logger.LogInfo("[MenuUI] the focused starting-money box's player left - focus cleared."); }
+            if (_lwAgeFocusId.Length > 0 && ai < 0)  { _lwAgeFocusId = "";  Plugin.Logger.LogInfo("[MenuUI] the focused age box's player left - focus cleared."); }
+            if (ci != _lwRowCashFocus || ai != _lwRowAgeFocus) _lwCaretDirty = true;
+            _lwRowCashFocus = ci; _lwRowAgeFocus = ai;
+        }
+
+        private void SetDifficulty(string d)
+        {
+            _selectedDifficulty = d;
+            try { _hostSettings = MPServer.Preset(d); } catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] preset {d}: {ex.Message}"); }
+            // Difficulty sets the base starting cash; the per-row fields default to it
+            // (and any explicit per-player overrides are kept).  Force a roster refresh.
+            _lwRowCashFocus = -1; _lwCashFocusId = "";
+            Plugin.Logger.LogInfo($"[MenuUI] Difficulty → {d} (base cash {_hostSettings.StartingMoney})");
+            HighlightDifficulty();
+            RefreshLobbyWindow();
+        }
+
+        /// <summary>MODS-GATE-1: the chosen 'Different mods' button is the blue kind (1), the other the plain kind (0).</summary>
+        private void HighlightModsGate()
+        {
+            bool refuse = MPConfig.RefuseModMismatch;
+            LSetKind(_lwModsAllowB,  refuse ? 0 : 1);
+            LSetKind(_lwModsRefuseB, refuse ? 1 : 0);
+        }
+
+        /// <summary>MODS-GATE-1: the Allow / Refuse click path (the DEV lever 'uiview modsgate' calls this too). Saved in
+        /// the host's config at once; the next Hello reads it.</summary>
+        private void SetModsGate(bool refuse)
+        {
+            try
+            {
+                MPConfig.SetRefuseModMismatch(refuse);
+                Plugin.Logger.LogInfo($"[MenuUI] Different mods → {(refuse ? "Refuse" : "Allow")} (saved RefuseModMismatch={MPConfig.RefuseModMismatchSaved}).");
+                HighlightModsGate();
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] Different mods: {ex.Message}"); }
+        }
+
+        /// <summary>The selected difficulty is the primary (blue) button, the others the normal grey-blue.</summary>
+        private void HighlightDifficulty()
+        {
+            LSetKind(_lwDiffEasyB,   _selectedDifficulty == "Easy"   ? 1 : 0);
+            LSetKind(_lwDiffNormalB, _selectedDifficulty == "Normal" ? 1 : 0);
+            LSetKind(_lwDiffHardB,   _selectedDifficulty == "Hard"   ? 1 : 0);
+        }
+        private static void TintSel(GameObject? go, bool sel)
+        {
+            if (go == null) return;
+            try { var b = go.GetComponent<Button>(); if (b != null && b.targetGraphic != null) b.targetGraphic.color = sel ? Color.white : new Color(0.55f, 0.55f, 0.60f, 1f); } catch { }
+        }
+
+        private void OnCustomize()
+        {
+            // Open the deep-settings panel (year length, tax, etc.), seeded from the
+            // currently-selected difficulty (_hostSettings).  It edits the same
+            // _hostSettings the lobby uses, so changes carry into the started game.
+            // (Load mode: the save's own adjustable settings - round-53.)
+            Plugin.Logger.LogInfo("[MenuUI] More settings / Save settings → deep settings panel.");
+            try { OnOpenSettings(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] customize: {ex.Message}"); }
+        }
+        private void OnToggleShowIp() { _showIp = !_showIp; Plugin.Logger.LogInfo($"[MenuUI] Show IP = {_showIp}"); RefreshLobbyWindow(); }
+
+        // Round-93: transient lobby notice (overlay-disabled etc.) — shown on the lobby's notice line for a beat.
+        private static string _lobbyNotice = "";
+        private static float  _lobbyNoticeUntil;
+
+        /// <summary>Round-215: let non-UI code (e.g. the server's version-mismatch
+        /// refusal) surface a transient notice on the lobby's notice line. Before
+        /// this, a refused joiner was explained on the JOINER's screen only — the
+        /// host saw nothing and filed "impossible to join" reports.</summary>
+        internal static void PostLobbyNotice(string msg, float seconds = 12f)
+        {
+            _lobbyNotice = msg;
+            _lobbyNoticeUntil = Time.unscaledTime + seconds;
+        }
+
+        /// <summary>Round-253e: retract the transient notice (lobby closed). The mod-mismatch
+        /// line no longer goes through here at all — round-253f made it a LIVE READ in the
+        /// strip render (events over timers, user ruling): it exists exactly while a
+        /// mismatched player is present, with no timer and nothing to retract.</summary>
+        internal static void ClearLobbyNotice()
+        {
+            _lobbyNotice = "";
+            _lobbyNoticeUntil = 0f;
+        }
+
+        private void OnInviteFriends()
+        {
+            // Round-93 (field 20260725-172640): with the Steam overlay disabled, the invite call
+            // silently no-ops — the button read as dead (12+ clicks, then a frustrated quit that
+            // auto-filed as a "crash"). Say why instead.
+            bool overlayOk = false;
+            try { overlayOk = Steamworks.SteamUtils.IsOverlayEnabled; } catch { }
+            if (!overlayOk)
+            {
+                _lobbyNotice = Loc.T("gps_lobby_overlay_off", "Steam overlay is disabled - enable it in Steam's settings");
+                _lobbyNoticeUntil = Time.unscaledTime + 10f;
+                Plugin.Logger.LogWarning("[MenuUI] Invite Friends: Steam overlay unavailable — notice shown (round-93).");
+                RefreshLobbyWindow();
+                return;
+            }
+            Plugin.Logger.LogInfo("[MenuUI] Invite Friends → Steam invite dialog.");
+            MPSteamPresence.OpenInviteDialog();
+        }
+
+        // ── state reads (live; the DEV lever can substitute a fake state for screenshots) ──
+        private bool LwHost()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return DevLobby == 1 || DevLobby == 2;
+#endif
+            return MPServer.IsRunning;
+        }
+        private bool LwClient()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return DevLobby == 3;
+#endif
+            return MPClient.IsConnected;
+        }
+        private bool LwConnecting()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return DevLobby == 4;
+#endif
+            return MPClient.IsConnecting;
+        }
+        private bool LwLoad(bool host)
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return DevLobby == 2;
+#endif
+            return host ? _lobbyLoadMode : MPClient.HostLoadMode;
+        }
+        private IReadOnlyList<string>? LwPlayers(bool host)
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return _devRoster;
+#endif
+            return host ? MPServer.LobbyPlayers : MPClient.LobbyPlayers;
+        }
+        private int LwBoundPort()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return _devBusyB > 0 ? _devBusyB : 7777;
+#endif
+            return MPServer.BoundPort;
+        }
+        private int LwRequestedPort()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return _devBusyA > 0 ? _devBusyA : 7777;
+#endif
+            return MPServer.RequestedPort > 0 ? MPServer.RequestedPort : MPConfig.HostPort;
+        }
+        /// <summary>The port the host asked for was busy and the +10 fallback landed elsewhere.</summary>
+        private bool LwBusy(out int asked, out int bound)
+        {
+            asked = LwRequestedPort(); bound = LwBoundPort();
+#if BAMP_DEV
+            if (DevLobby != 0) return _devBusyA > 0;
+#endif
+            return MPServer.IsRunning && bound > 0 && asked > 0 && bound != asked;
+        }
+        private bool LwAwaitingApproval()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return DevLobby == 3;
+#endif
+            return MPClient.JoinStatus == "awaiting-approval";
+        }
+        private string LwSaveName()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return "MP Jun 23, 4:14 PM";
+#endif
+            return MPServer.ChosenLoadSession ?? "";
+        }
+        /// <summary>Change port works only while the host is alone in the lobby (the UDP rebind never runs under a peer).</summary>
+        private bool LwPortChangeAllowed()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return _devRoster == null || _devRoster.Count <= 1;
+#endif
+            try { return MPServer.IsRunning && MPServer.IsInLobby && MPServer.LobbyPlayers.Count <= 1 && MPServer.ConnectedCount == 0 && MPServer.TransportPeerCount == 0; }   // review item 6: a connection still saying hello counts
+            catch { return false; }
+        }
+        private string LwFailReason()
+        {
+#if BAMP_DEV
+            if (DevLobby == 6) return DevModsReason();
+            if (DevLobby == 7) return "You're banned from this host's games.";   // BAN-PLAYERS-1 C2: B6b at any window size (the real text: MPClient tag BAMP:banned)
+            if (DevLobby == 5) return "No host answered at that address. If your friend is on Steam, right-click their name and choose Join Game. Direct IP needs the host's public address and port 7777 opened on their router.";
+#endif
+            string? f = MPClient.FriendlyDisconnectReason;
+            if (!string.IsNullOrEmpty(f)) return f ?? "";
+            // Review item 2: the mod's own complete sentences (rejected / kicked / banned / host left / identity / build /
+            // version) show as they are; a raw transport reason ("Timeout", "RemoteConnectionClose", Steam end-reason
+            // names) is logged and the player sees JoinLostText.
+            string raw = MPClient.LastDisconnectReason ?? "";
+            if (MPClient.LastDisconnectReasonIsOwn && raw.Length > 0) return raw;
+            if (raw != _lwRawReasonLogged)
+            {
+                _lwRawReasonLogged = raw;
+                Plugin.Logger.LogInfo($"[MenuUI] Couldn't join: transport reason '{raw}' (shown as the generic line).");
+            }
+            return JoinLostText;
+        }
+        /// <summary>'Connecting to {address}…': the direct address + port, or the Steam friend's name for a Steam join.</summary>
+        private string LwConnectAddress()
+        {
+#if BAMP_DEV
+            if (DevLobby != 0) return "203.0.113.5:7777";
+#endif
+            string a = MPConfig.HostIP ?? "";
+            if (MPClient.LastConnectPath != "steam") return $"{a}:{MPClient.LastConnectPort}";
+            if (a != _lwSteamAddrKey)
+            {
+                _lwSteamAddrKey = a; _lwSteamAddrShown = a;
+                try
+                {
+                    string idPart = a.StartsWith("steam:", StringComparison.OrdinalIgnoreCase) ? a.Substring(6).Trim() : a;
+                    if (ulong.TryParse(idPart, out ulong id))
+                    {
+                        string nm = new Steamworks.Friend(id).Name;
+                        if (!string.IsNullOrEmpty(nm) && nm != "[unknown]") _lwSteamAddrShown = nm;
+                    }
+                }
+                catch { }
+            }
+            return _lwSteamAddrShown;
+        }
+        private static string LwShownAddress(int port)
+        {
+            string pub = "", lan = "";
+            try { pub = MPNet.PublicIp ?? ""; lan = MPNet.LanIp ?? ""; } catch { }
+            if (pub.Length > 0 && lan.Length > 0) return Loc.T("gps_lobby_addr_internet", "Internet {0}", $"{pub}:{port}") + "\n" + Loc.T("gps_lobby_addr_lan", "Same network {0}", $"{lan}:{port}");
+            if (pub.Length > 0) return Loc.T("gps_lobby_addr_internet", "Internet {0}", $"{pub}:{port}");
+            if (lan.Length > 0) return Loc.T("gps_lobby_addr_lan", "Same network {0}", $"{lan}:{port}");
+            return "";
+        }
+
+        /// <summary>Positions that depend on the mode (host/joiner, new/saved game, IP shown, Steam up, Steam-only). Runs only
+        /// when that key changes — the 0.5 s refresh never rebuilds layout.</summary>
+        private void LobbyLayout(bool host, bool client, bool load, bool showIp, bool steamOk, bool steamOnly)
+        {
+            int key = (host ? 1 : 0) | (client ? 2 : 0) | (load ? 4 : 0) | (showIp ? 8 : 0) | (steamOk ? 16 : 0) | (steamOnly ? 32 : 0);
+            if (key == _lwLayoutKey) return;
+            _lwLayoutKey = key;
+            bool newGame = !load;
+            // Player table columns (row-relative): name | Starting money 282 | Age 434 (joiner 526) | Kick 526.
+            LShowGO(_lwHdrCash != null ? _lwHdrCash.gameObject : null, host && newGame);
+            LShowGO(_lwHdrAge != null ? _lwHdrAge.gameObject : null, newGame);
+            if (_lwHdrAge != null) LPos(_lwHdrAge.rectTransform, host ? 410f : 548f, 64f, 80f, 15f);
+            float nameW = host ? (newGame ? 191f : 431f) : 477f;   // BAN-PLAYERS-1 C2 (B5): the host's rows end at Kick + Ban
+            for (int s = 0; s < LW_SLOTS; s++)
+            {
+                var r = _lwRows[s];
+                if (r == null) continue;
+                LPos(r.name.rectTransform, 37f, 0f, nameW, LW_ROW_H);
+                LPos(r.age.rt, host ? 388f : 526f, LW_ROW_CTL_Y, 64f, 30f);
+            }
+            // Right column (380 wide at x 678).
+            LShowGO(_rtLwSettings != null ? _rtLwSettings.gameObject : null, host);
+            LShowGO(_rtLwInvite != null ? _rtLwInvite.gameObject : null, host);
+            LShowGO(_rtLwWaiting != null ? _rtLwWaiting.gameObject : null, client);
+            // MODS-GATE-1: the 'Different mods' row sits 10 under Difficulty (new game) or the save name (saved game); the
+            // section grows by that row, and Invite follows it (_lwInviteTop below).
+            float modsY = newGame ? 102f : 86f;
+            float banY = modsY + 36f + 10f;   // BAN-PLAYERS-1 C2 (B5): the 'Banned players' row under it
+            if (_lwBannedLbl != null) LPos(_lwBannedLbl.rectTransform, 16f, banY, 200f, 32f);
+            if (_lwBannedB != null) LPos(_lwBannedB.rt, 380f - 16f - 100f, banY, 100f, 32f);
+            float sh = banY + 32f + 14f;
+            if (_rtLwSettings != null) LPos(_rtLwSettings, 678f, 64f, 380f, sh);
+            LShow(_lwMoreB, newGame); LShow(_lwSaveSetB, !newGame);
+            LShowGO(_lwDiffLbl != null ? _lwDiffLbl.gameObject : null, newGame);
+            LShow(_lwDiffEasyB, newGame); LShow(_lwDiffNormalB, newGame); LShow(_lwDiffHardB, newGame);
+            LShowGO(_lwSavedLbl != null ? _lwSavedLbl.gameObject : null, !newGame);
+            if (_lwModsLbl != null) LPos(_lwModsLbl.rectTransform, 16f, modsY, 128f, 36f);
+            if (_lwModsAllowB != null) LPos(_lwModsAllowB.rt, 150f, modsY, 100f, 36f);
+            if (_lwModsRefuseB != null) LPos(_lwModsRefuseB.rt, 258f, modsY, 104f, 36f);
+            // Invite: Steam button, 'Direct connection:', the address (1 line hidden / 2 shown), Show IP + Change port, hint.
+            float y = 46f;
+            LShow(_lwInviteB, steamOk);
+            if (steamOk) y += 42f + 12f;
+            if (_lwDirectLbl != null) LPos(_lwDirectLbl.rectTransform, 16f, y, 348f, 16f);
+            y += 16f + 12f;
+            // Fold 2: from the address down, Invite (host) / Waiting (joiner) and the notice under them are placed by
+            // LwFitRightColumn on the MEASURED texts, after the refresh writes them; this records where the address starts.
+            _lwAddrY = y; _lwAddrFallbackH = showIp || steamOnly ? 48f : 18f; _lwSteamOnly = steamOnly;
+            _lwInviteTop = 64f + sh + 14f;
+            _lwRcLayout = -1;
+            // Footer: host = Leave left + Start Game right; joiner = Leave alone, right.
+            if (_lwLeaveB != null) LPos(_lwLeaveB.rt, host ? 22f : 908f, 590f, 150f, 44f);
+            LShow(_lwStartB, host);
+        }
+
+        private void RefreshLobbyWindow()
+        {
+            if (_lobbyWindow == null) return;
+            try { RefreshLobbyCore(); }
+            catch (Exception ex)
+            {
+                if (!_lwRefreshErrLogged) { _lwRefreshErrLogged = true; Plugin.Logger.LogWarning($"[MenuUI] lobby refresh: {ex}"); }
+            }
+        }
+
+        /// <summary>Every 0.5 s while the lobby is open, and on events. Texts are written only when they change.</summary>
+        private void RefreshLobbyCore()
+        {
+            bool host = LwHost();
+            bool client = !host && LwClient();
+            bool connecting = !host && !client && LwConnecting();
+            if (client || connecting) _lwHostFailed = false;
+            int card = host || client ? 0 : connecting ? 1 : 2;
+            _lwCard = card;
+            if (card != 0) _lwThumbDrag = false;
+            LwFit(false);   // review item 15: screen size / UI scale changed while open
+            LShowGO(_lwMain != null ? _lwMain.go : null, card == 0);
+            LShowGO(_lwConn != null ? _lwConn.go : null, card == 1);
+            LShowGO(_lwFail != null ? _lwFail.go : null, card == 2);
+            if (card != 0 && _lwPortOpen) ClosePortPopup();
+            if (card == 1) { LSetText(_lwConnLbl, Loc.T("gps_lobby_connecting", "Connecting to {0}...", LwConnectAddress())); return; }
+            if (card == 2) { RefreshFailCard(); return; }
+            var main = _lwMain;
+            if (main == null) return;
+
+            var players = LwPlayers(host);
+            int n = players != null ? players.Count : 0;
+            bool load = LwLoad(host);
+            bool steamOk = false;
+            try { steamOk = Steamworks.SteamClient.IsValid; } catch { }
+#if BAMP_DEV
+            if (DevLobby != 0) steamOk = true;
+#endif
+            int port = host ? LwBoundPort() : 0;
+            bool steamOnly = host && port <= 0;
+            LobbyLayout(host, client, load, _showIp && !steamOnly, steamOk, steamOnly);
+            LSetText(main.sub, (load ? Loc.T("gps_lobby_saved_game", "Saved game") : Loc.T("gps_lobby_new_game", "New game")) + " · "
+                + (n == 1 ? Loc.T("gps_lobby_one_player", "1 player") : Loc.T("gps_lobby_players", "{0} players", n)));
+
+            // ── the player list: LW_SLOTS (8) row slots; from the 9th player the list scrolls ──
+            LwSyncFocus(players, n);
+            int maxScroll = Math.Max(0, n - LW_SLOTS);
+            if (_lwScroll > maxScroll) _lwScroll = maxScroll;
+            if (_lwScroll < 0) _lwScroll = 0;
+            int baseCash = _hostSettings != null ? _hostSettings.StartingMoney : 0;
+            int baseAge  = _hostSettings != null ? _hostSettings.StartingAge   : 18;
+            for (int s = 0; s < LW_SLOTS; s++)
+            {
+                var r = _lwRows[s];
+                if (r == null) continue;
+                int pi = _lwScroll + s;
+                bool occupied = players != null && pi < n && !string.IsNullOrEmpty(players[pi]);
+                LShowGO(r.go, occupied);
+                if (!occupied || players == null) continue;
+                string nm = players[pi];
+                bool isLocal = nm == MPConfig.PlayerId;
+                LShowGO(r.star.gameObject, pi == 0 && !(client && MPClient.LobbyHostDedicated));   // row 0 = the host (a dedicated server's own character is not in the list: LOBBY-DEDICATED-1)
+                LSetText(r.name, isLocal ? $"<noparse>{nm}</noparse> <color=#CDD4DA>{Loc.T("gps_lobby_you", "(you)")}</color>" : $"<noparse>{nm}</noparse>");
+                // Starting money: host only, new game only, editable by the host on any row.
+                bool showCash = host && !load;
+                LShowGO(r.cash.rt.gameObject, showCash);
+                if (showCash && _lwRowCashFocus != pi)
+                    LFieldText(r.cash, MPServer.StartingCashFor(nm, baseCash).ToString("N0", System.Globalization.CultureInfo.InvariantCulture), false);
+                // Age: new game only. Your own row = your editable box. The HOST also sees the others' ages (read-only
+                // text: it bakes everyone's settings); a JOINER sees only its own (user, 2026-06-11).
+                bool ageField = !load && isLocal;
+                bool ageText = !load && !isLocal && host;
+                LShowGO(r.age.rt.gameObject, ageField);
+                LShowGO(r.ageTxt.gameObject, ageText);
+                if (ageField && _lwRowAgeFocus != pi) LFieldText(r.age, DisplayAgeFor(nm, true, baseAge).ToString(), false);
+                if (ageText) LSetText(r.ageTxt, DisplayAgeFor(nm, false, baseAge).ToString());
+                LShow(r.kick, host && pi > 0);   // never on the host's own row
+                LShow(r.ban, host && pi > 0);    // BAN-PLAYERS-1 C2 (B5): beside Kick, never on the host's own row
+                LFieldState(r.cash, false, _lwRowCashFocus == pi);
+                LFieldState(r.age, false, _lwRowAgeFocus == pi);
+            }
+            bool scroll = n > LW_SLOTS;
+            LShowGO(_lwTrack, scroll);
+            int tk = scroll ? n * 1000 + _lwScroll : -2;
+            if (tk != _lwThumbKey && _lwThumb != null)
+            {
+                _lwThumbKey = tk;
+                if (scroll)
+                {
+                    float th = LW_LIST_H * LW_SLOTS / n;
+                    LPos(_lwThumb, 0f, maxScroll > 0 ? (LW_LIST_H - th) * _lwScroll / maxScroll : 0f, 6f, th);
+                }
+            }
+
+            // ── right column ──
+            if (host)
+            {
+                if (load)
+                {
+                    string sn = LwSaveName();
+                    LSetText(_lwSavedLbl, sn.Length > 0 ? Loc.T("gps_lobby_saved_name", "Saved game: {0}", sn) : "");
+                }
+                else HighlightDifficulty();
+                HighlightModsGate();
+
+                string addr;
+                bool dots = false;
+                if (steamOnly)
+                {   // H-HOSTPORT-1 (wording approved by the user 2026-09-26): Steam-only hosting - no UDP port bound.
+                    int rp = LwRequestedPort();
+                    addr = Loc.T("gps_lobby_steam_only", "Others join at:   Steam invites only (ports {0}-{1} are in use)", rp, Math.Min(rp + 10, 65535));
+                }
+                else if (!_showIp) { addr = $"•••••••••• : {port}"; dots = true; }
+                else addr = LwShownAddress(port);
+                LSetText(_lwAddrLbl, addr);
+                if (_lwAddrLbl != null)
+                {
+                    float sp = dots ? 14f : 0f;
+                    if (_lwAddrLbl.characterSpacing != sp) _lwAddrLbl.characterSpacing = sp;
+                    var ac = dots ? L_MUTED : C_WHITE;
+                    if (_lwAddrLbl.color != ac) _lwAddrLbl.color = ac;
+                }
+                LShow(_lwShowIpB, !steamOnly);
+                LSetText(_lwShowIpB != null ? _lwShowIpB.lbl : null, _showIp ? Loc.T("gps_lobby_hide_ip", "Hide IP") : Loc.T("gps_lobby_show_ip", "Show IP"));
+                bool canPort = LwPortChangeAllowed();
+                LSetKind(_lwPortB, canPort ? 0 : 4);
+                bool busy = LwBusy(out int asked, out int bound);
+                // Review item 10: Steam-only hosting has no UDP port, so no port hint at all.
+                string hint = steamOnly ? ""
+                            : busy ? Loc.T("gps_lobby_port_busy", "Port {0} is in use, so friends join on {1} this time.", asked, bound)
+                            : canPort ? Loc.T("gps_lobby_port_hint", "Friends joining over the internet need this port forwarded on your router.")
+                            : Loc.T("gps_lobby_only_alone", L_ONLY_ALONE);
+                LSetText(_lwHintLbl, hint);
+                if (_lwHintLbl != null) { var hc = busy ? L_NOTICE : L_MUTED; if (_lwHintLbl.color != hc) _lwHintLbl.color = hc; }
+            }
+            else if (client)
+            {
+                string h0 = players != null && n > 0 ? players[0] : "";
+                var sb = new System.Text.StringBuilder();   // 0.5 s cadence, not per frame
+                // LOBBY-DEDICATED-1: a dedicated server has no host who starts - its world is running and on its way
+                if (MPClient.LobbyHostDedicated) sb.Append(Loc.T("gps_lobby_connected_server", "Connected to the server - the world is on its way."));
+                else if (h0.Length > 0) sb.Append(Loc.T("gps_lobby_connected_wait", "Connected to {0} - waiting for the host to start.", "<noparse>" + h0 + "</noparse>"));
+                // JOIN-WAIT-1 (C2): a mid-game join is PARKED until the host clicks accept, with no timeout.
+                if (LwAwaitingApproval())
+                    sb.Append(sb.Length > 0 ? "\n" : "").Append("<size=21><color=#F6C177>" + Loc.T("gps_lobby_wait_approval", "Waiting for the host to let you in.") + "</color></size>");
+                // Round-270: the joiner's world download, in the spot they are already watching (4 s freshness window).
+                if (SteamXferProgress.ActiveWithin(4000) && SteamXferProgress.Tag == "SteamClient" && SteamXferProgress.Cnt > 0)
+                {
+                    int dlPct = Mathf.Min(100, SteamXferProgress.Got * 100 / SteamXferProgress.Cnt);
+                    sb.Append(sb.Length > 0 ? "\n" : "").Append(ComposeDownloadLine(dlPct, SteamXferProgress.Got, SteamXferProgress.Cnt, SteamXferProgress.KBytes));
+                }
+                LSetText(_lwWaitLbl, sb.ToString());
+            }
+
+            LwFitRightColumn(host);
+
+            // ── notice line: transient notices (overlay disabled, refusals, Steam-only ...) + the LIVE mod-mismatch read ──
+            string notice = "";
+            if (!string.IsNullOrEmpty(_lobbyNotice) && Time.unscaledTime < _lobbyNoticeUntil) notice = _lobbyNotice;
+#if BAMP_DEV
+            // Round-270 /uipreview dl: dev preview slot (separate from _lobbyNotice, which teardown clears).
+            if (!string.IsNullOrEmpty(_previewNotice) && Time.unscaledTime < _previewNoticeUntil) notice = _previewNotice;
+#endif
+            // Round-253f (user ruling: events over timers): shown exactly while a mismatched player is present.
+            string standing = "";
+            try { standing = host ? MPServer.ModMismatchStripLine() : MPClient.ModMismatchVsHost; } catch { }
+            if (!string.IsNullOrEmpty(standing)) notice = notice.Length > 0 ? notice + "\n" + standing : standing;
+            LSetText(_lwNotice, notice);
+        }
+
+        /// <summary>Fold 2 (manager's screenshot check 2026-09-28): each right-column section fits its content - the address,
+        /// hint and waiting texts are MEASURED, and the section ends 14 under its last line (the same as the title's top
+        /// padding); the notice follows 12 under it, down to the divider. Re-measured only when one of those texts or the
+        /// layout changed (a string compare on the 0.5 s refresh, no allocation otherwise).</summary>
+        private void LwFitRightColumn(bool host)
+        {
+            try
+            {
+                string addr = _lwAddrLbl != null ? _lwAddrLbl.text ?? "" : "";
+                string hint = _lwHintLbl != null ? _lwHintLbl.text ?? "" : "";
+                string wait = _lwWaitLbl != null ? _lwWaitLbl.text ?? "" : "";
+                if (_lwRcLayout == _lwLayoutKey && string.Equals(addr, _lwRcAddr, StringComparison.Ordinal)
+                    && string.Equals(hint, _lwRcHint, StringComparison.Ordinal) && string.Equals(wait, _lwRcWait, StringComparison.Ordinal)) return;
+                _lwRcLayout = _lwLayoutKey; _lwRcAddr = addr; _lwRcHint = hint; _lwRcWait = wait;
+                float ny;
+                if (host)
+                {
+                    float y = _lwAddrY;
+                    float ah = LwTextH(_lwAddrLbl, addr, 348f, _lwAddrFallbackH);
+                    if (ah <= 0f) ah = _lwAddrFallbackH;   // the address line is always shown; keep its place before the first write
+                    if (_lwAddrLbl != null) LPos(_lwAddrLbl.rectTransform, 16f, y, 348f, ah);
+                    y += ah + 12f;
+                    if (_lwShowIpB != null) LPos(_lwShowIpB.rt, 16f, y, 110f, 34f);
+                    if (_lwPortB != null) LPos(_lwPortB.rt, _lwSteamOnly ? 16f : 136f, y, 150f, 34f);
+                    y += 34f;
+                    float hh = LwTextH(_lwHintLbl, hint, 348f, 38f);
+                    if (hh > 0f)
+                    {
+                        y += 12f;
+                        if (_lwHintLbl != null) LPos(_lwHintLbl.rectTransform, 16f, y, 348f, hh);
+                        y += hh;
+                    }
+                    y += 14f;
+                    if (_rtLwInvite != null) LPos(_rtLwInvite, 678f, _lwInviteTop, 380f, y);
+                    ny = _lwInviteTop + y + 12f;
+                }
+                else
+                {
+                    float wh = Mathf.Min(LwTextH(_lwWaitLbl, wait, 348f, 90f), 200f);   // over 200 the label's own ellipsis cuts
+                    if (_lwWaitLbl != null) LPos(_lwWaitLbl.rectTransform, 16f, 46f, 348f, wh);
+                    float h = (wh > 0f ? 46f + wh : 34f) + 14f;
+                    if (_rtLwWaiting != null) LPos(_rtLwWaiting, 678f, 64f, 380f, h);
+                    ny = 64f + h + 12f;
+                }
+                if (_lwNotice != null) LPos(_lwNotice.rectTransform, 678f, ny, 380f, Mathf.Max(0f, LW_DIVIDER_Y - 12f - ny));
+            }
+            catch (Exception ex)
+            {
+                if (!_lwFitErrLogged) { _lwFitErrLogged = true; Plugin.Logger.LogWarning($"[MenuUI] lobby right-column fit: {ex.Message}"); }
+            }
+        }
+
+        /// <summary>The height (layout units, rounded up) <paramref name="txt"/> takes in <paramref name="lbl"/> at
+        /// <paramref name="wU"/> units wide; 0 for no text, <paramref name="fallbackU"/> when TMP cannot measure.</summary>
+        private static float LwTextH(TextMeshProUGUI? lbl, string txt, float wU, float fallbackU)
+        {
+            if (lbl == null || string.IsNullOrEmpty(txt)) return 0f;
+            try { return Mathf.Ceil(lbl.GetPreferredValues(txt, wU * LS, 0f).y / LS); }
+            catch { return fallbackU; }
+        }
+
+        /// <summary>Couldn't join: the reason in FULL (wraps, never cut); the card grows to fit, re-measured only when the
+        /// reason changes. A failed HOST start (no port and no Steam) reuses the card under the lobby title.</summary>
+        private void RefreshFailCard()
+        {
+            var fail = _lwFail;
+            var lbl = _lwFailLbl;
+            if (fail == null || lbl == null) return;
+            bool hostFail = _lwHostFailed;
+#if BAMP_DEV
+            if (DevLobby != 0) hostFail = false;
+#endif
+            string reason = hostFail ? (_lobbyNotice ?? "") : LwFailReason() + ServerModDownload.Status;   // SERVER-MODS-1: download progress
+            LSetText(fail.title, hostFail ? Loc.T("gps_ui_multiplayer_lobby", "Multiplayer Lobby") : Loc.T("gps_ui_couldn_t_join", "Couldn't join"));
+            string modsLabel = hostFail ? "" : ServerModDownload.ButtonLabel;
+            if (reason + "\n" + modsLabel == _lwFailShown) return;
+            _lwFailShown = reason + "\n" + modsLabel;
+            lbl.text = reason;
+            float hU = 0f;
+            if (reason.Length > 0) { try { hU = lbl.GetPreferredValues(reason, 396f * LS, 0f).y; } catch { hU = 60f * LS; } }
+            float h = Mathf.Max(hU / LS, 1f);
+            float by = 64f + h + 16f;
+            LPos(lbl.rectTransform, 22f, 64f, 396f, h);
+            if (_lwFailModsB != null)
+            {
+                LShowGO(_lwFailModsB.go, modsLabel.Length > 0);
+                if (modsLabel.Length > 0)
+                {
+                    if (_lwFailModsB.lbl != null) _lwFailModsB.lbl.text = modsLabel;
+                    LPos(_lwFailModsB.rt, 84f, by, 312f, 42f);
+                    by += 54f;
+                }
+            }
+            if (_lwFailBackB != null)  LPos(_lwFailBackB.rt, 84f, by, 140f, 42f);
+            if (_lwFailRetryB != null) LPos(_lwFailRetryB.rt, 236f, by, 160f, 42f);
+            fail.rt.sizeDelta = new Vector2(440f * LS, (by + 42f + 20f) * LS);
+        }
+
+        /// <summary>The age to display for a player in the lobby roster.  Local row =
+        /// our own chosen age; others = the synced value (host's map / client's synced
+        /// ages), falling back to the difficulty default.</summary>
+        private int DisplayAgeFor(string playerId, bool isLocal, int baseAge)
+        {
+            try
+            {
+                if (MPServer.IsRunning) return MPServer.StartingAgeFor(playerId, baseAge);
+                if (isLocal) return MPClient.ChosenStartingAge > 0 ? MPClient.ChosenStartingAge : baseAge;
+                return MPClient.LobbyAges.TryGetValue(playerId, out var a) && a > 0 ? a : baseAge;
+            }
+            catch { return baseAge; }
+        }
+
+        // ── Hosting port popup (option A: only while the host is alone; rebinds ONLY the UDP listener) ──
+
+        private bool OpenPortPopup()
+        {
+            if (!LwPortChangeAllowed())
+            {
+                int n = 0, pc0 = 0;
+                try { n = MPServer.LobbyPlayers.Count; pc0 = MPServer.TransportPeerCount; } catch { }
+                Plugin.Logger.LogInfo($"[MenuUI] Change port refused - {n} player(s) in the lobby, {pc0} connection(s) open (only possible before anyone joins).");
+                return false;
+            }
+            _lwPortOpen = true; _ppFocus = true; _ppErr = ""; _lwCaretDirty = true;
+            _ppText = MPConfig.HostPort.ToString();
+            var pc = _lwPortCard;
+            if (pc != null) { pc.go.transform.SetAsLastSibling(); LShowGO(pc.go, true); }
+            LayoutPortCard();
+            Plugin.Logger.LogInfo("[MenuUI] Change port → Hosting port popup.");
+            return true;
+        }
+
+        private void ClosePortPopup()
+        {
+            _lwPortOpen = false; _ppFocus = false;
+            LShowGO(_lwPortCard != null ? _lwPortCard.go : null, false);
+        }
+
+        private void LayoutPortCard()
+        {
+            var pc = _lwPortCard;
+            if (pc == null) return;
+            bool err = _ppErr.Length > 0;
+            if (_ppErrLbl != null) { LShowGO(_ppErrLbl.gameObject, err); LSetText(_ppErrLbl, _ppErr); }
+            float by = err ? 243f : 209f;
+            if (_ppCancelB != null) LPos(_ppCancelB.rt, 84f, by, 130f, 40f);
+            if (_ppSaveB != null)   LPos(_ppSaveB.rt, 226f, by, 130f, 40f);
+            pc.rt.sizeDelta = new Vector2(440f * LS, (by + 60f) * LS);
+            LFieldState(_ppField, _ppErr == L_PORT_ERR, _ppFocus);
+        }
+
+        private void TickPortPopup(Vector2 mp)
+        {
+            if (Input.GetMouseButtonDown(0))
+            {
+                if (LHit(_ppSaveB, mp)) { PortPopupSave(); return; }
+                if (LHit(_ppCancelB, mp)) { Plugin.Logger.LogInfo("[MenuUI] Hosting port popup → cancel"); ClosePortPopup(); return; }
+                bool f = LHitF(_ppField, mp);
+                if (f != _ppFocus) { _ppFocus = f; _lwCaretDirty = true; LayoutPortCard(); }
+            }
+            if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter)) { PortPopupSave(); return; }
+            if (_ppFocus && Input.inputString.Length > 0)
+            {
+                string s = TypeDigits(_ppText, 5);
+                if (s != _ppText) { _ppText = s; _lwCaretDirty = true; }
+            }
+        }
+
+        /// <summary>Save: validate 1024-65535, re-check "alone", rebind ONLY the UDP listener (Steam listener and lobby state
+        /// untouched; the busy-port fallback applies), then persist the CHOSEN port as HostPort (never a fallback, never 0).</summary>
+        private string PortPopupSave()
+        {
+            try
+            {
+                string t = (_ppText ?? "").Trim();
+                if (!int.TryParse(t, out int p) || p < 1024 || p > 65535)
+                {
+                    _ppErr = L_PORT_ERR; LayoutPortCard();
+                    Plugin.Logger.LogInfo($"[MenuUI] Hosting port '{t}' refused (not 1024-65535).");
+                    return "invalid";
+                }
+                if (!LwPortChangeAllowed())
+                {
+                    _ppErr = L_ONLY_ALONE; LayoutPortCard();
+                    Plugin.Logger.LogInfo($"[MenuUI] Hosting port {p} refused - someone joined.");
+                    return "refused";
+                }
+#if BAMP_DEV
+                if (DevLobby != 0) { ClosePortPopup(); return "dev"; }
+#endif
+                if (!MPServer.RebindUdp(p, out string why))
+                {
+                    Plugin.Logger.LogWarning($"[MenuUI] Hosting port {p}: rebind not done ({why}).");
+                    if (why == "players present") { _ppErr = L_ONLY_ALONE; LayoutPortCard(); return "refused"; }
+                    ClosePortPopup(); RefreshLobbyWindow();
+                    return "failed: " + why;
+                }
+                MPConfig.SetHostPort(p);
+                Plugin.Logger.LogInfo($"[MenuUI] Hosting port saved: asked {p}, listening on {MPServer.BoundPort}.");
+                // Review item 10: a UDP port is bound again - the 'Hosting through Steam only…' notice no longer holds.
+                if (MPServer.BoundPort > 0 && _lobbyNotice.StartsWith("Hosting through Steam only", StringComparison.Ordinal)) _lobbyNotice = "";
+                ClosePortPopup(); RefreshLobbyWindow();
+                return "saved";
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] hosting port save: {ex.Message}"); return "error"; }
+        }
+
+        // ── Couldn't join: Back / Try Again ──
+        private void OnFailBack()
+        {
+            bool reopen = !_lwHostFailed && MPClient.LastConnectPath == "ip";
+            Plugin.Logger.LogInfo($"[MenuUI] Couldn't join → back{(reopen ? " (Join a Game)" : "")}");
+            OnLobbyLeave();
+            if (reopen) ShowJoinDialog(true);
+        }
+
+        private void OnFailRetry()
+        {
+            try
+            {
+                if (_lwHostFailed) { Plugin.Logger.LogInfo("[MenuUI] Lobby → try again (host)"); OnHost(); }
+                else
+                {
+                    // The address OnJoin persisted for this attempt (a Steam join keeps 'steam:<id>'; its port is ignored).
+                    _ip = MPConfig.HostIP;
+                    if (MPClient.LastConnectPath == "ip" && MPClient.LastConnectPort > 0) _port = MPClient.LastConnectPort.ToString();
+                    Plugin.Logger.LogInfo("[MenuUI] Couldn't join → try again");
+                    OnJoin();
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] try again: {ex.Message}"); }
+            RefreshLobbyWindow();
+        }
+
+        /// <summary>MAIN THREAD per frame while the lobby window is open — clicks + typing. No per-frame allocation: the
+        /// carets repaint only on a caret-phase or text change.</summary>
+        private bool _btnDiagLogged;
+        private void TickLobbyWindow()
+        {
+            if (_lobbyWindow == null || !_lobbyWindow.activeSelf) { _btnDiagLogged = false; if (_bpInLobby) BpClose("lobby closed"); return; }
+            try { TickLobbyCore(); }
+            catch (Exception ex)
+            {
+                if (!_lwTickErrLogged) { _lwTickErrLogged = true; Plugin.Logger.LogWarning($"[MenuUI] lobby tick: {ex}"); }
+            }
+        }
+
+        private void TickLobbyCore()
+        {
+            // Sweep item 2 UI honesty: while a start is in flight the button says so.
+            var sl = _lwStartB != null ? _lwStartB.lbl : null;
+            if (sl != null)
+            {
+                string want = (MPServer.IsRunning && !MPServer.IsInLobby) ? "Starting..." : "Start Game";
+                if (sl.text != want) sl.text = want;
+            }
+            if (_lwCard == 1 && _rtLwSpin != null) _rtLwSpin.localEulerAngles = new Vector3(0f, 0f, -((Time.unscaledTime * 300f) % 360f));
+            bool on = Time.unscaledTime % 1f < 0.5f;
+            if (on != _lwCaretOn || _lwCaretDirty) { _lwCaretOn = on; _lwCaretDirty = false; PaintLobbyCarets(on); }
+            // One-shot geometry diagnostic (2026-07-10 invite-button report), once per lobby open.
+            if (!_btnDiagLogged)
+            {
+                _btnDiagLogged = true;
+                try
+                {
+                    string D(LBtn? b) => b == null ? "null" : $"rect={b.rt.rect} active={b.go.activeInHierarchy}";
+                    Plugin.Logger.LogInfo($"[BtnDiag] invite: {D(_lwInviteB)} | showip: {D(_lwShowIpB)} | changeport: {D(_lwPortB)} | start: {D(_lwStartB)} | leave: {D(_lwLeaveB)}");
+                }
+                catch { }
+            }
+            var mp = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+            if (Input.GetKeyDown(KeyCode.Escape)) { LwEscape(); return; }   // review item 4
+            if (_lwPortOpen) { TickPortPopup(mp); return; }   // the popup owns the mouse and keys while open
+            if (BpOpen && _bpInLobby) { BpWheel(mp); if (Input.GetMouseButtonDown(0)) BpClick(mp); return; }   // BAN-PLAYERS-1 C2: so do the ban popups
+            LwBannedCount();
+            bool click = Input.GetMouseButtonDown(0);
+            if (_lwCard == 1) { if (click && LHit(_lwConnCancelB, mp)) OnLobbyLeave(); return; }
+            if (_lwCard == 2)
+            {
+                if (click && LHit(_lwFailBackB, mp)) { OnFailBack(); return; }
+                if (click && LHit(_lwFailRetryB, mp)) { OnFailRetry(); return; }
+                if (click && ServerModDownload.Offered && LHit(_lwFailModsB, mp)) { ServerModDownload.OpenNext(); return; }
+                return;
+            }
+            bool host = LwHost();
+            var roster = LwPlayers(host);
+            int rn = roster != null ? roster.Count : 0;
+            LwSyncFocus(roster, rn);
+
+            // Review item 13: drag the thumb / click the track to page (the wheel below still works).
+            if (_lwThumbDrag)
+            {
+                if (!Input.GetMouseButton(0)) _lwThumbDrag = false;
+                else { LwDragThumb(mp.y, rn); return; }
+            }
+            else if (click && _rtLwTrackHit != null && _lwTrack != null && _lwTrack.activeSelf && RectHit(_rtLwTrackHit, mp))
+            {
+                int where = LwThumbSide(mp);
+                if (where == 0) { _lwThumbDrag = true; _lwDragStartY = mp.y; _lwDragStartScroll = _lwScroll; }
+                else LwPage(where, rn);
+                return;
+            }
+
+            float wheel = Input.mouseScrollDelta.y;
+            if (wheel != 0f && _rtLwList != null && RectHit(_rtLwList, mp))
+            {
+                int ns = Mathf.Clamp(_lwScroll + (wheel > 0f ? -1 : 1), 0, Math.Max(0, rn - LW_SLOTS));
+                if (ns != _lwScroll) { _lwScroll = ns; LwClearFocus(); RefreshLobbyWindow(); }
+            }
+
+            if (click)
+            {
+                if (LHit(_lwLeaveB, mp)) { OnLobbyLeave(); return; }
+                if (host)
+                {
+                    if (LwBanRowHit(mp, roster, rn)) return;                    // BAN-PLAYERS-1 C2 (B5): asks first (B2)
+                    if (LHit(_lwBannedB, mp)) { BpOpenList(true); return; }      // B5 'Edit ({n})' -> B3
+                    for (int s = 0; s < LW_SLOTS; s++)
+                    {
+                        var r = _lwRows[s];
+                        if (r == null || !LHit(r.kick, mp)) continue;
+                        int pi = _lwScroll + s;
+                        if (roster != null && pi < rn)
+                        {
+                            Plugin.Logger.LogInfo($"[MenuUI] Kick → '{roster[pi]}'");
+                            MPServer.KickFromLobby(roster[pi]);
+                        }
+                        return;
+                    }
+                    if (LHit(_lwShowIpB, mp))     { OnToggleShowIp();   return; }
+                    if (LHit(_lwInviteB, mp))     { OnInviteFriends();  return; }
+                    if (LHit(_lwPortB, mp))       { OpenPortPopup();    return; }   // greyed = refused + logged
+                    if (LHit(_lwStartB, mp))      { OnLobbyStart();     return; }
+                    if (LHit(_lwDiffEasyB, mp))   { SetDifficulty("Easy");   return; }
+                    if (LHit(_lwDiffNormalB, mp)) { SetDifficulty("Normal"); return; }
+                    if (LHit(_lwDiffHardB, mp))   { SetDifficulty("Hard");   return; }
+                    if (LHit(_lwModsAllowB, mp))  { SetModsGate(false); return; }
+                    if (LHit(_lwModsRefuseB, mp)) { SetModsGate(true);  return; }
+                    if (LHit(_lwMoreB, mp) || LHit(_lwSaveSetB, mp)) { OnCustomize(); return; }
+                }
+                // Box focus: cash = host on any row; age = your OWN row only (host or joiner).
+                LwClearFocus();
+                int baseCash = _hostSettings != null ? _hostSettings.StartingMoney : 0;
+                int baseAge  = _hostSettings != null ? _hostSettings.StartingAge   : 18;
+                for (int s = 0; s < LW_SLOTS && roster != null; s++)
+                {
+                    var r = _lwRows[s];
+                    int pi = _lwScroll + s;
+                    if (r == null || pi >= rn) break;
+                    if (host && LHitF(r.cash, mp)) { _lwRowCashFocus = pi; _lwCashFocusId = roster[pi]; _lwEditBuf = MPServer.StartingCashFor(roster[pi], baseCash).ToString(); break; }
+                    if (LHitF(r.age, mp) && roster[pi] == MPConfig.PlayerId) { _lwRowAgeFocus = pi; _lwAgeFocusId = roster[pi]; _lwEditBuf = DisplayAgeFor(roster[pi], true, baseAge).ToString(); break; }
+                }
+                _lwCaretDirty = true;
+                RefreshLobbyWindow();   // repaint the box that lost focus (an event, not per frame)
+            }
+
+            if (Input.inputString.Length == 0) return;
+            if (host && _lwRowCashFocus >= 0)
+            {
+                int i = _lwRowCashFocus;
+                _lwEditBuf = TypeDigits(_lwEditBuf, 9);
+                if (roster != null && i < rn && !string.IsNullOrEmpty(roster[i]))
+                {
+                    if (int.TryParse(_lwEditBuf, out int v)) MPServer.StartingCashByPlayer[roster[i]] = v;
+                    else                                    MPServer.StartingCashByPlayer.Remove(roster[i]);   // empty → base
+                }
+                _lwCaretDirty = true;
+            }
+            else if (_lwRowAgeFocus >= 0)
+            {
+                // Round-226b (user design): the age box HOLDS two digits — a third keystroke never goes in; a complete
+                // 2-digit entry above 79 becomes 79 on screen AND in effect (the game zombie-walks at 80, kills at 90).
+                string s = TypeDigits(_lwEditBuf, 2);
+                if (int.TryParse(s, out int v))
+                {
+                    if (s.Length == 2 && v > 79) { v = 79; s = "79"; }
+                    v = Mathf.Clamp(v, 16, 79);
+                    if (MPServer.IsRunning) MPServer.SetStartingAge(MPConfig.PlayerId, v);   // host's own age (+ broadcast)
+                    else { MPClient.ChosenStartingAge = v; MPClient.SendLobbyPref(v); }       // client reports its age
+                }
+                _lwEditBuf = s;
+                _lwCaretDirty = true;
+            }
+        }
+
+        /// <summary>Round-226c: an end-of-text blinking bar in the focused box (typing only appends/backspaces at the end).</summary>
+        private void PaintLobbyCarets(bool on)
+        {
+            int sc = _lwRowCashFocus - _lwScroll, sa = _lwRowAgeFocus - _lwScroll;
+            if (_lwRowCashFocus >= 0 && sc >= 0 && sc < LW_SLOTS) { var r = _lwRows[sc]; if (r != null) LFieldText(r.cash, on ? _lwEditBuf + "|" : _lwEditBuf, true); }
+            if (_lwRowAgeFocus >= 0 && sa >= 0 && sa < LW_SLOTS)  { var r = _lwRows[sa]; if (r != null) LFieldText(r.age,  on ? _lwEditBuf + "|" : _lwEditBuf, true); }
+            if (_lwPortOpen && _ppField != null) LFieldText(_ppField, on && _ppFocus ? _ppText + "|" : _ppText, _ppFocus);
+        }
+
+        /// <summary>Review item 4: Escape in the lobby window = that window's own back / cancel: Hosting port popup = Cancel,
+        /// Connecting = Cancel, Couldn't join = Back. The lobby itself ignores it (leaving is a deliberate click). The press
+        /// is consumed in every case.</summary>
+        private string LwEscape()
+        {
+            string r;
+            if (BpOpen && _bpInLobby) { Plugin.Logger.LogInfo("[MenuUI] ban popup → back / close (Escape)"); BpEscape(); r = "ban popup"; }
+            else if (_lwPortOpen) { Plugin.Logger.LogInfo("[MenuUI] Hosting port popup → cancel (Escape)"); ClosePortPopup(); r = "port popup cancel"; }
+            else if (_lwCard == 1) { Plugin.Logger.LogInfo("[MenuUI] Connecting → cancel (Escape)"); OnLobbyLeave(); r = "connecting cancel"; }
+            else if (_lwCard == 2) { Plugin.Logger.LogInfo("[MenuUI] Couldn't join → back (Escape)"); OnFailBack(); r = "couldn't join back"; }
+            else r = "lobby: ignored";
+            ConsumeEscape();
+            return r;
+        }
+
+        /// <summary>Review item 13: where a track click landed against the thumb (vertical only): -1 above, 0 on, 1 below.</summary>
+        private int LwThumbSide(Vector2 mp)
+        {
+            var th = _lwThumb;
+            if (th == null) return 0;
+            RectTransformUtility.ScreenPointToLocalPointInRectangle(th, mp, null, out var local);
+            var r = th.rect;
+            return local.y > r.yMax ? -1 : local.y < r.yMin ? 1 : 0;
+        }
+
+        private void LwSetScroll(int ns, int rn)
+        {
+            ns = Mathf.Clamp(ns, 0, Math.Max(0, rn - LW_SLOTS));
+            if (ns != _lwScroll) { _lwScroll = ns; _lwCaretDirty = true; RefreshLobbyWindow(); }
+        }
+
+        private void LwPage(int dir, int rn) => LwSetScroll(_lwScroll + dir * LW_SLOTS, rn);
+
+        /// <summary>Thumb drag: the mouse's travel over the track's free length maps onto the scroll range. No allocation;
+        /// the list repaints only when the scroll position changes.</summary>
+        private void LwDragThumb(float my, int rn)
+        {
+            int maxScroll = Math.Max(0, rn - LW_SLOTS);
+            if (maxScroll == 0 || _lwTrack == null || _lwThumb == null) return;
+            var tr = (RectTransform)_lwTrack.transform;
+            float travel = tr.rect.height * tr.lossyScale.y - _lwThumb.rect.height * _lwThumb.lossyScale.y;
+            if (travel <= 1f) return;
+            LwSetScroll(_lwDragStartScroll + Mathf.RoundToInt((_lwDragStartY - my) / travel * maxScroll), rn);
+        }
+
+        /// <summary>Applies Input.inputString (digits + backspace) to a numeric string buffer.</summary>
+        private static string TypeDigits(string s, int maxLen)
+        {
+            foreach (char c in Input.inputString)
+            {
+                if (c == '\b') { if (s.Length > 0) s = s.Substring(0, s.Length - 1); }
+                else if (char.IsDigit(c) && s.Length < maxLen) s += c;
+            }
+            return s;
+        }
+
+#if BAMP_DEV
+        // ── DEV levers for the lobby redesign (TestDrive 'uiview', 2026-09-28) ─────────────────────────────
+        // Fake states so every screen can be screenshotted on ONE machine, plus the popup / join lever paths that
+        // t-lobbyport drives through the real code. The fake roster uses the approved mock-up's sample names.
+        internal static int DevLobby;   // 0 real, 1 host new game, 2 host saved game, 3 joiner, 4 connecting, 5 couldn't join
+        private static List<string>? _devRoster;
+        private static int _devBusyA, _devBusyB;
+        private static readonly List<System.Net.Sockets.Socket> _devOccupy = new();
+        private static LiteNetLib.NetManager? _devRawPeer;
+        private static readonly string[] DevNames = { "HostName", "FriendName", "Player Three", "Player Four", "Player Five", "Player Six", "Player Seven", "Player Eight" };
+
+        private void DevUiOff()
+        {
+            DevLobby = 0; _devRoster = null; _devBusyA = 0; _devBusyB = 0;
+            _lobbyNotice = "";   // a DEV-posted notice (lobbymany) must not leak into the next screen
+            ClosePortPopup();
+            ShowJoinDialog(false);
+        }
+
+        /// <summary>MODS-GATE-1 DEV card: a sample refusal through the real tag + sentence path - 7 missing (one over-long
+        /// name, so the ellipsis and ' and N more' both show) and 1 extra.</summary>
+        private static string DevModsReason()
+        {
+            try
+            {
+                string tag = MPContentFingerprint.ModsRefusalTag(
+                    "mod:Advanced Business Simulation Overhaul Extended Edition@1.0.0.0, mod:BetterFurniture@1.0.0.0, mod:CheaperRent@1.0.0.0, "
+                    + "mod:MoreCars@1.0.0.0, mod:NightMarket@1.0.0.0, mod:QuietCity@1.0.0.0, mod:RealisticTraffic@1.2.0.0",
+                    "mod:ExtraShelves@2.0.0.0", out _, out _);
+                return MPClient.ModsRefusalFromTag(tag);
+            }
+            catch { return ""; }
+        }
+
+        private void DevFill(int mode, int n, int me)
+        {
+            DevUiOff();
+            var list = new List<string>();
+            for (int i = 0; i < n; i++) list.Add(i == me ? MPConfig.PlayerId : i < DevNames.Length ? DevNames[i] : "Player " + (i + 1));
+            DevLobby = mode; _devRoster = list;
+            ShowView(MpView.Submenu);   // leave + re-enter so the lobby opens fresh (IP hidden, popup closed)
+            ShowView(MpView.Lobby);
+        }
+
+        internal string DevUi(string verb, string arg)
+        {
+            try
+            {
+                switch (verb)
+                {
+                    case "off": DevUiOff(); return "dev off";
+                    case "join":
+                        DevUiOff(); ShowView(MpView.Submenu); ShowJoinDialog(true);
+                        return $"join dialog open={_joinDialog != null && _joinDialog.activeSelf}";
+                    case "joinerr":
+                        DevUiOff(); ShowView(MpView.Submenu); ShowJoinDialog(true);
+                        _joinIp = "203.0.113.5"; _joinPort = "77"; _joinDirty = true;
+                        OnJoinConnect();
+                        return $"err='{_joinErr}' open={_joinDialog != null && _joinDialog.activeSelf}";
+                    case "lobby":       DevFill(1, 8, 0); return "fake host lobby, 8 players";
+                    case "lobbymany":
+                        // 12 players (the scrollbar), one over-long name (ellipsis) and the notice line in its new place.
+                        DevFill(1, 12, 0);
+                        if (_devRoster != null && _devRoster.Count > 2) _devRoster[2] = "Player Three With A Much Longer Name Than The Column";
+                        PostLobbyNotice(Loc.T("gps_ui_hosting_through_steam_only_ports_7777", "Hosting through Steam only: ports 7777–7787 are already in use."), 60f);
+                        RefreshLobbyWindow();
+                        return "fake host lobby, 12 players";
+                    case "thumb":
+                    {   // the thumb-drag path: a drag to fraction <arg> of the track
+                        int rn = _devRoster != null ? _devRoster.Count : 0, mx = Math.Max(0, rn - LW_SLOTS);
+                        float fr = float.Parse(arg, System.Globalization.CultureInfo.InvariantCulture);
+                        _lwDragStartScroll = 0; LwSetScroll(Mathf.RoundToInt(fr * mx), rn);
+                        return $"scroll={_lwScroll}/{mx}";
+                    }
+                    case "page":
+                    {   // the track-click path: <arg> = -1 (above the thumb) or 1 (below)
+                        int rn = _devRoster != null ? _devRoster.Count : 0;
+                        LwPage(int.Parse(arg), rn);
+                        return $"scroll={_lwScroll}/{Math.Max(0, rn - LW_SLOTS)}";
+                    }
+                    case "escape":
+                    {   // the same handlers the Escape key runs
+                        string r;
+                        if (_joinDialog != null && _joinDialog.activeSelf) { OnJoinBack(); ConsumeEscape(); r = "join back"; }
+                        else if (_lobbyWindow != null && _lobbyWindow.activeSelf) r = LwEscape();
+                        else r = "nothing open";
+                        return $"{r} view={_view} join={(_joinDialog != null && _joinDialog.activeSelf)} popup={_lwPortOpen}";
+                    }
+                    case "rawpeer":
+                    {   // a transport connection that never says hello (review item 6); 'off' closes it
+                        try { _devRawPeer?.Stop(); } catch { }
+                        _devRawPeer = null;
+                        if (arg.Length == 0 || arg == "off") return $"raw peer closed transportPeers={MPServer.TransportPeerCount}";
+                        var nm = new LiteNetLib.NetManager(new LiteNetLib.EventBasedNetListener());
+                        nm.Start();
+                        nm.Connect("127.0.0.1", int.Parse(arg), "BAMP");
+                        _devRawPeer = nm;
+                        return $"raw peer connecting to 127.0.0.1:{arg} (no hello)";
+                    }
+                    case "lobbysaved":  DevFill(2, 3, 0); return "fake saved-game lobby, 3 players";
+                    case "lobbyclient": DevFill(3, 5, 4); return "fake joiner lobby, 5 players";
+                    case "portpopup":
+                        DevFill(1, 1, 0); _devBusyA = 7777; _devBusyB = 7778; RefreshLobbyWindow();
+                        return $"fake host lobby + busy line, Hosting port popup open={OpenPortPopup()}";
+                    case "connecting":  DevFill(4, 0, 0); return "fake connecting";
+                    case "failed":      DevFill(arg == "mods" ? 6 : arg == "banned" ? 7 : 5, 0, 0); return arg == "mods" ? "fake couldn't join (mods)" : arg == "banned" ? "fake couldn't join (banned)" : "fake couldn't join";
+                    case "modsgate":
+                    {   // MODS-GATE-1: 'allow' / 'refuse' = the buttons' own click path; no argument = read the state
+                        if (arg == "allow") SetModsGate(false);
+                        else if (arg == "refuse") SetModsGate(true);
+                        else if (arg.Length > 0) return "ERR usage: modsgate [allow|refuse]";
+                        RefreshLobbyWindow();
+                        bool shown = _lwModsAllowB != null && _lwModsAllowB.go.activeInHierarchy;
+                        return $"state={(MPConfig.RefuseModMismatch ? "Refuse" : "Allow")} saved='{MPConfig.RefuseModMismatchSaved}' shown={shown} allowKind={(_lwModsAllowB != null ? _lwModsAllowB.kind : -9)} refuseKind={(_lwModsRefuseB != null ? _lwModsRefuseB.kind : -9)}";
+                    }
+                    // ── SAVED-SETTINGS-1 levers: the real saved-game lobby and the settings window's own click paths ──
+                    case "ssload":
+                    {   // the save picker's Load click for session <arg>
+                        DevUiOff();
+                        _spSelSession = arg; _spSelPid = "";
+                        OnSpLoad();
+                        return $"lobby load={_lobbyLoadMode} seeded={_ssHas} from={_ssSource} courses={_ssCourses} contacts={_ssContacts}";
+                    }
+                    case "ssopen":
+                    {
+                        OnOpenSettings();
+                        var lk = new List<string>();
+                        foreach (var kv in _devSsRows) if (kv.Value.locked) lk.Add(kv.Key);
+                        return $"open={_settingsOpen} mode={(_settingsPanelLoadMode ? "saved" : "new")} rows={_devSsRows.Count} locked=[{string.Join(",", lk)}]";
+                    }
+                    case "ssset":
+                    {   // '<label>=<value>': a number is TYPED into the value box (click-to-type path); ON/OFF clicks the toggle if it differs
+                        int eq = arg.LastIndexOf('=');
+                        if (eq <= 0) return "ERR usage: ssset <label>=<value>";
+                        string lab = arg.Substring(0, eq).Trim(), val = arg.Substring(eq + 1).Trim();
+                        if (!_settingsOpen) return "ERR settings window not open";
+                        if (!_devSsRows.TryGetValue(lab, out var row)) return $"ERR no row '{lab}'";
+                        if (row.locked) return $"locked {lab}={row.show()}";
+                        if (row.num >= 0)
+                        {
+                            BeginSettingsEdit(row.num); _editBuffer = val; CommitSettingsEdit();
+                            return $"{lab}={_numFields[row.num].Lbl.text}";
+                        }
+                        bool want = val.Equals("ON", StringComparison.OrdinalIgnoreCase);
+                        if (row.get != null && row.tog != null && row.get() != want)
+                            foreach (var hh in _settingsHits) if (ReferenceEquals(hh.rt, row.tog)) { hh.act(); break; }
+                        return $"{lab}={row.show()}";
+                    }
+                    case "ssdump": return DevSsDump();
+                    case "sstip":
+                    {   // force the hover tooltip of row <arg> ('' clears)
+                        _devTip = -1;
+                        if (arg.Length > 0) for (int i = 0; i < _settingsTips.Count; i++) if (_settingsTips[i].title == arg) { _devTip = i; break; }
+                        return arg.Length == 0 ? "tip cleared" : _devTip >= 0 ? $"tip '{arg}': {_settingsTips[_devTip].desc}" : $"ERR no row '{arg}'";
+                    }
+                    case "ssclose": _devTip = -1; OnCloseSettings(); return $"open={_settingsOpen}";
+                    case "ssstart":
+                        _devTip = -1;
+                        if (_settingsOpen) OnCloseSettings();
+                        OnLobbyStart();
+                        return $"lobby start inLobby={MPServer.IsInLobby}";
+                    case "real":        DevUiOff(); ShowView(MpView.Lobby); return "real lobby";
+                    case "host":
+                        DevUiOff(); OnMpHostNew();
+                        return $"server={MPServer.IsRunning} bound={MPServer.BoundPort} asked={MPServer.RequestedPort} HostPort={MPConfig.HostPort}";
+                    case "port":
+                    {
+                        RefreshLobbyWindow();
+                        if (!OpenPortPopup())
+                            return $"refused allowed=False hint='{(_lwHintLbl != null ? _lwHintLbl.text : "")}' bound={MPServer.BoundPort} HostPort={MPConfig.HostPort}";
+                        _ppText = arg; _lwCaretDirty = true;
+                        string r = PortPopupSave();
+                        RefreshLobbyWindow();
+                        return $"{r} bound={MPServer.BoundPort} asked={MPServer.RequestedPort} HostPort={MPConfig.HostPort} popupOpen={_lwPortOpen} err='{_ppErr}' hint='{(_lwHintLbl != null ? _lwHintLbl.text : "")}'";
+                    }
+                    case "joinaddr":
+                        DevUiOff(); ShowView(MpView.Submenu); ShowJoinDialog(true);
+                        _joinIp = arg; _joinDirty = true;
+                        OnJoinConnect();
+                        return $"ip='{_ip}' port='{_port}' err='{_joinErr}' started={MPClient.IsConnecting || MPClient.IsConnected}";
+                    case "cfg":
+                        // 'cfg joinport <n>' puts the JOIN port back after a test (the lever's join persisted it).
+                        if (arg.StartsWith("joinport ", StringComparison.Ordinal)) MPConfig.SetRuntime(MPConfig.PlayerId, null, int.Parse(arg.Substring(9).Trim()));
+                        return $"HostPort={MPConfig.HostPort} Port={MPConfig.Port}";
+                    case "leave": DevUiOff(); OnLobbyLeave(); return $"left server={MPServer.IsRunning} client={MPClient.IsConnected}";
+                    case "occupy":
+                    {
+                        foreach (var o in _devOccupy) { try { o.Close(); } catch { } }
+                        _devOccupy.Clear();
+                        if (arg.Length == 0 || arg == "off") return "released";
+                        // '<port>' or '<first>-<last>' (review item 7: a whole fallback range held)
+                        int dash = arg.IndexOf('-');
+                        int op = int.Parse(dash > 0 ? arg.Substring(0, dash) : arg), ol = dash > 0 ? int.Parse(arg.Substring(dash + 1)) : op;
+                        for (int q = op; q <= ol; q++)
+                        {
+                            var s = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.InterNetwork, System.Net.Sockets.SocketType.Dgram, System.Net.Sockets.ProtocolType.Udp);
+                            s.ExclusiveAddressUse = true;
+                            s.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Any, q));
+                            _devOccupy.Add(s);
+                        }
+                        return dash > 0 ? $"holding UDP {op}-{ol} ({_devOccupy.Count})" : $"holding UDP {op}";
+                    }
+                }
+                return "ERR unknown lobby lever '" + verb + "'";
+            }
+            catch (Exception ex) { return "ERR " + ex.GetType().Name + ": " + ex.Message; }
+        }
+#endif
+
+        // ── Player HUD ────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Rebuilds the HUD row text each frame it's visible.
+        /// Row 0 = local player, rows 1+ = remote players from RemotePlayerManager.
+        /// </summary>
+        // (RefreshHUD excised 2026-06-11 — dead, no callers.)
+
+        // ── Canvas construction ───────────────────────────────────────────────
+
+        /// <summary>Round-176 — the main canvas's live pixel scale.  1 canvas unit = 1/UiScale screen
+        /// pixels.  Everything converting between screen pixels and canvas units divides by this.</summary>
+        internal static float UiScale = 1f;
+        private static CanvasScaler? _uiScaler;
+
+        private static float DesiredUiScale()
+        {
+            float zoom = 1f;
+            try { zoom = PlayerPrefSettings.uiZooming; } catch { }
+            if (zoom < 0.25f || zoom > 4f) zoom = 1f;              // unset/garbage pref -> neutral
+            return Mathf.Max(0.5f, (Screen.height / 1080f) * zoom);
+        }
+
+        private static void TickUiScale()
+        {
+            try
+            {
+                if (_uiScaler == null) return;
+                float want = DesiredUiScale();
+                if (Mathf.Abs(_uiScaler.scaleFactor - want) < 0.001f) return;
+                _uiScaler.scaleFactor = want;
+                UiScale = want;
+                Plugin.Logger.LogInfo($"[UI] canvas scale → {want:F2} (screen {Screen.width}x{Screen.height}, game UI zoom {(PlayerPrefSettings.uiZooming):F2}).");
+            }
+            catch { }
+        }
+
+        private void BuildCanvas()
+        {
+            _canvasGO = new GameObject("BAMP_Canvas");
+            DontDestroyOnLoad(_canvasGO);
+
+            var canvas = _canvasGO.AddComponent<Canvas>();
+            canvas.renderMode   = RenderMode.ScreenSpaceOverlay;
+            canvas.sortingOrder = 999;
+
+            var scaler = _canvasGO.AddComponent<CanvasScaler>();
+            // Round-176 (field: "windows way too small on a larger display"): ConstantPixelSize stays —
+            // the coordinate math depends on pixel units — but the factor is now LIVE: resolution
+            // baseline (screen height / 1080) x the game's own UI Zoom setting.  The native
+            // SetUIZooming sweep overwrites every scaler's factor on a zoom change (ours included);
+            // TickUiScale re-asserts the correct value within a frame.  All screen<->canvas math
+            // divides by UiScale, so windows keep their proportions at any resolution or zoom.
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ConstantPixelSize;
+            _uiScaler = scaler;
+            scaler.scaleFactor = UiScale = DesiredUiScale();
+
+            _canvasGO.AddComponent<GraphicRaycaster>();
+
+            // NOTE: the old draggable F8 debug panel was removed — the native main-menu
+            // Multiplayer button / submenu / lobby + the in-game F9 window now cover
+            // everything it did.  The deep settings panel (reused by the lobby's
+            // "Customize") is a SEPARATE object (BuildSettingsPanel) and is kept.
+
+            // In-game multiplayer window (players + chat; F9 to toggle).
+            try { BuildMpWindow(_canvasGO.transform); }
+            catch (Exception ex) { Plugin.Logger.LogError($"[UI] BuildMpWindow failed: {ex}"); }
+
+            BuildStartupScreen(_canvasGO.transform);
+            try { BuildSettingsPanel(_canvasGO.transform); }
+            catch (Exception ex) { Plugin.Logger.LogError($"[UI] BuildSettingsPanel failed: {ex}"); }
+        }
+
+        // ── HUD builder ───────────────────────────────────────────────────────
+
+        private void BuildCrashReportPopup(Transform canvasRoot)
+        {
+            _crashReportGO = MakeGO("BAMP_CrashReportPopup", canvasRoot);
+            var ort = _crashReportGO.GetComponent<RectTransform>();
+            ort.anchorMin = Vector2.zero;
+            ort.anchorMax = Vector2.one;
+            ort.offsetMin = ort.offsetMax = Vector2.zero;
+
+            var shade = _crashReportGO.AddComponent<Image>();
+            shade.color = new Color(0f, 0f, 0f, 0.68f);
+
+            var panel = MakeGO("Panel", _crashReportGO.transform);
+            _crashReportRT = panel.GetComponent<RectTransform>();
+            _crashReportRT.anchorMin = _crashReportRT.anchorMax = new Vector2(0.5f, 0.5f);
+            _crashReportRT.pivot = new Vector2(0.5f, 0.5f);
+            _crashReportRT.sizeDelta = new Vector2(620f, 366f);
+            _crashReportRT.anchoredPosition = Vector2.zero;
+
+            var panelImg = panel.AddComponent<Image>();
+            panelImg.color = new Color(0.08f, 0.09f, 0.12f, 0.98f);
+
+            var header = MakeGO("Header", panel.transform);
+            var hrt = header.GetComponent<RectTransform>();
+            Stretch(hrt, 0f, 0f, 0f, 46f, top: true);
+            var hi = header.AddComponent<Image>();
+            hi.color = C_HDR;
+
+            _crashReportTitleLbl = MakeLabel(header.transform, "Crash report", 18, C_WHITE, 18f, 0f, 320f, 46f, TextAlignmentOptions.Left);
+            ApplyFont(_crashReportTitleLbl);
+            var tag = MakeLabel(header.transform, MyPluginInfo.SHORT_NAME, 12, new Color(0.78f, 0.84f, 0.94f, 1f), 456f, 0f, 140f, 46f, TextAlignmentOptions.Right);
+            ApplyFont(tag);
+
+            _crashReportBodyLbl = MakeLabel(panel.transform,
+                "The previous game session did not close cleanly. Describe what happened, what you were doing, and whether you were host or client.",
+                14, C_LBLGREY, 22f, -62f, 576f, 40f, TextAlignmentOptions.TopLeft);
+            _crashReportBodyLbl.enableWordWrapping = true;
+            ApplyFont(_crashReportBodyLbl);
+
+            var sprite = IsAlive(_panelSprite) ? _panelSprite : EnsureRoundedSprite();
+            (_crashReportTagRT, _crashReportTagLbl) = MakeHubButton("Type: Bugs", Vector2.zero, 178f, new Color(0.28f, 0.32f, 0.42f, 1f), 28f, sprite, panel.transform);
+            SetTopLeft(_crashReportTagRT, 22f, -108f);
+            _crashReportTagLbl.fontSize = 12;
+
+            var input = MakeGO("Input", panel.transform);
+            _crashReportInputRT = input.GetComponent<RectTransform>();
+            SetAnchored(_crashReportInputRT, 22f, -144f, 576f, 112f);
+            var inputImg = input.AddComponent<Image>();
+            inputImg.color = C_FIELD;
+
+            var viewport = MakeGO("TextArea", input.transform);
+            var vrt = viewport.GetComponent<RectTransform>();
+            vrt.anchorMin = Vector2.zero; vrt.anchorMax = Vector2.one;
+            vrt.offsetMin = new Vector2(12f, 8f); vrt.offsetMax = new Vector2(-12f, -8f);
+            viewport.AddComponent<RectMask2D>();
+
+            var textGO = MakeGO("Text", viewport.transform);
+            var trt = textGO.GetComponent<RectTransform>();
+            trt.anchorMin = Vector2.zero; trt.anchorMax = Vector2.one;
+            trt.offsetMin = Vector2.zero; trt.offsetMax = Vector2.zero;
+            var inputText = textGO.AddComponent<TextMeshProUGUI>();
+            inputText.fontSize = 14; inputText.color = C_WHITE;
+            inputText.alignment = TextAlignmentOptions.TopLeft;
+            inputText.enableWordWrapping = true;
+            inputText.overflowMode = TextOverflowModes.ScrollRect;
+            ApplyFont(inputText);
+
+            _crashReportInputField = input.AddComponent<TMP_InputField>();
+            _crashReportInputField.textViewport = vrt;
+            _crashReportInputField.textComponent = inputText;
+            _crashReportInputField.targetGraphic = inputImg;
+            _crashReportInputField.lineType = TMP_InputField.LineType.MultiLineNewline;
+            _crashReportInputField.characterLimit = 700;
+            _crashReportInputField.text = _crashReportMessage;
+            _crashReportInputField.caretWidth = 2;
+            _crashReportInputField.customCaretColor = true;
+            _crashReportInputField.caretColor = C_WHITE;
+            _crashReportInputField.selectionColor = new Color(0.30f, 0.50f, 0.85f, 0.55f);
+            _crashReportInputField.onValueChanged.AddListener(v => _crashReportMessage = TrimCrashReportMessage(v));
+            _crashReportInputField.onSelect.AddListener(_ => _crashReportFocus = true);
+            _crashReportInputField.onDeselect.AddListener(_ => _crashReportFocus = false);
+
+            _crashReportStatusLbl = MakeLabel(panel.transform, "", 12, C_LBLGREY, 22f, -266f, 576f, 22f, TextAlignmentOptions.Left);
+            ApplyFont(_crashReportStatusLbl);
+
+            (_crashReportAttachRT, var attachLbl) = MakeHubButton("Attach files", Vector2.zero, 150f, new Color(0.28f, 0.32f, 0.42f, 1f), 36f, sprite, panel.transform);
+            SetTopLeft(_crashReportAttachRT, 22f, -306f);
+            attachLbl.fontSize = 13;
+
+            (_crashReportSendRT, var sendLbl) = MakeHubButton("Send report", Vector2.zero, 148f, C_BTNBLUE, 36f, sprite, panel.transform);
+            SetTopLeft(_crashReportSendRT, 286f, -306f);
+            sendLbl.fontSize = 13;
+
+            (_crashReportDismissRT, var dismissLbl) = MakeHubButton("Dismiss", Vector2.zero, 132f, C_STOP, 36f, sprite, panel.transform);
+            SetTopLeft(_crashReportDismissRT, 450f, -306f);
+            dismissLbl.fontSize = 13;
+
+            _crashReportGO.SetActive(false);
+        }
+
+        private void TickCrashReportPopup()
+        {
+            if (!_crashReportPopupVisible)
+            {
+                if (_crashReportGO != null && _crashReportGO.activeSelf) _crashReportGO.SetActive(false);
+                return;
+            }
+            if (_canvasGO == null) return;
+            if (_crashReportGO == null) BuildCrashReportPopup(_canvasGO.transform);
+            StyleCrashReportPopup();
+            if (_crashReportGO != null && !_crashReportGO.activeSelf) _crashReportGO.SetActive(true);
+            if (_crashReportAutoFocusPending && _crashReportInputField != null)
+            {
+                try
+                {
+                    EventSystem.current?.SetSelectedGameObject(_crashReportInputField.gameObject);
+                    _crashReportInputField.ActivateInputField();
+                    _crashReportInputField.MoveTextEnd(false);
+                }
+                catch { }
+                _crashReportAutoFocusPending = false;
+            }
+
+            if (_crashReportAutoCloseAt > 0f && Time.unscaledTime >= _crashReportAutoCloseAt) { DismissCrashReportPopup(); return; }
+            RefreshCrashReportText();
+
+            var mp = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+            if (Input.GetMouseButtonDown(0))
+            {
+                if (_crashReportSendRT != null && RectHit(_crashReportSendRT, mp)) { SendCrashReportPopup(); return; }
+                if (_crashReportDismissRT != null && RectHit(_crashReportDismissRT, mp)) { DismissCrashReportPopup(); return; }
+                if (_crashReportAttachRT != null && RectHit(_crashReportAttachRT, mp)) { AttachFilesToBugReport(); return; }
+                if (_crashReportTagRT != null && RectHit(_crashReportTagRT, mp)) { NextBugReportTag(); return; }
+                _crashReportFocus = _crashReportInputRT != null && RectHit(_crashReportInputRT, mp);
+            }
+
+            if (!_crashReportFocus) return;
+            if (Input.GetKeyDown(KeyCode.Escape)) { _crashReportFocus = false; return; }
+        }
+
+        /// <summary>Entry point for the recycled native top-bar bug-report button (2026-07-08).</summary>
+        internal void OpenManualBugReport()
+        {
+            // Round-279 (fix C): sample the blocker state BEFORE the popup's own
+            // input-block sets HelpSystem — the old live sample was self-poisoned
+            // and made the wedge-time state unknowable in every manual report.
+            try { MPRestSync.PreReportNavBlockers = MPRestSync.DescribeNavBlockersForReport(); } catch { }
+            _crashReportIsCrash = false;
+            _crashReportMessage = "";
+            _crashReportAttachments.Clear();
+            _bugReportTagIndex = 0;
+            _crashReportSending = false; _crashReportResult = ""; _crashReportAutoCloseAt = 0f; _crashReportSentOk = false;
+            _crashReportDir = "";
+            _crashReportPopupVisible = true;
+            _crashReportFocus = true;
+            _crashReportAutoFocusPending = true;
+            if (_crashReportInputField != null)
+                _crashReportInputField.SetTextWithoutNotify("");
+            Plugin.Logger.LogInfo("[BugReport] manual report window opened.");
+        }
+
+        private void AttachFilesToBugReport()
+        {
+            // Show the OS file picker OUT OF PROCESS (NativeFilePicker → PowerShell) on a background
+            // thread, so it can never crash the game (the old in-process native dialog did, 2026-06-19).
+            // The main thread is never blocked; results are marshalled back when the user finishes picking.
+            if (_crashReportStatusLbl != null)
+                _crashReportStatusLbl.text = "Opening the file picker — choose your screenshots/videos there…";
+            var t = new Thread(() =>
+            {
+                string[] files;
+                try { files = NativeFilePicker.PickBugReportAttachments(); }
+                catch { files = Array.Empty<string>(); }
+                GameStatePatcher.EnqueueOnMainThread(() =>
+                {
+                    foreach (var f in files)
+                        if (!string.IsNullOrWhiteSpace(f) && File.Exists(f)
+                            && !_crashReportAttachments.Contains(f, StringComparer.OrdinalIgnoreCase))
+                            _crashReportAttachments.Add(f);
+                    RefreshCrashReportText();
+                });
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void StyleCrashReportPopup()
+        {
+            if (_crashReportGO == null) return;
+            var sprite = IsAlive(_panelSprite) ? _panelSprite : EnsureRoundedSprite();
+            if (sprite != null && !ReferenceEquals(_crashReportStyledWith, sprite))
+            {
+                foreach (var img in _crashReportGO.GetComponentsInChildren<Image>(true))
+                {
+                    if (img.gameObject == _crashReportGO) continue;
+                    try { img.sprite = sprite; img.type = Image.Type.Sliced; } catch { }
+                }
+                _crashReportStyledWith = sprite;
+            }
+            if (IsAlive(_gameFont))
+                foreach (var t in _crashReportGO.GetComponentsInChildren<TMP_Text>(true)) ApplyFont(t);
+        }
+
+        private void RefreshCrashReportText()
+        {
+            if (_crashReportTitleLbl != null)
+                _crashReportTitleLbl.text = _crashReportIsCrash ? "Crash report" : "Bug report";
+            if (_crashReportBodyLbl != null)
+            {
+                // Task #5: tell the player (and the report reader) WHERE the previous session died —
+                // "last alive at the main menu, uptime 41s" reads very differently from a mid-game crash.
+                string hint = MPBugReport.PendingCrashHint;
+                _crashReportBodyLbl.text = _crashReportIsCrash
+                    ? "The previous game session did not close cleanly. Describe what happened, what you were doing, and whether you were host or client."
+                      + (string.IsNullOrEmpty(hint) ? "" : "\n" + hint)
+                    : "Describe the bug, what you were doing, and whether you were host or client. Attach screenshots or short videos if they help.";
+            }
+            if (_crashReportInputField != null && _crashReportInputField.text != _crashReportMessage)
+                _crashReportInputField.SetTextWithoutNotify(_crashReportMessage);
+            RefreshCrashReportTagText();
+            if (_crashReportStatusLbl != null)
+            {
+                if (!string.IsNullOrEmpty(_crashReportResult))
+                {
+                    _crashReportStatusLbl.text = _crashReportResult;   // submit/sent/failed — hold it, don't overwrite
+                }
+                else
+                {
+                    string attach = _crashReportAttachments.Count == 0
+                        ? "Optional: click 'Attach files' to add screenshots/videos. Your logs are always included."
+                        : $"{_crashReportAttachments.Count} file(s) attached. Files over 24 MB are skipped.";
+                    bool uploadOn = MPConfig.BugReportRelayUrlLive().Length > 0 || MPConfig.BugReportDiscordWebhookUrlLive().Length > 0;
+                    _crashReportStatusLbl.text = (uploadOn
+                        ? "Uploads one zip: description, logs, report and attachments. "
+                        : "Discord upload is not configured. A local report folder will be saved. ") + attach;
+                }
+            }
+        }
+
+        private void SendCrashReportPopup()
+        {
+            if (_crashReportSending || _crashReportSentOk) return;   // in flight OR already sent this opening — ignore double-clicks (round-96)
+            try
+            {
+                if (_crashReportInputField != null) _crashReportMessage = _crashReportInputField.text ?? "";
+                string prefix = _crashReportIsCrash ? "previous crash: " : "manual bug report: ";
+                _crashReportSending = true;
+                _crashReportResult = "Submitting report...";   // shown by RefreshCrashReportText; popup stays open
+                var result = MPBugReport.Create(prefix + _crashReportMessage, openFolder: false,
+                    attachments: _crashReportAttachments, discordTagIds: SelectedDiscordForumTagIds(),
+                    onUploadComplete: (ok, folder) => GameStatePatcher.EnqueueOnMainThread(() => OnReportUploadDone(ok, folder)),
+                    includeCrashArtifacts: _crashReportIsCrash);   // Unity crash folder rides CRASH reports only
+                _crashReportDir = result.DirectoryPath;
+                if (_crashReportIsCrash) MPBugReport.AcknowledgePendingCrash();
+                if (!result.DiscordUploadQueued)   // nothing to upload — report saved locally, done
+                {
+                    _crashReportSending = false;
+                    _crashReportSentOk = true;   // round-96: a completed local save is also "sent" for this opening
+                    _crashReportResult = "Saved locally (Discord upload not configured).";
+                    _crashReportAutoCloseAt = Time.unscaledTime + 2.5f;
+                }
+            }
+            catch (Exception ex)
+            {
+                _crashReportSending = false;
+                _crashReportResult = "Report failed: " + ex.Message;
+                Plugin.Logger.LogWarning($"[BugReport] crash popup send failed: {ex.Message}");
+            }
+        }
+
+        // Main-thread callback when the async upload finishes (relay/Discord result). H-REPORTLOSS-1:
+        // also called when a LATER retry of the same report succeeds — the existing success text
+        // then replaces the failure text, but only while the popup still shows THAT report.
+        private void OnReportUploadDone(bool ok, string folder)
+        {
+            if (!_crashReportPopupVisible) return;   // user already closed the popup
+            if (!string.Equals(folder, _crashReportDir, StringComparison.OrdinalIgnoreCase)) return;   // an older report's late result
+            _crashReportSending = false;
+            if (ok)
+            {
+                _crashReportSentOk = true;   // round-96: latch — no second send from this opening
+                _crashReportResult = "Report sent. You can close this window.";
+                _crashReportAutoCloseAt = Time.unscaledTime + 2f;   // let them see it, then auto-close
+            }
+            else
+            {
+                _crashReportResult = "Upload failed - saved locally. You can attach the report folder manually.";
+                // keep the popup open so they see it; no auto-close
+            }
+        }
+
+        private void DismissCrashReportPopup()
+        {
+            if (_crashReportIsCrash) MPBugReport.AcknowledgePendingCrash();
+            _crashReportSending = false; _crashReportResult = ""; _crashReportAutoCloseAt = 0f; _crashReportSentOk = false;
+            _crashReportDir = "";
+            _crashReportPopupVisible = false;
+            MPRestSync.PreReportNavBlockers = null;   // round-279: the snapshot dies with the popup
+            if (_crashReportGO != null) _crashReportGO.SetActive(false);
+        }
+
+        private void NextBugReportTag()
+        {
+            if (_crashReportIsCrash) return;
+            var tags = MPConfig.BugReportDiscordBugTagsLive();
+            if (tags.Count == 0)
+            {
+                if (_crashReportStatusLbl != null)
+                    _crashReportStatusLbl.text = "No Discord bug tags are configured yet. Add BugReportDiscordBugTags to the mod config.";
+                MPChat.AddNotice("no Discord bug tags configured");
+                return;
+            }
+            _bugReportTagIndex = (_bugReportTagIndex + 1) % tags.Count;
+            RefreshCrashReportTagText();
+        }
+
+        private IEnumerable<string> SelectedDiscordForumTagIds()
+        {
+            if (_crashReportIsCrash)
+            {
+                string crashTag = MPConfig.BugReportDiscordCrashTagIdLive();
+                if (!string.IsNullOrWhiteSpace(crashTag)) yield return crashTag;
+                yield break;
+            }
+
+            var tags = MPConfig.BugReportDiscordBugTagsLive();
+            if (tags.Count == 0) yield break;
+            _bugReportTagIndex = Mathf.Clamp(_bugReportTagIndex, 0, tags.Count - 1);
+            yield return tags[_bugReportTagIndex].Id;
+        }
+
+        private static IEnumerable<string> DefaultBugDiscordForumTagIds()
+        {
+            var tags = MPConfig.BugReportDiscordBugTagsLive();
+            if (tags.Count > 0)
+                yield return tags[0].Id;
+        }
+
+        private void RefreshCrashReportTagText()
+        {
+            if (_crashReportTagRT != null)
+                _crashReportTagRT.gameObject.SetActive(true);
+            if (_crashReportTagLbl == null) return;
+
+            if (_crashReportIsCrash)
+            {
+                _crashReportTagLbl.text = string.IsNullOrWhiteSpace(MPConfig.BugReportDiscordCrashTagIdLive())
+                    ? "Type: Crash (not configured)"
+                    : "Type: Crash";
+                return;
+            }
+
+            var tags = MPConfig.BugReportDiscordBugTagsLive();
+            if (tags.Count == 0)
+            {
+                _crashReportTagLbl.text = "Type: configure tags";
+                return;
+            }
+
+            _bugReportTagIndex = Mathf.Clamp(_bugReportTagIndex, 0, tags.Count - 1);
+            _crashReportTagLbl.text = "Type: " + tags[_bugReportTagIndex].Label;
+        }
+
+        private static string TrimCrashReportMessage(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            value = value.Replace("\r", "");
+            return value.Length > 700 ? value.Substring(0, 700) : value;
+        }
+
+        // (2026-06-16) Removed 8 dead hand-rolled text-editing helpers (TrimTextLimit, RenderTextWithCaret,
+        // ControlDown, CleanClipboardForInput, InsertTextAtCaret, MoveCaretVertical, EditTextBuffer,
+        // EscapeCrashText) — leftovers from the pre-TMP_InputField chat input; EditTextBuffer (the entry
+        // point) had zero callers and the rest only called each other.
+
+        private const float HUD_W = 230f;
+        private const float HUD_ROW_H = 22f;
+        private const float HUD_PAD = 8f;
+
+        private void BuildHUD(Transform canvasRoot)
+        {
+            // Container anchored to top-right corner of the screen
+            _hudGO = MakeGO("BAMP_HUD", canvasRoot);
+            var rt = _hudGO.GetComponent<RectTransform>();
+            // Anchor top-right; pivot top-right
+            rt.anchorMin = rt.anchorMax = rt.pivot = new Vector2(1f, 1f);
+            // 10px from top-right edge; height calculated below
+            const int maxRows = 8;
+            float totalH = HUD_ROW_H + maxRows * HUD_ROW_H + HUD_PAD * 2f;
+            rt.sizeDelta        = new Vector2(HUD_W, totalH);
+            rt.anchoredPosition = new Vector2(-10f, -10f);
+
+            // Background
+            var bg = _hudGO.AddComponent<Image>();
+            bg.color = new Color(0.08f, 0.08f, 0.10f, 0.82f);
+
+            // Header row
+            _hudHeader = MakeLabel(_hudGO.transform, "[MP]  F9",
+                12, new Color(0.55f, 0.85f, 1f, 1f),
+                HUD_PAD, -HUD_PAD, HUD_W - HUD_PAD * 2f, HUD_ROW_H,
+                TextAlignmentOptions.Left);
+
+            // Player rows
+            for (int i = 0; i < maxRows; i++)
+            {
+                float rowY = -(HUD_PAD + HUD_ROW_H + i * HUD_ROW_H);
+                _hudRows[i] = MakeLabel(_hudGO.transform, "",
+                    11, i == 0 ? new Color(0.4f, 1f, 0.4f, 1f)   // local player — green
+                                : new Color(0.9f, 0.9f, 0.9f, 1f), // remote — white
+                    HUD_PAD, rowY, HUD_W - HUD_PAD * 2f, HUD_ROW_H,
+                    TextAlignmentOptions.Left);
+            }
+
+            // Starts hidden — user presses F9 to show
+            _hudGO.SetActive(false);
+        }
+
+        // ── In-game multiplayer window (Phase 6) ──────────────────────────────
+        // Draggable, corner-resizable window anchored top-right.  Compact collapsible
+        // players list + a chat log that takes the majority of the height + an input
+        // row.  The opacity slider fades ONLY the background/chrome — the slider,
+        // players list and chat text stay fully readable even at opacity 0.  Manual
+        // hit-testing throughout (RectHit + Input.mousePosition), like the lobby.
+
+        private const float MPW_W   = 345f;   // default width  (freely resizable; chat restyle 2026-09-28 mock-up)
+        private const float MPW_H   = 304f;   // default height (freely resizable; chat restyle 2026-09-28 mock-up)
+
+        private Image AddFade(Image img) { _mpFade.Add((img, img.color.a)); return img; }
+
+        /// <summary>Anchor a RectTransform as a stretch within its parent, inset by
+        /// (left, top, right, bottom).  If <paramref name="top"/> is set, it instead
+        /// anchors as a full-width bar of height=<paramref name="bottom"/> pinned to
+        /// the parent's top, <paramref name="topY"/> below the top edge.</summary>
+        private static void Stretch(RectTransform rt, float left, float topY, float right, float bottom, bool top = false)
+        {
+            if (top)
+            {
+                rt.anchorMin = new Vector2(0f, 1f); rt.anchorMax = new Vector2(1f, 1f); rt.pivot = new Vector2(0.5f, 1f);
+                rt.offsetMin = new Vector2(left, -(topY + bottom));   // bottom == height here
+                rt.offsetMax = new Vector2(-right, -topY);
+            }
+            else
+            {
+                rt.anchorMin = Vector2.zero; rt.anchorMax = Vector2.one; rt.pivot = new Vector2(0.5f, 0.5f);
+                rt.offsetMin = new Vector2(left, bottom);
+                rt.offsetMax = new Vector2(-right, -topY);
+            }
+        }
+
+        /// <summary>Toggles the game's own navigation blocker so typing in chat
+        /// doesn't drive the player.  Reuses PlayerController.SetNavigationBlocker —
+        /// the same registry the game uses for Map/PurchaseUI/etc.  HelpSystem is
+        /// chosen because it's off by default in multiplayer, so it won't
+        /// collide with the game's own blockers.</summary>
+        private void SyncChatNavBlock(bool want)
+        {
+            if (want == _mpChatNavBlocked) return;
+            try
+            {
+                var pc = PlayerHelper.PlayerController;
+                if (pc == null) { _mpChatNavBlocked = false; return; }
+                var m = pc.GetType().GetMethod(want ? "SetNavigationBlocker" : "UnsetNavigationBlocker",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                if (m == null) return;
+                var enumType = m.GetParameters()[0].ParameterType;
+                m.Invoke(pc, new[] { Enum.ToObject(enumType, 11) });   // NavigationBlocker.HelpSystem
+                _mpChatNavBlocked = want;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Chat] nav block: {ex.Message}"); }
+        }
+
+        private void ApplyOpacityFromMouse(Vector2 mp)
+        {
+            if (_mpOpacityTrackRT == null) return;
+            RectTransformUtility.ScreenPointToLocalPointInRectangle(_mpOpacityTrackRT, mp, null, out var local);
+            float w = _mpOpacityTrackRT.rect.width;
+            float t = w > 0f ? Mathf.Clamp01((local.x - _mpOpacityTrackRT.rect.xMin) / w) : _mpOpacity;   // from the left edge (the track's pivot is its right edge)
+            SetMpOpacity(Mathf.Clamp(t, 0f, 1f));
+        }
+
+        /// <summary>Sets window opacity.  Fades ONLY the background + chrome images;
+        /// the slider, roster text and chat stay fully visible (even at 0).</summary>
+        private void SetMpOpacity(float o)
+        {
+            // Floor at 0.15 — at 0 the chrome is fully invisible and the window
+            // looks broken (and a stray click on a not-yet-laid-out track could
+            // land there without the user ever touching the slider).
+            o = Mathf.Clamp(o, 0.15f, 1f);
+            _mpOpacity = o;
+            foreach (var (img, baseA) in _mpFade)
+            {
+                if (img == null) continue;
+                var c = img.color; c.a = baseA * o; try { img.color = c; } catch { }
+            }
+            if (_cwTitleTxt != null) { var tc = _cwTitleTxt.color; tc.a = o; try { _cwTitleTxt.color = tc; } catch { } }   // the title fades with its bar
+            float w = _mpOpacityTrackRT != null ? _mpOpacityTrackRT.rect.width : 196f;
+            if (_mpOpacityKnobRT != null)
+                _mpOpacityKnobRT.anchoredPosition = new Vector2(w * o - 6f, _mpOpacityKnobRT.anchoredPosition.y);
+        }
+
+        private void SubmitMpChat()
+        {
+            if (_mpChatInputField != null) _mpChatInput = _mpChatInputField.text ?? "";
+            string raw = _mpChatInput;
+            string t = _mpChatInput.Trim();
+            _mpChatInput = "";
+            if (_mpChatInputField != null)
+            {
+                _mpChatInputField.SetTextWithoutNotify("");
+                _mpChatInputField.ActivateInputField();
+            }
+            if (t.Length == 0) return;
+            _cwScroll = 0f; _cwUnseen = false;   // sending jumps the list to the newest line
+
+            // BUG-REPORT-OFF-1: the "/bug" command is gone with the original Going Public's report upload.
+
+#if BAMP_DEV
+            // Round-270: /uipreview dl|wait — force-render the join-progress overlay states
+            // with sample data for visual verification (12s each, auto-expires; "off" clears).
+            if (t.StartsWith("/uipreview", StringComparison.OrdinalIgnoreCase))
+            {
+                string which = t.Length > 10 ? t.Substring(10).Trim().ToLowerInvariant() : "";
+                switch (which)
+                {
+                    case "dl":   PreviewJoinerDownload(); MPChat.AddNotice("preview armed for 2 min — exit to menu, then Host New Game: the download line shows on the lobby panel"); break;
+                    case "wait": PreviewWaitList();       MPChat.AddNotice("previewing: waiting-for-players list (12s)"); break;
+                    case "off":  SetStartupPreview("", 0f); _previewNotice = ""; _previewNoticeUntil = 0f; MPChat.AddNotice("preview cleared"); break;
+                    default:     MPChat.AddNotice("usage: /uipreview dl | wait | off"); break;
+                }
+                return;
+            }
+
+            // Dev builds ONLY (maintainer decision 2026-06-16): the intentional-crash test never ships in Release.
+            if (t.Equals("/bugcrash", StringComparison.OrdinalIgnoreCase) ||
+                t.StartsWith("/bugcrash ", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!MPConfig.AllowBugReportCrashTestLive())
+                {
+                    MPChat.AddNotice("crash test is disabled in config");
+                    return;
+                }
+                string rest = t.Length > 9 ? t.Substring(9).Trim() : "";
+                if (!rest.StartsWith("confirm", StringComparison.OrdinalIgnoreCase))
+                {
+                    MPChat.AddNotice("type /bugcrash confirm <reason> to intentionally close the game");
+                    return;
+                }
+                string reason = rest.Length > 7 ? rest.Substring(7).Trim() : "manual crash test";
+                MPBugReport.CrashForTest(reason);
+                return;
+            }
+#endif
+
+            // One-off whisper: "/w <name> <message>" (unique prefix match) —
+            // sends private without changing the selected chip.
+            if (t.StartsWith("/w ", StringComparison.OrdinalIgnoreCase))
+            {
+                string rest = t.Substring(3).TrimStart();
+                int sp = rest.IndexOf(' ');
+                if (sp > 0)
+                {
+                    string name = rest.Substring(0, sp);
+                    string msg  = rest.Substring(sp + 1).Trim();
+                    var lp = MPServer.IsRunning ? MPServer.LobbyPlayers : MPClient.LobbyPlayers;
+                    string? match = null; int hits = 0;
+                    foreach (var p in lp)
+                        if (p != MPConfig.PlayerId && p.StartsWith(name, StringComparison.OrdinalIgnoreCase)) { match = p; hits++; }
+                    if (hits == 1 && msg.Length > 0) { try { MPChat.SendFromLocal(msg, match!); } catch { } return; }
+                    MPChat.AddNotice(hits == 0 ? $"no player matching '{name}'" : $"'{name}' matches several players");
+                    return;
+                }
+            }
+            // R3: the private recipient left while this was typed - never send it anywhere: keep the draft and show TO =
+            // Everyone, so a second Enter is a deliberate public send.
+            if (_chatTarget != "" && !CwTargetOnline(_chatTarget))
+            {
+                _chatTarget = "";
+                _mpChatInput = raw;
+                try { _mpChatInputField?.SetTextWithoutNotify(raw); } catch { }
+                Plugin.Logger.LogInfo("[Chat] private line not sent: the recipient left - draft kept, TO switched to Everyone.");
+                return;
+            }
+            try { MPChat.SendFromLocal(t, _chatTarget); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Chat] submit: {ex.Message}"); }
+        }
+
+        /// <summary>Rounds the window's corners with the menu's panel sprite + applies
+        /// the game font.  Lazy: the sprite/font are captured when the native menu is
+        /// injected (which is AFTER the window is built), so we apply them on first show.</summary>
+        // ── Asset-lifetime hardening ──────────────────────────────────────────
+        // The captured menu sprite/font are GAME-owned (Addressables) and get
+        // destroyed on scene/view unloads — the client log showed the theme
+        // capture completing TWICE at the menu (assets died between), and the
+        // F9 window styled with a dead sprite renders blank (transparent bg, no
+        // corners; a dead font blanks the glyphs too).  So: only ever use a
+        // captured asset that is verifiably ALIVE, and fall back to a sprite WE
+        // own (procedural rounded-rect, immortal) for the in-game window.
+
+        /// <summary>True if a Unity object reference is non-null AND its native
+        /// object still exists (interop == handles destroyed; the name probe
+        /// covers any interop where it doesn't).</summary>
+        private static bool IsAlive(UnityEngine.Object? o)
+        {
+            if (o is null || o == null) return false;
+            try { _ = o.name; return true; } catch { return false; }
+        }
+
+        /// <summary>Mod-owned rounded-corner 9-slice sprite — generated once,
+        /// flagged so Unity never unloads it.  White fill: Image.color tints it,
+        /// so it drops in wherever the captured menu sprite was used.</summary>
+        private static Sprite? _ownedRoundedSprite;
+        private static Sprite? EnsureRoundedSprite()
+        {
+            if (_ownedRoundedSprite is not null && IsAlive(_ownedRoundedSprite)) return _ownedRoundedSprite;
+            try
+            {
+                const int S = 24;       // texture size
+                const float R = 8f;     // corner radius
+                var tex = new Texture2D(S, S, TextureFormat.RGBA32, false);
+                tex.hideFlags = HideFlags.HideAndDontSave;   // includes DontUnloadUnusedAsset
+                for (int y = 0; y < S; y++)
+                for (int x = 0; x < S; x++)
+                {
+                    // Distance-based alpha: opaque except outside the rounded corners.
+                    float cx = Mathf.Clamp(x + 0.5f, R, S - R);
+                    float cy = Mathf.Clamp(y + 0.5f, R, S - R);
+                    float d  = Mathf.Sqrt((x + 0.5f - cx) * (x + 0.5f - cx) + (y + 0.5f - cy) * (y + 0.5f - cy));
+                    float a  = Mathf.Clamp01(R - d + 0.5f);   // 1px soft edge
+                    tex.SetPixel(x, y, new Color(1f, 1f, 1f, a));
+                }
+                tex.Apply();
+                Sprite sp;
+                try
+                {
+                    sp = Sprite.Create(tex, new Rect(0, 0, S, S), new Vector2(0.5f, 0.5f),
+                                       100f, 0, SpriteMeshType.FullRect,
+                                       new Vector4(R + 1f, R + 1f, R + 1f, R + 1f));   // 9-slice border
+                }
+                catch
+                {
+                    sp = Sprite.Create(tex, new Rect(0, 0, S, S), new Vector2(0.5f, 0.5f));
+                }
+                sp.hideFlags = HideFlags.HideAndDontSave;
+                _ownedRoundedSprite = sp;
+                Plugin.Logger.LogInfo("[MPWin] Generated owned rounded sprite (fallback theme).");
+                return sp;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MPWin] EnsureRoundedSprite: {ex.Message}"); return null; }
+        }
+
+        private float _mpStyleNext;
+        private void StyleMpWindow()
+        {
+            if (_mpWin == null) return;
+            if (_mpStyled && ReferenceEquals(_mpStyledFont, _gameFont)) return;
+            float now = Time.unscaledTime;
+            if (now < _mpStyleNext) return;   // the alive-probe reads a name: at most once a second while waiting
+            _mpStyleNext = now + 1f;
+            try
+            {
+                if (!IsAlive(_gameFont)) return;
+                foreach (var tx in _mpWin.GetComponentsInChildren<TMP_Text>(true)) ApplyFont(tx);
+                _mpStyled = true; _mpStyledFont = _gameFont; _cwLaidW = -1f;   // new glyph metrics: re-measure the rows
+                Plugin.Logger.LogInfo("[MPWin] styled (font=game; shapes are the mod's own rounded kit).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MPWin] style: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Builds the full-screen "waiting for players" overlay shown during the
+        /// startup pause hold.  Dims the game and names the players still loading.
+        /// </summary>
+        private void BuildStartupScreen(Transform canvasRoot)
+        {
+            _startupScreenGO = MakeGO("BAMP_StartupScreen", canvasRoot);
+            var rt = _startupScreenGO.GetComponent<RectTransform>();
+            rt.anchorMin = Vector2.zero;
+            rt.anchorMax = Vector2.one;
+            rt.offsetMin = rt.offsetMax = Vector2.zero;
+
+            var bg = _startupScreenGO.AddComponent<Image>();
+            bg.color = new Color(0f, 0f, 0f, 0.82f);
+
+            // Centred message — fills the screen, centre-aligned.
+            var txtGO = MakeGO("Txt", _startupScreenGO.transform);
+            var trt = txtGO.GetComponent<RectTransform>();
+            trt.anchorMin = Vector2.zero;
+            trt.anchorMax = Vector2.one;
+            trt.offsetMin = trt.offsetMax = Vector2.zero;
+            _startupScreenTxt = txtGO.AddComponent<TextMeshProUGUI>();
+            _startupScreenTxt.fontSize  = 26;
+            _startupScreenTxt.color     = new Color(1f, 0.95f, 0.7f, 1f);
+            _startupScreenTxt.alignment = TextAlignmentOptions.Center;
+            _startupScreenTxt.text      = "Multiplayer";
+
+            _startupScreenGO.SetActive(false);
+        }
+
+        // ── Game settings window ──────────────────────────────────────────────
+        // SAVED-SETTINGS-1 (user-approved 2026-09-29, decisions 18, 20, 21): the lobby's CARD style, one window for BOTH modes
+        // (approved mock-up lobbyart/gen_settings.py, boards SavedSettings / SavedSettingsTips; every size below is in MOCK-UP
+        // units, x LS like the lobby kit). Two columns WORLD | PLAYER, CLOSE bottom right. New game: everything editable.
+        // Saved game: the save's REAL values (manifest WorldSettings, fallback StartSettings - SeedSavedWorldSettings); Days per
+        // year locked (fixed at creation, SaveGameManager.cs:510); All courses / All contacts locked ON once the save has them
+        // (one-way in the game, SaveGameManager.cs:512-519); no world values known = only the needs rows, as before. Starting
+        // money / age / tutorial are never here (money/age are the lobby roster's; tutorial is the host world's, D26).
+        // Clicks stay on the hand-rolled RectHit dispatch (_settingsHits / _numFields / _rtSettingsClose).
+        private bool _settingsPanelLoadMode;
+        private const float SW_COLW = 460f, SW_ROWW = 436f, SW_ROWH = 30f;
+        private const string SW_LOCKED_DAYS = " Set when this world was created; it can't be changed.";
+        private const string SW_LOCKED_ON   = " Already on for this world; it can't be turned off again.";
+        private static readonly Color SW_LOCKTXT = LC(0xAEB7BF), SW_TIPBG = LC(0x262B33);
+        private TextMeshProUGUI? _tooltipTitle;
+        private string _tipShown = "";
+
+        // Saved-game seed (SeedSavedWorldSettings): what the save holds, so only a real change is applied.
+        private bool _ssHas, _ssCourses, _ssContacts;
+        private string _ssSource = "none";
+        private GameVariablesDto? _ssSeed, _ssPreLoad;
+        private int _ssPreDays;
+        private string _ssPreDiff = "", _ssPreSel = "";   // F3: the lobby's difficulty before a saved world was seeded
+        private bool _ssPreNeedsHas, _ssPreNoEnergy, _ssPreNap;   // SAVED-SETTINGS-LOW-1 (d): the lobby's needs tuning before a save's mirror
+        private int _ssPreDrain, _ssPreRest, _ssPreMorale;
+
+        private void BuildSettingsPanel(Transform canvasRoot) => BuildSettingsPanel(canvasRoot, false);
+
+        private void BuildSettingsPanel(Transform canvasRoot, bool loadMode)
+        {
+            _settingsPanelLoadMode = loadMode;
+            _settingsHits.Clear();
+            _settingsRefreshers.Clear();
+            _settingsTips.Clear();
+            _numFields.Clear();
+            _editField = -1;
+            _tipShown = "";
+            _settingsContentImg = null;   // the card's own rounded kit - the legacy menu-sprite restyle must not re-skin it
+#if BAMP_DEV
+            _devSsRows.Clear(); _devTip = -1;
+#endif
+            bool world = !loadMode || _ssHas;
+            bool daysLocked = loadMode, coursesLocked = loadMode && _ssCourses, contactsLocked = loadMode && _ssContacts;
+            int rows = world ? 13 : 4;
+            float w = world ? 980f : SW_COLW + 44f;
+            float sectH = 42f + rows * (SW_ROWH + 5f);
+            const float colsY = 82f;
+            float footY = colsY + sectH + 14f, h = footY + 1f + 12f + 38f + 16f;
+
+            // Root: full-screen, transparent (no dimming, like the lobby's windows), swallows clicks behind it.
+            _settingsPanelGO = MakeGO("BAMP_Settings", canvasRoot);
+            LStretch(_settingsPanelGO.GetComponent<RectTransform>(), 0f, 0f, 0f, 0f);
+            _settingsPanelGO.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0f);
+
+            var card = LMakeCard(_settingsPanelGO.transform, "Card", Loc.T("gps_ui_multiplayer_game_settings", "Multiplayer Game Settings"), w, h);
+            if (loadMode) { string sn = LwSaveName(); card.sub.text = sn.Length > 0 ? $"Saved game: {sn}" : ""; }
+            var ct = card.go.transform;
+            LText(ct, Loc.T("gps_ui_hover_a_name_for_a_description", "Hover a name for a description  •  click a value to type it"), 13f, L_MUTED, 22f, 56f, w - 44f, 16f, TextAlignmentOptions.Left);
+
+            float x = 22f;
+            if (world)
+            {
+                var ws = SwSection(ct, "World", "WORLD — applies to everyone", x, colsY, sectH);
+                int r = 0;
+                SwNum(ws, r++, "Tax %", "Percent of profit paid as income tax each period.",
+                      () => _hostSettings.TaxPercentage, v => _hostSettings.TaxPercentage = (int)v, 1f, 0f, 50f, "0");
+                SwNum(ws, r++, "Days per year", "In-game days per year. Affects aging and yearly events." + (daysLocked ? SW_LOCKED_DAYS : ""),
+                      () => _hostSettings.DaysPerYear, v => _hostSettings.DaysPerYear = (int)v, 5f, 10f, 365f, "0", daysLocked);
+                SwNum(ws, r++, "Market price x", "Global multiplier on product market prices.",
+                      () => _hostSettings.MarketPriceMultiplier, v => _hostSettings.MarketPriceMultiplier = v, 0.05f, 0f, 5f, "0.00");
+                SwNum(ws, r++, "Employee salary x", "Multiplier on employee wages. Higher = staff cost more.",
+                      () => _hostSettings.EmployeeHourlySalaryMultiplier, v => _hostSettings.EmployeeHourlySalaryMultiplier = v, 0.05f, 0f, 5f, "0.00");
+                SwNum(ws, r++, "Bank interest x", "Multiplier applied to bank interest amounts.",
+                      () => _hostSettings.BankInterestMultiplier, v => _hostSettings.BankInterestMultiplier = v, 0.05f, 0f, 5f, "0.00");
+                // ("Bank interest rate" row removed for game 1.0 (2026-08-29): the banking overhaul deleted the flat rate.)
+                SwNum(ws, r++, "Rival difficulty x", "Strength of AI rival companies. Higher = tougher rivals.",
+                      () => _hostSettings.RivalsDifficultyMultiplier, v => _hostSettings.RivalsDifficultyMultiplier = v, 0.05f, 0f, 5f, "0.00");
+                SwNum(ws, r++, "Customer promotion x", "Effectiveness of marketing at attracting customers.",
+                      () => _hostSettings.BaseCustomerPromotionMultiplier, v => _hostSettings.BaseCustomerPromotionMultiplier = v, 0.05f, 0f, 5f, "0.00");
+                SwNum(ws, r++, "Wholesale urgent fee x", "Surcharge multiplier for rush (urgent) wholesale orders.",
+                      () => _hostSettings.WholesaleUrgentFeeMultiplier, v => _hostSettings.WholesaleUrgentFeeMultiplier = v, 0.05f, 0f, 5f, "0.00");
+                SwNum(ws, r++, "Importer urgent fee x", "Surcharge multiplier for rush (urgent) importer orders.",
+                      () => _hostSettings.ImporterUrgentFeeMultiplier, v => _hostSettings.ImporterUrgentFeeMultiplier = v, 0.05f, 0f, 5f, "0.00");
+                SwNum(ws, r++, "Export x", "Multiplier on revenue earned from exporting goods.",
+                      () => _hostSettings.ExportMultiplier, v => _hostSettings.ExportMultiplier = v, 0.05f, 0f, 5f, "0.00");
+                // Sell-back (game 1.0, 2026-08-29): live only under Custom (ItemHelper.cs:85), which any edit here selects; the
+                // game honours it only while STRICTLY POSITIVE, so the minimum is 0.05 - every selectable value is one it uses.
+                SwNum(ws, r++, "Sell-back x", "How much you get back when selling items, as a share of their value. 0.75 = 75% back.",
+                      () => _hostSettings.SellingMultiplier, v => _hostSettings.SellingMultiplier = v, 0.05f, 0.05f, 5f, "0.00");
+                SwBool(ws, r++, "No wholesale/import limits", "Removes per-order quantity caps on wholesale and imports.",
+                       () => _hostSettings.DisableWholesaleAndImportLimits, v => _hostSettings.DisableWholesaleAndImportLimits = v);
+                SwBool(ws, r++, "All importer products", "Every product is importable from the start of the game.",
+                       () => _hostSettings.AllProductsAvailableFromImporters, v => _hostSettings.AllProductsAvailableFromImporters = v);
+                x += SW_COLW + 16f;
+            }
+
+            var ps = SwSection(ct, "Player", "PLAYER — per character", x, colsY, sectH);
+            int q = 0;
+            if (world)
+                SwBool(ps, q++, "Disable aging", "Your character never grows older.",
+                       () => _hostSettings.DisableAging, v => _hostSettings.DisableAging = v);
+            // Needs & morale tempo (2026-07-20): single-percent controls (0 = off). MP's clock never pauses, so the defaults
+            // compensate (drain 40% since 2026-09-02, rest 300%, morale 10%).
+            SwNum(ps, q++, "Needs drain %", "Energy & hunger drain speed as % of normal. 0 = off entirely (no sleep/food needs).",
+                  () => _hostSettings.NeedsDrainPercent, v => { _hostSettings.NeedsDrainPercent = (int)v; _hostSettings.DisableEnergy = (int)v == 0; },
+                  1f, 0f, 100f, "0");
+            SwBool(ps, q++, "Power nap", "Lets players in a bed recover rest faster while napping. Off hides the button for everyone.",
+                   () => _hostSettings.PowerNapAllowed, v => _hostSettings.PowerNapAllowed = v);
+            SwNum(ps, q++, "Rest speed %", "How fast energy recovers while resting (bed/bench/car), as % of normal.",
+                  () => _hostSettings.RestSpeedPercent, v => _hostSettings.RestSpeedPercent = (int)v, 10f, 10f, 1000f, "0");
+            SwNum(ps, q++, "Morale multiplier %", "How long positive morale effects last, as % of normal. Lower = they last longer (10% = buffs last 10x).",
+                  () => _hostSettings.MoraleTempoPercent, v => _hostSettings.MoraleTempoPercent = (int)v, 1f, 1f, 100f, "0");
+            if (world)
+            {
+                SwBool(ps, q++, "Disable happiness need", "Removes the happiness need from your character.",
+                       () => _hostSettings.DisableHappiness, v => _hostSettings.DisableHappiness = v);
+                SwBool(ps, q++, "All courses unlocked", "Every education course is available immediately." + (coursesLocked ? SW_LOCKED_ON : ""),
+                       () => _hostSettings.AllCoursesUnlocked, v => _hostSettings.AllCoursesUnlocked = v, coursesLocked);
+                SwBool(ps, q++, "All contacts unlocked", "Every business contact is available immediately." + (contactsLocked ? SW_LOCKED_ON : ""),
+                       () => _hostSettings.AllContactsUnlocked, v => _hostSettings.AllContactsUnlocked = v, contactsLocked);
+                SwBool(ps, q++, "Disable vehicle damage", "Your vehicles never take damage.",
+                       () => _hostSettings.DisableVehicleDamage, v => _hostSettings.DisableVehicleDamage = v);
+                SwBool(ps, q++, "Disable vehicle fuel", "Your vehicles never consume fuel.",
+                       () => _hostSettings.DisableVehicleFuel, v => _hostSettings.DisableVehicleFuel = v);
+            }
+
+            LPos(LImg(ct, "Divider", L_DIVIDER, null, 0f).rectTransform, 22f, footY, w - 44f, 1f);
+            var close = LButton(ct, "Close", Loc.T("gps_ui_close", "CLOSE"), w - 22f - 104f, footY + 13f, 104f, 38f, 0, 14f);
+            _rtSettingsClose = close.rt;
+
+            // Tooltip (approved mock-up): dark card, the row's name as a centred title, a thin rule, then the description.
+            _tooltipGO = MakeGO("Tooltip", _settingsPanelGO.transform);
+            var ttrt = _tooltipGO.GetComponent<RectTransform>();
+            ttrt.anchorMin = ttrt.anchorMax = ttrt.pivot = new Vector2(0f, 1f);
+            ttrt.sizeDelta = new Vector2(300f * LS, 80f * LS);
+            LStretch(LImg(_tooltipGO.transform, "Bg", SW_TIPBG, LRoundSprite(false), 3f).rectTransform, 0f, 0f, 0f, 0f);
+            _tooltipTitle = LText(_tooltipGO.transform, "", 14f, C_WHITE, 12f, 10f, 276f, 18f, TextAlignmentOptions.Center, true);
+            LPos(LImg(_tooltipGO.transform, "Rule", new Color(1f, 1f, 1f, 0.35f), null, 0f).rectTransform, 12f, 35f, 276f, 1f);
+            _tooltipTxt = LText(_tooltipGO.transform, "", 12f, C_WHITE, 12f, 43f, 276f, 17f, TextAlignmentOptions.TopLeft, wrap: true);
+            _tooltipGO.SetActive(false);
+
+            _settingsPanelGO.SetActive(false);
+            Plugin.Logger.LogInfo($"[UI] settings window built: mode={(loadMode ? "saved" : "new")} worldRows={world} daysLocked={daysLocked && world} coursesLocked={coursesLocked && world} contactsLocked={contactsLocked && world} ({w:0}x{h:0} mock-up units).");
+        }
+
+        private void SetSettingsTip(string title, string desc)
+        {
+            _tipShown = desc;
+            try
+            {
+                if (_tooltipTitle != null) _tooltipTitle.text = title;
+                if (_tooltipTxt == null || _tooltipGO == null) return;
+                _tooltipTxt.text = desc;
+                float bh = _tooltipTxt.GetPreferredValues(desc, 276f * LS, 0f).y;
+                _tooltipTxt.rectTransform.sizeDelta = new Vector2(276f * LS, bh);
+                ((RectTransform)_tooltipGO.transform).sizeDelta = new Vector2(300f * LS, 43f * LS + bh + 10f * LS);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[UI] settings tooltip: {ex.Message}"); }
+        }
+
+        /// <summary>A section box (mock-up: dark translucent fill, white-14% border, 12px bold light-grey title).</summary>
+        private RectTransform SwSection(Transform p, string name, string title, float x, float y, float h)
+        {
+            var box = LImg(p, name, L_SECT, LRoundSprite(false), 4f);
+            LStretch(LImg(box.transform, "Line", L_SECTLINE, LRoundSprite(true), 4f).rectTransform, 0f, 0f, 0f, 0f);
+            LPos(box.rectTransform, x, y, SW_COLW, h);
+            LText(box.transform, title, 12f, L_HDR, 12f, 12f, SW_COLW - 24f, 15f, TextAlignmentOptions.Left, true, false, 8f);
+            return box.rectTransform;
+        }
+
+        private RectTransform SwRow(RectTransform sect, int i, string label, string desc, bool locked)
+        {
+            var row = LImg(sect, "Row" + i, L_ROW, LRoundSprite(false), 3f);
+            LPos(row.rectTransform, 12f, 35f + i * (SW_ROWH + 5f), SW_ROWW, SW_ROWH);
+            var lbl = LText(row.transform, label, 13f, locked ? SW_LOCKTXT : C_WHITE, 10f, 0f, SW_ROWW - 160f, SW_ROWH, TextAlignmentOptions.Left);
+            _settingsTips.Add((lbl.rectTransform, desc, label));
+            return row.rectTransform;
+        }
+
+        /// <summary>The mock-up's small button (24 high): kind 0 grey-blue, 1 blue (ON), 4 disabled.</summary>
+        private (RectTransform rt, Image img, TextMeshProUGUI lbl) SwSmallBtn(Transform p, string name, string text, float x, float w, int kind)
+        {
+            var img = LImg(p, name, L_BTN[kind], LRoundSprite(false), 3f);
+            LPos(img.rectTransform, x, 3f, w, 24f);
+            var t = LText(img.transform, text, 11f, kind == 4 ? L_DISTXT : C_WHITE, 0f, 0f, w, 24f, TextAlignmentOptions.Center, true, false, 4f);
+            return (img.rectTransform, img, t);
+        }
+
+        private void SwLock(RectTransform row, float x)
+        {
+            var lk = LImg(row, "Lock", SW_LOCKTXT, LIconSprite(4), 0f);
+            lk.type = Image.Type.Simple;
+            LPos(lk.rectTransform, x, 9f, 12f, 12f);
+        }
+
+        private void SwNum(RectTransform sect, int i, string label, string desc, System.Func<float> get, System.Action<float> set,
+                           float step, float min, float max, string fmt, bool locked = false)
+        {
+            var row = SwRow(sect, i, label, desc, locked);
+            var dec = SwSmallBtn(row, "-", "<", 306f, 24f, locked ? 4 : 0);
+            var boxLine = LImg(row, "val", L_FIELDLINE, LRoundSprite(false), 3f);
+            LPos(boxLine.rectTransform, 334f, 3f, 64f, 24f);
+            LStretch(LImg(boxLine.transform, "Fill", L_FIELD, LRoundSprite(false), 3f).rectTransform, 1f, 1f, 1f, 1f);
+            var valLbl = LText(boxLine.transform, "", 13f, locked ? L_DISTXT : C_WHITE, 0f, 0f, 64f, 24f, TextAlignmentOptions.Center);
+            var inc = SwSmallBtn(row, "+", ">", 402f, 24f, locked ? 4 : 0);
+            void Render() { valLbl.text = get().ToString(fmt); }
+            Render();
+            _settingsRefreshers.Add(Render);
+            if (locked)
+            {   // fixed at creation: greyed value, disabled arrows, a small lock - no clicks, no typing
+                SwLock(row, 288f);
+#if BAMP_DEV
+                _devSsRows[label] = (-1, null, null, true, () => get().ToString(fmt));
+#endif
+                return;
+            }
+            _settingsHits.Add((dec.rt, () => { set(Mathf.Clamp(get() - step, min, max)); MarkCustom(); Render(); }));
+            _settingsHits.Add((inc.rt, () => { set(Mathf.Clamp(get() + step, min, max)); MarkCustom(); Render(); }));
+            _numFields.Add(new NumField
+            {
+                Rt = boxLine.rectTransform, Lbl = valLbl, Get = get, Set = set, Min = min, Max = max, Fmt = fmt
+            });
+#if BAMP_DEV
+            _devSsRows[label] = (_numFields.Count - 1, null, null, false, () => get().ToString(fmt));
+#endif
+        }
+
+        private void SwBool(RectTransform sect, int i, string label, string desc, System.Func<bool> get, System.Action<bool> set, bool lockedOn = false)
+        {
+            var row = SwRow(sect, i, label, desc, lockedOn);
+            var b = SwSmallBtn(row, "t", "", 386f, 40f, 0);
+            if (lockedOn)
+            {   // one-way in the game: already on for this world, shown locked ON - no click
+                b.img.color = L_BTN[1]; b.lbl.text = "ON";
+                SwLock(row, 368f);
+#if BAMP_DEV
+                _devSsRows[label] = (-1, null, get, true, () => "ON");
+#endif
+                return;
+            }
+            void Render()
+            {
+                bool v = get();
+                b.lbl.text = v ? "ON" : "OFF";
+                b.img.color = v ? L_BTN[1] : L_BTN[0];
+            }
+            Render();
+            _settingsHits.Add((b.rt, () => { set(!get()); MarkCustom(); Render(); }));
+            _settingsRefreshers.Add(Render);
+#if BAMP_DEV
+            _devSsRows[label] = (-1, b.rt, get, false, () => get() ? "ON" : "OFF");
+#endif
+        }
+
+        /// <summary>SAVED-SETTINGS-1 (D2): the load lobby's window shows the save's REAL values - manifest WorldSettings (stamped
+        /// at every host save), else StartSettings (in MP nobody can change world settings mid-game - OptionsGuard - so the
+        /// creation values are still current), else nothing: only the needs rows are shown. The seed is remembered so only a
+        /// real change by the host is applied.</summary>
+        private void SeedSavedWorldSettings(GameVariablesDto? ws, int wsRev, GameVariablesDto? start, string name)
+        {
+            try
+            {
+                if (_ssPreLoad == null) { _ssPreLoad = new GameVariablesDto(); MPServer.CopyWorldFlex(_hostSettings, _ssPreLoad); _ssPreDays = _hostSettings.DaysPerYear; _ssPreDiff = _hostSettings.Difficulty ?? ""; _ssPreSel = _selectedDifficulty ?? ""; }
+                var src = ws ?? start;
+                _ssSource = ws != null ? $"WorldSettings rev={wsRev}" : start != null ? "StartSettings" : "none";
+                _ssHas = src != null; _ssSeed = null; _ssCourses = _ssContacts = false;
+                if (src == null)
+                {
+                    Plugin.Logger.LogInfo($"[MenuUI] saved world settings: '{name}' records none (no WorldSettings, no StartSettings) - the window shows only the needs rows.");
+                    return;
+                }
+                MPServer.CopyWorldFlex(src, _hostSettings);
+                _hostSettings.DaysPerYear = src.DaysPerYear;
+                // A record written before game 1.0 has no sell-back (0): the game then reads the preset's value
+                // (ItemHelper.cs:85-92), so that is what the world really runs - show it, never an unselectable 0.
+                if (src.SellingMultiplier <= 0f)
+                {
+                    float sb = 0.75f;
+                    try { if (src.Difficulty != "Custom") sb = MPServer.Preset(src.Difficulty).SellingMultiplier; } catch { }
+                    _hostSettings.SellingMultiplier = sb > 0f ? sb : 0.75f;
+                }
+                _ssCourses = src.AllCoursesUnlocked; _ssContacts = src.AllContactsUnlocked;
+                _ssSeed = new GameVariablesDto();
+                MPServer.CopyWorldFlex(_hostSettings, _ssSeed);
+                Plugin.Logger.LogInfo($"[MenuUI] saved world settings seeded from {_ssSource} ('{name}'): days {src.DaysPerYear}, tax {src.TaxPercentage}, market {src.MarketPriceMultiplier:0.00}, sell-back {_hostSettings.SellingMultiplier:0.00}, courses {(_ssCourses ? "on (locked)" : "off")}, contacts {(_ssContacts ? "on (locked)" : "off")}.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] saved world settings seed: {ex.Message}"); }
+        }
+
+        private void RestorePreLoadSettings()
+        {
+            try
+            {
+                if (_ssPreLoad != null)
+                {
+                    MPServer.CopyWorldFlex(_ssPreLoad, _hostSettings); _hostSettings.DaysPerYear = _ssPreDays; _ssPreLoad = null;
+                    // F3: an edit in the saved window called MarkCustom - the new game gets the lobby's preset back, not a Custom world
+                    if (_ssPreDiff.Length > 0) _hostSettings.Difficulty = _ssPreDiff;
+                    if (_ssPreSel.Length > 0) _selectedDifficulty = _ssPreSel;
+                    _ssPreDiff = _ssPreSel = "";
+                    Plugin.Logger.LogInfo($"[MenuUI] new-game settings restored (difficulty {_hostSettings.Difficulty}, preset {_selectedDifficulty}).");
+                }
+                _ssHas = false; _ssSeed = null; _ssCourses = _ssContacts = false; _ssSource = "none";
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] restore new-game settings: {ex.Message}"); }
+            try
+            {
+                if (_ssPreNeedsHas)
+                {   // SAVED-SETTINGS-LOW-1 (d): the saved game's needs tuning (OnSpLoad's mirror) never carries into a new game
+                    _ssPreNeedsHas = false;
+                    _hostSettings.NeedsDrainPercent = _ssPreDrain; _hostSettings.RestSpeedPercent = _ssPreRest;
+                    _hostSettings.MoraleTempoPercent = _ssPreMorale; _hostSettings.DisableEnergy = _ssPreNoEnergy;
+                    _hostSettings.PowerNapAllowed = _ssPreNap;
+                    Plugin.Logger.LogInfo($"[MenuUI] new-game needs tuning restored (drain {_ssPreDrain}% rest {_ssPreRest}% morale {_ssPreMorale}% power nap {_ssPreNap}).");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] restore new-game needs tuning: {ex.Message}"); }
+        }
+
+#if BAMP_DEV
+        private readonly Dictionary<string, (int num, RectTransform? tog, System.Func<bool>? get, bool locked, System.Func<string> show)> _devSsRows = new();
+        private int _devTip = -1;
+        private static readonly Vector3[] _devTipCorners = new Vector3[4];
+        /// <summary>DEV: a cursor point for a forced tooltip - the tip lands just right of the row name's start, below it.</summary>
+        private static Vector2 DevTipPoint(RectTransform rt)
+        {
+            rt.GetWorldCorners(_devTipCorners);
+            return new Vector2(_devTipCorners[0].x + (60f + 300f * LS + 24f) * UiScale, _devTipCorners[0].y);
+        }
+        private string DevSsDump()
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var kv in _devSsRows) sb.Append(kv.Key).Append('=').Append(kv.Value.show()).Append(kv.Value.locked ? "(locked)" : "").Append("; ");
+            string diff = _ssSeed != null ? MPServer.WorldFlexDiff(_ssSeed, _hostSettings) : "(no seed)";
+            return $"mode={(_settingsPanelLoadMode ? "saved" : "new")} from={_ssSource} rows={_devSsRows.Count} changed=[{diff}] {sb}";
+        }
+#endif
+
+        // ── Settings panel — per-frame tooltip + click-to-type editing ────────
+
+        private void TickSettingsPanel()
+        {
+            if (!_settingsOpen)
+            {
+                if (_tooltipGO != null && _tooltipGO.activeSelf) _tooltipGO.SetActive(false);
+                return;
+            }
+
+            var ms = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+
+            // Hover → tooltip following the cursor (SAVED-SETTINGS-1: the row's name as its title, as the approved mock-up)
+            string? desc = null, title = null;
+            foreach (var t in _settingsTips)
+                if (RectHit(t.rt, ms)) { if (!string.IsNullOrEmpty(t.desc)) { desc = t.desc; title = t.title; } break; }   // POWERNAP: an empty desc must not pop an empty tooltip box
+#if BAMP_DEV
+            if (desc == null && _devTip >= 0 && _devTip < _settingsTips.Count) { var dvt = _settingsTips[_devTip]; desc = dvt.desc; title = dvt.title; ms = DevTipPoint(dvt.rt); }
+#endif
+
+            if (_tooltipGO != null && _tooltipTxt != null)
+            {
+                if (desc != null)
+                {
+                    if (!ReferenceEquals(desc, _tipShown)) SetSettingsTip(title ?? "", desc);   // only when the hovered row changes
+                    var ttrt = (RectTransform)_tooltipGO.transform;
+                    float tw = ttrt.sizeDelta.x, th = ttrt.sizeDelta.y;
+                    // Place to the LEFT of the cursor — a cursor's body extends
+                    // down-right from its hotspot, so its left side is always clear.
+                    // SAVED-SETTINGS-1: the cursor is in screen pixels, the tooltip in canvas units (they differ below 1080p).
+                    ms /= UiScale;
+                    const float gap = 24f;
+                    float cx = ms.x - gap - tw;
+                    float cy = ms.y - 8f;
+                    if (cx < 0f) cx = ms.x + gap + 56f;          // no room left — go well clear to the right
+                    if (cx + tw > Screen.width / UiScale) cx = Screen.width / UiScale - tw;
+                    if (cy - th < 0f) cy = th;                   // keep fully on-screen
+                    ttrt.anchoredPosition = new Vector2(cx, cy - Screen.height / UiScale);
+                    if (!_tooltipGO.activeSelf) _tooltipGO.SetActive(true);
+                }
+                else if (_tooltipGO.activeSelf) _tooltipGO.SetActive(false);
+            }
+
+            // While typing into a field, show the buffer with a cursor.
+            if (_editField >= 0 && _editField < _numFields.Count)
+                _numFields[_editField].Lbl.text = _editBuffer + "|";
+        }
+
+        private void BeginSettingsEdit(int i)
+        {
+            CommitSettingsEdit();
+            _editField  = i;
+            _editBuffer = _numFields[i].Get()
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private void CommitSettingsEdit()
+        {
+            if (_editField < 0 || _editField >= _numFields.Count) { _editField = -1; return; }
+            var f = _numFields[_editField];
+            if (float.TryParse(_editBuffer, System.Globalization.NumberStyles.Float,
+                               System.Globalization.CultureInfo.InvariantCulture, out float v))
+            {
+                f.Set(Mathf.Clamp(v, f.Min, f.Max));
+                MarkCustom();
+            }
+            f.Lbl.text  = f.Get().ToString(f.Fmt);   // re-render the committed value
+            _editField  = -1;
+            _editBuffer = "";
+        }
+
+        /// <summary>
+        /// Shows the full-screen startup overlay while the game is held waiting for
+        /// players to finish loading, naming whoever is still loading.  Hides itself
+        /// the moment the hold is released.
+        /// </summary>
+        private float _startupDiagTimer;
+        private bool  _startupScreenWasShown;
+        private float _startupHeldSince;
+
+        // ── Round-270: per-player world-download progress (display-only) ─────────
+        // pid → (percent, unscaled time received). Fresh (<4s) = downloading; a row
+        // gone quiet but not yet world-ready = the native load is running — the
+        // staleness IS the phase, no phase field to desync. Cleared lazily when no
+        // session is active. Direct-UDP joiners never report → they render as
+        // "loading world…" throughout (accepted limitation).
+        private static readonly Dictionary<string, (int pct, float at)> _joinDl = new();
+        public static void ReportJoinProgress(string pid, int pct)
+        {
+            if (string.IsNullOrEmpty(pid)) return;
+            lock (_joinDl) _joinDl[pid] = (Mathf.Clamp(pct, 0, 100), Time.unscaledTime);
+        }
+        private static string JoinProgressSuffix(string pid)
+        {
+            try
+            {
+                lock (_joinDl)
+                    if (_joinDl.TryGetValue(pid, out var e))
+                        return Time.unscaledTime - e.at < 4f
+                            ? $" — downloading world {e.pct}%"
+                            : " — loading world…";
+            }
+            catch { }
+            return " — loading world…";
+        }
+
+        // Round-270: the display texts, extracted so the /uipreview dev command renders
+        // EXACTLY what the live path renders (a preview that drifts is a UI-vs-behavior lie).
+        /// <summary>The joiner's download status — two MENU-STYLED lines appended to the
+        /// lobby panel's info text. Never a screen takeover (user review 2026-08-17).</summary>
+        private static string ComposeDownloadLine(int pct, int got, int cnt, int kbytes) =>
+            "<color=#FFD24A>" + Loc.T("gps_lobby_download", "Downloading the world - {0}% (part {1} of {2}, {3} MB)", pct, got, cnt, (kbytes / 1024f).ToString("F1")) + "</color>\n" +
+            "<size=15><color=#AAAAAA>" + Loc.T("gps_lobby_download_stay", "Stay on this screen - cancelling restarts the download.") + "</color></size>";
+
+        private static string ComposeWaitRow(string pid) =>
+            $"<color=#FFD24A>{MPNames.Resolve(pid)}</color><color=#CFCFCF>{JoinProgressSuffix(pid)}</color>";
+
+#if BAMP_DEV
+        // /uipreview (dev chat command): force the startup overlay into each round-270
+        // state with sample data so the layout can be verified visually without a
+        // Steam-relay session. Overrides the tick for its duration; auto-expires.
+        private static float  _previewUntil;
+        private static string _previewText = "";
+        internal static void SetStartupPreview(string text, float seconds)
+        { _previewText = text ?? ""; _previewUntil = Time.unscaledTime + seconds; }
+
+        /// <summary>Arm the LOBBY PANEL's download line with sample numbers for 2 minutes —
+        /// exit to the menu, then host or join so the lobby panel is visible; the line
+        /// renders in place via a dev-only preview slot that survives session teardown
+        /// (the ordinary notice slot is wiped by MPServer.Stop — first attempt's bug).</summary>
+        private static string _previewNotice = "";
+        private static float  _previewNoticeUntil;
+        internal static void PreviewJoinerDownload()
+        {
+            _previewNotice      = "Connected to host\n" + ComposeDownloadLine(64, 3, 4, 1229);
+            _previewNoticeUntil = Time.unscaledTime + 120f;
+        }
+
+        internal static void PreviewWaitList()
+        {
+            ReportJoinProgress("PreviewFriend", 64);
+            lock (_joinDl) _joinDl["PreviewSlowpoke"] = (12, Time.unscaledTime - 10f);   // stale → "loading world…"
+            string body = "Waiting for these players to finish loading:\n\n" +
+                          ComposeWaitRow("PreviewFriend") + "\n" + ComposeWaitRow("PreviewSlowpoke");
+            SetStartupPreview(
+                "<size=36><b>Multiplayer</b></size>\n\n" + body +
+                "\n\n<size=20><color=#FFD24A>Auto-start in 2:41</color></size>" +
+                "\n\n<size=17><color=#AAAAAA>The game starts automatically once everyone is ready.</color></size>", 12f);
+        }
+#endif
+
+        private void TickStartupScreen()
+        {
+            if (_startupScreenGO == null) return;
+
+#if BAMP_DEV
+            // Round-270 /uipreview: dev-only forced render for visual verification.
+            if (Time.unscaledTime < _previewUntil)
+            {
+                _startupScreenGO.SetActive(true);
+                _startupScreenWasShown = true;
+                if (_startupScreenTxt != null) _startupScreenTxt.text = _previewText;
+                return;
+            }
+#endif
+
+            // Host-loss notice (set on involuntary in-game disconnect) reuses this
+            // overlay — checked first so it wins over the startup-wait text.  The
+            // game stays frozen (LateUpdate clamp) only while the notice is up;
+            // dismissing it lets the player continue OFFLINE as a single-player
+            // fork (allowed by design — the MP session is unaffected: the host's
+            // copies are canonical and overwrite this world on the next rejoin).
+            if (MPClient.SessionEnded)
+            {
+                _startupScreenGO.SetActive(true);
+                _startupScreenWasShown = true;
+                if (_startupScreenTxt != null)
+                    _startupScreenTxt.text =
+                        "<size=36><b>Multiplayer</b></size>\n\n" +
+                        "<color=#FF7070>Connection to the host was lost.</color>\n\n" +
+                        "The multiplayer session has ended — it resumes from the\n" +
+                        "host's last save when the host returns.\n\n" +
+                        "<size=17><color=#AAAAAA>You can keep playing this world offline as a single-player copy.\n" +
+                        "Progress made here will NOT count toward the multiplayer session;\n" +
+                        "saves from now on go to your single-player games.</color></size>\n\n" +
+                        "<size=20><color=#FFD24A>Click (or press Enter) to continue offline</color></size>";
+
+                if (Input.GetMouseButtonDown(0) || Input.GetKeyDown(KeyCode.Return))
+                {
+                    MPClient.SessionEnded = false;                  // lifts the freeze clamp — AND the CheckAutoSave
+                                                                    // suppression patch (its gate reads SessionEnded), so
+                                                                    // SP autosave resumes here with no sticky flag to clear
+                    MPClient.InMpGame     = false;                  // committed to the offline solo fork → native time allowed
+                    MPClient.OfflineFork  = true;                   // H-BIZ-1 r3: this world stays an (offline) MP world for the registration shields
+                    try { TrafficSync.HandBackToVanilla("offline fork"); } catch { }   // H-SVC-116: after InMpGame=false so the clamp is already off
+                    try { OptionsGuard.OnSessionLeft("offline fork"); } catch { }   // SPEED-SHARED fold b: the fork keeps no scene reload, so restore the own clock speed here
+                    GameStateReader.SetNativePause(false);          // lift the true pause too
+                    _startupScreenGO.SetActive(false);
+                    _startupScreenWasShown = false;
+                    Plugin.Logger.LogInfo("[UI] Host-loss notice dismissed — continuing OFFLINE (single-player fork; MP session unaffected).");
+                }
+                return;
+            }
+
+            // Disconnect-pause overlay (host): a player dropped (timeout-style)
+            // and the session auto-paused — say WHO and how to proceed, instead
+            // of the silent freeze the user mistook for a hang.  Cleared by the
+            // player reconnecting (auto) or by clicking to keep playing.
+            if (MPServer.IsRunning && MPServer.PausedByDisconnect)
+            {
+                _startupScreenGO.SetActive(true);
+                _startupScreenWasShown = true;
+                if (_startupScreenTxt != null)
+                    _startupScreenTxt.text =
+                        "<size=36><b>Multiplayer</b></size>\n\n" +
+                        $"<color=#FFD24A>{MPServer.DisconnectPauseWho} lost connection.</color>\n\n" +
+                        "Game paused.  They can rejoin from the multiplayer menu and will\n" +
+                        "continue from their last save (money and properties stay current).\n\n" +
+                        "<size=20><color=#FFD24A>Click (or press Enter) to keep playing without them</color></size>";
+                if (Input.GetMouseButtonDown(0) || Input.GetKeyDown(KeyCode.Return))
+                {
+                    MPServer.ResumeFromDisconnectPause();
+                    _startupScreenGO.SetActive(false);
+                    _startupScreenWasShown = false;
+                }
+                return;
+            }
+
+            // Round-270 redesign (user review 2026-08-17: the first cut put a FULL-SCREEN
+            // raycast-blocking overlay over the MENU — trapping the joiner's clicks, in
+            // in-game styling, flickering between slow chunks). The joiner's download
+            // progress lives on the LOBBY PANEL's info line instead (see the
+            // "Connected to host" branch) — non-blocking, menu-styled, in the exact
+            // spot the waiting player is already looking. This overlay serves only its
+            // original in-world states.
+            // Session over → forget stale download rows (lazy cleanup).
+            if (!MPServer.IsRunning && !MPClient.IsConnected)
+                lock (_joinDl) if (_joinDl.Count > 0) _joinDl.Clear();
+
+            // Suppress the one-frame flash on an INSTANT-release hold: hosting alone
+            // (no one to wait for) begins AND ends the startup hold within ~1 frame,
+            // so the full-screen "waiting for players" overlay would flash for that
+            // single frame (the "~8s flicker").  Only show it once the hold has
+            // actually persisted a beat — a genuine multi-player wait lasts seconds.
+            // Unscaled time, because it must keep ticking through the timeScale=0 freeze.
+            // Round-205: the host's soft-hold counts as held too — it sees the same
+            // wait screen everyone else does while its world populates.
+            bool held = ((MPServer.IsRunning || MPClient.IsConnected) && TimeSync.IsStartupHeld) || HostSoftHoldActive;
+            if (!held) _startupHeldSince = 0f;
+            else if (_startupHeldSince == 0f) _startupHeldSince = Time.unscaledTime;
+            bool show = held && (Time.unscaledTime - _startupHeldSince) > 0.3f;
+            _startupScreenGO.SetActive(show);
+
+            // Diagnostics: log show transitions + sample the real timeScale/screen state
+            // each second while held, so we can see if the freeze + wait screen actually
+            // engaged (the "no freeze" report).
+            if (show != _startupScreenWasShown)
+            {
+                _startupScreenWasShown = show;
+                MPLoadProfiler.Mark($"WAIT SCREEN {(show ? "SHOWN" : "hidden")} (timeScale={Time.timeScale}, screenActive={_startupScreenGO.activeInHierarchy})");
+            }
+            if (show)
+            {
+                _startupDiagTimer -= Time.unscaledDeltaTime;
+                if (_startupDiagTimer <= 0f)
+                {
+                    _startupDiagTimer = 1f;
+                    MPLoadProfiler.Mark($"WAIT held: timeScale={Time.timeScale}, screenActive={_startupScreenGO.activeInHierarchy}, inGame={IsInGame()}, parkedGhosts={ParkedVehicleSync.ClientGhostCount}");
+                }
+            }
+
+            if (!show || _startupScreenTxt == null) return;
+
+            var waiting = MPServer.IsRunning
+                ? MPServer.GetStartupWaitingFor()
+                : MPClient.StartupWaitingFor;
+
+            string body = (waiting != null && waiting.Count > 0)
+                ? "Waiting for these players to finish loading:\n\n" +
+                  // Round-270: each waiting player carries their live download percent
+                  // (or "loading world…" once their reports go quiet / never came).
+                  string.Join("\n", waiting.Select(ComposeWaitRow))
+                : "Waiting for all players to finish loading…";
+
+            // Countdown to the force-release (host knows the elapsed time;
+            // clients show the host-side limit as an estimate).
+            float remaining = Mathf.Max(0f, STARTUP_HOLD_TIMEOUT - _startupHoldElapsed);
+            string countdown = MPServer.IsRunning
+                ? $"\n\n<size=20><color=#FFD24A>Auto-start in {(int)remaining / 60}:{(int)remaining % 60:D2}</color></size>"
+                : "";
+
+            _startupScreenTxt.text =
+                "<size=36><b>Multiplayer</b></size>\n\n" +
+                body +
+                countdown +
+                "\n\n<size=17><color=#AAAAAA>The game starts automatically " +
+                "once everyone is ready.</color></size>";
+        }
+
+        // (Legacy F8 panel pane-builders + state-panel refreshers EXCISED 2026-06-11 —
+        //  the subsystem was unreachable dead code; the native menu/lobby is the real UI.)
+
+        // ── Button handlers ───────────────────────────────────────────────────
+
+        private void OnHost()
+        {
+            _lwHostFailed = false;
+            // Lobby port option A (user-approved 2026-09-28): hosting reads its OWN config key, HostPort - never the
+            // join port (_port / config Port), so joining a friend on 8000 no longer makes you host on 8000. Round-59
+            // still holds: a host is never refused for its port (an invalid value falls back; the load self-heals it).
+            int p = MPConfig.HostPort;
+            if (p < 1024 || p > 65535)
+            {
+                p = 7777;
+                Plugin.Logger.LogWarning($"[UI] host port fell back to {p} (HostPort {MPConfig.HostPort} was invalid).");
+            }
+            if (string.IsNullOrWhiteSpace(_name))
+            { SetStatus(Loc.T("gps_ui_enter_a_player_name", "Enter a player name."), true); return; }
+            MPConfig.SetRuntime(_name.Trim(), null, 0);   // the name only: port 0 never touches the JOIN port (round-59 rule)
+            // H-HOSTPORT-1: the failure text also goes to the lobby's notice line (the lobby opens right after this).
+            if (!MPServer.Start(p))
+            { _lwHostFailed = true; SetStatus(Loc.T("gps_ui_hosting_failed_port", "Hosting FAILED on port {0} (port in use?).", p), true); PostLobbyNotice(Loc.T("gps_ui_hosting_failed_port", "Hosting FAILED on port {0} (port in use?).", p), 60f); return; }
+            // Needs/morale tuning applies for EVERY hosted session (a LOADED game
+            // never runs BuildGameVariables) — the heartbeat then carries it to
+            // all clients, so the whole session runs the host's percents.
+            MPNeedsTuning.Apply(_hostSettings, "host settings");
+            // H-HOSTPORT-1: the port actually bound (a busy configured port falls through to the next free one);
+            // Steam-only (no UDP port at all): wording approved by the user 2026-09-26 - informs, no suggestions.
+            if (MPServer.BoundPort > 0) SetStatus(Loc.T("gps_ui_hosting_on_port", "Hosting on port {0} — waiting for players.", MPServer.BoundPort), false);
+            else { string so = Loc.T("gps_ui_hosting_steam_only_ports", "Hosting through Steam only: ports {0}–{1} are already in use.", p, Math.Min(p + 10, 65535)); SetStatus(so, false); PostLobbyNotice(so, 60f); }
+        }
+
+        private void OnJoin()
+        {
+            _lwHostFailed = false;   // review item 5: every new join starts without a stale host failure
+            if (string.IsNullOrWhiteSpace(_name))
+            { SetStatus(Loc.T("gps_ui_enter_a_player_name", "Enter a player name."), true); return; }
+            // Slice 2: the address field also accepts "steam:<SteamID64>" (or a
+            // bare 17-digit id) → relay connect, no port/IP needed.  Proper
+            // friends-list/invite UX is stage C; this unlocks testing now.
+            string addr = (_ip ?? "").Trim();
+            string steamPart = addr.StartsWith("steam:", StringComparison.OrdinalIgnoreCase) ? addr.Substring(6).Trim()
+                             : (addr.Length == 17 && ulong.TryParse(addr, out _)) ? addr : "";
+            if (steamPart.Length > 0 && ulong.TryParse(steamPart, out ulong hostSteamId))
+            {
+                MPConfig.SetRuntime(_name.Trim(), addr, 0);
+                if (MPClient.ConnectSteam(hostSteamId))
+                    SetStatus(Loc.T("gps_ui_connecting_via_steam_relay", "Connecting via Steam relay..."), false);
+                else
+                    SetStatus(Loc.T("gps_ui_steam_relay_connect_failed_to_start_2", "Steam relay connect failed to start (see log). Note: you cannot relay-connect to your OWN SteamId."), true);
+                return;
+            }
+            if (!int.TryParse(_port, out int p) || p < 1024 || p > 65535)
+            { SetStatus(Loc.T("gps_ui_invalid_port", "Invalid port."), true); return; }
+            if (string.IsNullOrWhiteSpace(_ip))
+            { SetStatus(Loc.T("gps_ui_enter_a_host_ip_or_steam", "Enter a host IP (or steam:<id64>)."), true); return; }
+            MPConfig.SetRuntime(_name.Trim(), _ip.Trim(), p);
+            MPClient.Connect(_ip.Trim(), p);
+            SetStatus(Loc.T("gps_ui_connecting", "Connecting..."), false);
+        }
+
+        // ── Round-253b (user-directed): lobby START GATE on mod mismatch ──────────
+        // Before the host launches (new game or load) with connected players whose
+        // installed-mod lists differ from the host's, a popup names the mismatched
+        // players and asks Continue / Cancel. The PLAYER decides — never an automatic
+        // refusal (the standing never-force doctrine). Records come from the Hello
+        // diff (MPServer.ModMismatchByPlayer); a rejoin with aligned mods clears them.
+        private GameObject? _modGateGO;
+        private TextMeshProUGUI? _modGateLbl;
+        private Action? _modGatePending;
+
+        /// <summary>True = the popup now owns the decision; the caller must NOT proceed.
+        /// False = no mismatch among present players (or UI unavailable) — proceed.</summary>
+        private bool GateStartOnModMismatch(Action proceed, string verb)
+        {
+            try
+            {
+                if (!MPServer.IsRunning) return false;
+                string sum = MPServer.ModMismatchSummary();
+                if (string.IsNullOrEmpty(sum)) return false;
+                if (_modGateGO == null) BuildModGate();
+                if (_modGateGO == null || _modGateLbl == null) return false;   // our own UI failure must never block a start
+                _modGatePending = proceed;
+                _modGateLbl.text = $"Players in this lobby run DIFFERENT mods than you:\n\n{sum}\n\n"
+                    + $"Different game content can change prices, items and behavior between machines.\n{verb} anyway?";
+                _modGateGO.SetActive(true);
+                ModalMouseAcquire();   // round-253c: every manual RectHit dispatcher goes dead until release
+                Plugin.Logger.LogWarning($"[Content] start gate: mod-mismatch popup shown before '{verb}' — {sum.Replace("\n", " | ")}");
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private void BuildModGate()
+        {
+            if (_modGateGO != null || _canvasGO == null) return;
+            // User test 2026-08-13: the first version was the bare box — clicking Cancel ALSO
+            // hit the native lobby button behind it. Root is now a FULL-SCREEN SCRIM whose
+            // Image swallows every raycast behind the box (the merger-confirm pattern); the
+            // manual click ticks additionally early-out while the gate is open.
+            _modGateGO = MakeGO("BAMP_ModGate", _canvasGO.transform);
+            var prt = _modGateGO.GetComponent<RectTransform>();
+            prt.anchorMin = Vector2.zero; prt.anchorMax = Vector2.one;
+            prt.offsetMin = Vector2.zero; prt.offsetMax = Vector2.zero;
+            _modGateGO.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0.62f);   // raycast-blocking scrim
+
+            var box = MakeGO("Box", _modGateGO.transform);
+            var brt = box.GetComponent<RectTransform>();
+            brt.anchorMin = brt.anchorMax = brt.pivot = new Vector2(0.5f, 0.5f);
+            brt.sizeDelta = new Vector2(520f, 300f);
+            brt.anchoredPosition = Vector2.zero;
+            var bg = box.AddComponent<Image>();
+            bg.color = new Color(0.10f, 0.10f, 0.13f, 0.97f);
+            if (_panelSprite != null) { try { bg.sprite = _panelSprite; bg.type = Image.Type.Sliced; } catch { } }
+            ApplyFont(MakeLabel(box.transform, "Mod mismatch", 26, C_WHITE, 0f, -14f, 520f, 36f, TextAlignmentOptions.Center));
+            _modGateLbl = MakeLabel(box.transform, "", 14, C_WHITE, 24f, -56f, 472f, 170f, TextAlignmentOptions.TopLeft);
+            ApplyFont(_modGateLbl); _modGateLbl.enableWordWrapping = true;
+            CloneButtonInto(box.transform, "BAMP_ModGateGo",   "Continue", OnModGateContinue, 90f,  -240f, 160f, 44f);
+            CloneButtonInto(box.transform, "BAMP_ModGateStop", "Cancel",   OnModGateCancel,   270f, -240f, 160f, 44f);
+            _modGateGO.SetActive(false);
+        }
+
+        /// <summary>Round-254: the ONLY UI the mod shows when the Harmony bootstrap died.
+        /// Pure uGUI, zero native-object dependencies (the native menu may not even be
+        /// built yet), retried each frame until the canvas exists.</summary>
+        private void EnsureFatalBanner()
+        {
+            if (_fatalGO != null || _canvasGO == null) return;
+            try
+            {
+                _fatalGO = MakeGO("BAMP_FatalBanner", _canvasGO.transform);
+                var prt = _fatalGO.GetComponent<RectTransform>();
+                prt.anchorMin = Vector2.zero; prt.anchorMax = Vector2.one;
+                prt.offsetMin = Vector2.zero; prt.offsetMax = Vector2.zero;
+                _fatalGO.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0.55f);   // scrim
+
+                var box = MakeGO("Box", _fatalGO.transform);
+                var brt = box.GetComponent<RectTransform>();
+                brt.anchorMin = brt.anchorMax = brt.pivot = new Vector2(0.5f, 0.5f);
+                brt.sizeDelta = new Vector2(680f, 420f);
+                box.AddComponent<Image>().color = new Color(0.10f, 0.10f, 0.13f, 0.98f);
+
+                ApplyFont(MakeLabel(box.transform, "Multiplayer disabled", 26, new Color(1f, 0.72f, 0.35f, 1f), 0f, -16f, 680f, 36f, TextAlignmentOptions.Center));
+                var body = MakeLabel(box.transform, FatalBootBanner ?? "", 14, C_WHITE, 28f, -62f, 624f, 280f, TextAlignmentOptions.TopLeft);
+                ApplyFont(body); body.enableWordWrapping = true;
+
+                var okGO = MakeGO("OK", box.transform);
+                var okRT = okGO.GetComponent<RectTransform>();
+                okRT.anchorMin = okRT.anchorMax = okRT.pivot = new Vector2(0.5f, 0f);
+                okRT.anchoredPosition = new Vector2(0f, 22f); okRT.sizeDelta = new Vector2(180f, 40f);
+                var okImg = okGO.AddComponent<Image>(); okImg.color = new Color(0.30f, 0.32f, 0.44f, 1f);
+                var okBtn = okGO.AddComponent<Button>(); okBtn.targetGraphic = okImg;
+                var okLbl = MakeLabel(okGO.transform, "OK", 15, C_WHITE, 0f, 0f, 180f, 40f, TextAlignmentOptions.Center);
+                ApplyFont(okLbl);
+                okBtn.onClick.AddListener(() =>
+                {
+                    _fatalDismissed = true;
+                    try { _fatalGO?.SetActive(false); } catch { }
+                });
+            }
+            catch { _fatalGO = null; }   // canvas mid-build — retry next frame
+        }
+
+        private void OnModGateContinue()
+        {
+            try { _modGateGO?.SetActive(false); } catch { }
+            ModalMouseRelease();   // round-253c: also swallows THIS frame's click for manual ticks
+            var act = _modGatePending; _modGatePending = null;
+            Plugin.Logger.LogInfo("[Content] start gate: user chose CONTINUE despite the mod mismatch.");
+            try { act?.Invoke(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[Content] start gate continue: {ex.Message}"); }
+        }
+
+        private void OnModGateCancel()
+        {
+            try { _modGateGO?.SetActive(false); } catch { }
+            ModalMouseRelease();   // round-253c: also swallows THIS frame's click for manual ticks
+            _modGatePending = null;
+            Plugin.Logger.LogInfo("[Content] start gate: user CANCELED after the mod-mismatch popup.");
+            SetStatus(Loc.T("gps_ui_start_canceled", "Start canceled."), false);
+        }
+
+        private void OnStartNew()
+        {
+            if (GateStartOnModMismatch(StartNewNow, "Start new game")) return;
+            StartNewNow();
+        }
+        private void StartNewNow()
+        {
+            MPServer.StartNewGame(_hostSettings);
+            SetStatus(Loc.T("gps_ui_starting_new_game", "Starting new game ({0})...", _hostSettings.Difficulty), false);
+        }
+        private void OnStartLoad()
+        {
+            if (GateStartOnModMismatch(StartLoadNow, "Load")) return;
+            StartLoadNow();
+        }
+        private void StartLoadNow()
+        {
+            // Round-53: the lobby's (possibly customized) dials are the save's NEW authority —
+            // apply them for this session and write them back to the manifest before loading.
+            try
+            {
+                // NEEDS-OFF-1: a dedicated server's world that started with energy off (Custom) keeps it - drain 0 at every
+                // load. Worlds made before 1.0.16 kept the dial's 40 % in their save and lost "off" at the next start
+                // (server 3, ServerTest01: StartSettings.DisableEnergy=true, TuneNeedsDrain=40).
+                if (MPConfig.DedicatedHost && _hostSettings.NeedsDrainPercent != 0 && !string.IsNullOrEmpty(MPServer.ChosenLoadSession)
+                    && MPSaveManager.ReadManifest(MPServer.ChosenLoadSession)?.StartSettings?.DisableEnergy == true)
+                {
+                    Plugin.Logger.LogInfo($"[Needs] '{MPServer.ChosenLoadSession}' started with energy off - drain {_hostSettings.NeedsDrainPercent}% -> 0% (NEEDS-OFF-1).");
+                    _hostSettings.NeedsDrainPercent = 0;
+                    _hostSettings.DisableEnergy = true;
+                }
+                MPNeedsTuning.Apply(_hostSettings, "load lobby");
+                string name = MPServer.ChosenLoadSession;
+                if (!string.IsNullOrEmpty(name))
+                {
+                    MPServer.LastStartSettings = null;   // H-FRESH-1 r2: a LOAD starts from the manifest's own StartSettings (restored in HostLoadSession) or, when the manifest predates the field, from the live world at world-ready — never from the previous world
+                    var m = MPSaveManager.ReadManifest(name);
+                    if (m != null)
+                    {
+                        m.TuneNeedsDrain   = _hostSettings.NeedsDrainPercent;
+                        m.TuneRestSpeed    = _hostSettings.RestSpeedPercent;
+                        m.TuneMoraleTempo  = _hostSettings.MoraleTempoPercent;
+                        m.TunePowerNap     = _hostSettings.PowerNapAllowed ? 1 : 0;   // POWERNAP
+                        MPSaveManager.WriteManifest(name, m);
+                        Plugin.Logger.LogInfo($"[MenuUI] save tuning authority updated: drain={m.TuneNeedsDrain}% rest={m.TuneRestSpeed}% morale={m.TuneMoraleTempo}% → '{name}'.");
+                    }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] load tuning apply: {ex.Message}"); }
+            // SAVED-SETTINGS-1 (D3): dirty only when the host changed a flexible value from the save's own; the host applies it at
+            // world-ready (MPServer.HostApplyPendingWorldSettings); WorldSettings + the bumped rev reach the manifest only with the
+            // host's next successful save (MPSaveCoordinator.SetSessionMetadata).
+            try
+            {
+                MPServer.PendingWorldSettings = null; MPServer.PendingWorldSettingsSession = ""; MPServer.WorldSettingsLoadArmed = true;
+                if (_ssHas && _ssSeed != null)
+                {
+                    string wsDiff = MPServer.WorldFlexDiff(_ssSeed, _hostSettings);
+                    if (wsDiff.Length > 0)
+                    {
+                        var wsP = new GameVariablesDto();
+                        MPServer.CopyWorldFlex(_hostSettings, wsP);
+                        wsP.Difficulty = "Custom";
+                        MPServer.PendingWorldSettings = wsP;
+                        MPServer.PendingWorldSettingsSession = MPServer.ChosenLoadSession ?? "";
+                        Plugin.Logger.LogInfo($"[MenuUI] saved world settings changed by the host ({wsDiff}) - applied at world-ready.");
+                    }
+                    else Plugin.Logger.LogInfo("[MenuUI] saved world settings unchanged - nothing to apply this load.");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[MenuUI] saved world settings: {ex.Message}"); }
+            MPServer.StartLoadGame();
+            // F13 (2026-08-21): a refusal leaves IsInLobby TRUE — only a proceeding load may
+            // claim "Loading save..." (live read; the refusal notice owns the line otherwise).
+            if (!MPServer.IsInLobby) SetStatus(Loc.T("gps_ui_loading_save", "Loading save..."), false);
+        }
+
+        private void OnCycleDifficulty()
+        {
+            int i = System.Array.IndexOf(_difficulties, _selectedDifficulty);
+            _selectedDifficulty = _difficulties[(i + 1) % _difficulties.Length];
+            _hostSettings = MPServer.Preset(_selectedDifficulty);
+            UpdateDifficultyLabel();
+            RefreshSettingsPanel();
+            Plugin.Logger.LogInfo($"[UI] Difficulty preset: {_selectedDifficulty}.");
+        }
+
+        private void UpdateDifficultyLabel()
+        {
+            // (legacy F8 difficulty label excised 2026-06-11 — the native
+            //  lobby's HighlightDifficulty owns the live display)
+        }
+
+        /// <summary>Called when the host hand-edits a setting — difficulty becomes "Custom".</summary>
+        private void MarkCustom()
+        {
+            _hostSettings.Difficulty = "Custom";
+            UpdateDifficultyLabel();
+        }
+
+        private void RefreshSettingsPanel()
+        {
+            foreach (var r in _settingsRefreshers) r();
+        }
+
+        private void OnOpenSettings()
+        {
+            _settingsOpen = true;
+            // Round-53: the load lobby gets the save-authoritative shape of the panel; rebuild
+            // when the mode differs from what's built (panel is otherwise built once).
+            // SAVED-SETTINGS-1: rebuilt on EVERY open - the saved game's seed, subtitle and locked rows are always the current ones.
+            bool wantLoadMode = _lobbyLoadMode && MPServer.IsRunning;
+            try { if (_settingsPanelGO != null) Destroy(_settingsPanelGO); } catch { }
+            _settingsPanelGO = null;
+            try { BuildSettingsPanel(_canvasGO!.transform, wantLoadMode); }
+            catch (Exception ex) { Plugin.Logger.LogError($"[UI] BuildSettingsPanel rebuild failed: {ex}"); }
+            RefreshSettingsPanel();
+            StyleSettingsPanel();   // native font + rounded panel (lazy — once assets are captured)
+            if (_settingsPanelGO != null)
+            {
+                _settingsPanelGO.transform.SetAsLastSibling();   // draw ABOVE the lobby window
+                _settingsPanelGO.SetActive(true);
+            }
+            // Hide the lobby behind the full-screen modal so its buttons don't take
+            // clicks through the overlay (and so the panel isn't visually obscured).
+            if (_lobbyWindow != null && _lobbyWindow.activeSelf) { _settingsHidLobby = true; _lobbyWindow.SetActive(false); }
+        }
+
+        private void OnCloseSettings()
+        {
+            CommitSettingsEdit();
+            _settingsOpen = false;
+            if (_settingsPanelGO != null) _settingsPanelGO.SetActive(false);
+            // Return to the lobby if we came from it.
+            if (_settingsHidLobby) { _settingsHidLobby = false; if (_lobbyWindow != null) _lobbyWindow.SetActive(true); }
+        }
+
+        /// <summary>Lazily restyle the settings panel to match the native menu: apply
+        /// the captured game font to every label and round the content background
+        /// with the menu's panel sprite.  These assets are captured when the native
+        /// Multiplayer button is injected (at the main menu), which is AFTER the panel
+        /// is built — so we apply them on first open, retrying until both are ready.</summary>
+        private bool _settingsStyled;
+        private void StyleSettingsPanel()
+        {
+            if (_settingsStyled || _settingsPanelGO == null) return;
+            if (_gameFont == null && _panelSprite == null) return;   // not captured yet — retry next open
+            try
+            {
+                foreach (var t in _settingsPanelGO.GetComponentsInChildren<TMP_Text>(true)) ApplyFont(t);
+                // Round every panel element (content bg, buttons, value fields) with the
+                // menu's sprite so the page matches the native menu — no sharp corners.
+                if (_settingsContentImg != null && _panelSprite != null)
+                    foreach (var img in _settingsContentImg.GetComponentsInChildren<Image>(true))
+                    { try { img.sprite = _panelSprite; img.type = Image.Type.Sliced; } catch { } }
+                if (_gameFont != null && _panelSprite != null) _settingsStyled = true;   // both applied → done
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[UI] StyleSettingsPanel: {ex.Message}"); }
+        }
+        // Host stop = this machine left the session: on the HOST the clock value is already its own preference (OptionsGuard.cs:55/:79), so this only clears the session bookkeeping (SessionMultiplier/_multTouched/LastBroadcastMult) - the same call the client's disconnect path makes.
+        private void OnStop()      { MPServer.Stop();          try { OptionsGuard.OnSessionLeft("host stop"); } catch { }   SetStatus(Loc.T("gps_ui_stopped_hosting", "Stopped hosting."), false); }
+        private void OnDisc()      { MPClient.DisconnectAfterLeavePublish("disconnect");    SetStatus(Loc.T("gps_ui_disconnected", "Disconnected."), false); }   // R2: the last paperwork publish goes first
+
+        private void OnToggleEnforceCash()
+        {
+            MPServer.SetEnforceStartingCash(!MPServer.EnforceStartingCash);
+            // (legacy enforce-cash label excised 2026-06-11)
+        }
+
+
+        // ── State machine ─────────────────────────────────────────────────────
+
+        private static MPState State()
+        {
+            if (MPClient.IsConnecting)                        return MPState.Connecting;
+            if (MPServer.IsRunning &&  MPServer.IsInLobby)   return MPState.LobbyHost;
+            if (MPServer.IsRunning && !MPServer.IsInLobby)   return MPState.Hosting;
+            if (MPClient.IsConnected &&  MPClient.IsInLobby) return MPState.LobbyClient;
+            if (MPClient.IsConnected && !MPClient.IsInLobby) return MPState.Connected;
+            return MPState.Idle;
+        }
+
+        private void SetStatus(string msg, bool err)
+        {
+            if (_txtStatus != null)
+            {
+                _txtStatus.text  = msg;
+                _txtStatus.color = err ? C_RED : C_GREEN;
+            }
+            Plugin.Logger.LogInfo($"[UI] {msg}");
+        }
+
+        // ── Coordinate helpers ────────────────────────────────────────────────
+
+        /// Convert raw Input.mousePosition (y=0 at bottom) to canvas anchoredPosition
+        /// units (y=0 at top of screen, negative downward).  Round-176: canvas units are screen
+        /// pixels divided by the live UiScale (resolution x game UI Zoom).
+        private static Vector2 ScreenToCanvas(Vector2 screen) =>
+            new Vector2(screen.x / UiScale, (screen.y - Screen.height) / UiScale);
+
+        // ── Round-253c RESTRUCTURE (bandaid ceiling): modal mouse ownership ──────
+        // Two rounds of per-tick ModGateOpen guards still click-through'd — the user's
+        // second test hit the LOBBY window's manual tick (:5377+), which the first
+        // sweep missed, and this file has ~ten such Input.GetMouseButtonDown+RectHit
+        // dispatchers (chat, crash popup, rest dock, hub, tooltips …). Every one of
+        // them funnels through THIS primitive, so the modal check lives here, ONCE:
+        // while a modal popup owns the mouse, every manual hit test in the file says
+        // "miss". The modal's own buttons are real uGUI Buttons on the EventSystem
+        // path — unaffected. _modalSwallowFrame additionally eats the very frame the
+        // modal CLOSES: Update-vs-EventSystem order within a frame is undefined, so
+        // without it the click that dismissed the popup could still reach a manual
+        // dispatcher running later that same frame (the user's frozen-window repro).
+        private static bool _modalOwnsMouse;
+        private static int  _modalSwallowFrame = -1;
+        internal static void ModalMouseAcquire() { _modalOwnsMouse = true; }
+        internal static void ModalMouseRelease() { _modalOwnsMouse = false; _modalSwallowFrame = Time.frameCount; }
+
+        private static bool RectHit(RectTransform rt, Vector2 screenPos)
+        {
+            if (_modalOwnsMouse || Time.frameCount <= _modalSwallowFrame) return false;
+            if (rt == null) return false;
+            RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                rt, screenPos, null, out var local);
+            return rt.rect.Contains(local);
+        }
+
+        // ── UI factory helpers ────────────────────────────────────────────────
+
+        private static GameObject MakeGO(string name, Transform parent)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            go.AddComponent<RectTransform>();
+            return go;
+        }
+
+        private static void SetAnchored(RectTransform rt, float x, float y, float w, float h)
+        {
+            rt.anchorMin = rt.anchorMax = new Vector2(0f, 1f);
+            rt.pivot     = new Vector2(0f, 1f);
+            rt.anchoredPosition = new Vector2(x, y);
+            rt.sizeDelta        = new Vector2(w, h);
+        }
+
+
+        private static TextMeshProUGUI MakeLabel(Transform parent, string text, int size,
+            Color color, float x, float y, float w, float h, TextAlignmentOptions align)
+        {
+            var go  = MakeGO("Lbl", parent);
+            SetAnchored(go.GetComponent<RectTransform>(), x, y, w, h);
+            var tmp = go.AddComponent<TextMeshProUGUI>();
+            tmp.text         = text;
+            tmp.fontSize     = size;
+            tmp.color        = color;
+            tmp.alignment    = align;
+            tmp.overflowMode = TextOverflowModes.Ellipsis;
+            return tmp;
+        }
+
+        private (Image img, TextMeshProUGUI lbl, RectTransform rt) MakeField(
+            Transform parent, string initial, float x, float y, float w, float h)
+        {
+            var go  = MakeGO("Field", parent);
+            var rt  = go.GetComponent<RectTransform>();
+            SetAnchored(rt, x, y, w, h);
+            var img = go.AddComponent<Image>();
+            img.color = C_FIELD;
+            var lbl = MakeLabel(go.transform, initial, SZ_FLD, C_WHITE,
+                                4f, 0f, w - 8f, h, TextAlignmentOptions.Left);
+            return (img, lbl, rt);
+        }
+
+        private static (Image img, RectTransform rt) MakeButton(
+            Transform parent, string label, Color color,
+            float x, float y, float w, float h)
+        {
+            var go  = MakeGO("Btn", parent);
+            var rt  = go.GetComponent<RectTransform>();
+            SetAnchored(rt, x, y, w, h);
+            var img = go.AddComponent<Image>();
+            img.color = color;
+            MakeLabel(go.transform, label, SZ_BTN, C_WHITE, 0f, 0f, w, h,
+                      TextAlignmentOptions.Center);
+            return (img, rt);
+        }
+
+        private static void MakeButton(Transform parent, string label, Color color,
+            float x, float y, float w, float h, out RectTransform rt)
+        {
+            var (_, r) = MakeButton(parent, label, color, x, y, w, h);
+            rt = r;
+        }
+
+        private enum MPState { Idle, LobbyHost, LobbyClient, Hosting, Connected, Connecting }
+    }
+}

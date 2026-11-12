@@ -1,0 +1,547 @@
+{
+  "id": "T-HOSTSWITCH1",
+  "title": "RIVALS-HOST-SWITCH-1 part 1, the HOST CARRY: the previous host saves (coordinated, its .hsg mirrored to the client), both leave, the former CLIENT hosts the same world - its load must carry the previous host's world-only state (AI shops' income lists, neighbourhood clocks, rival histories, special rivals, market) and keep every player shop as its own copy; then 10 days pass and the rivals must not collapse.",
+  "preconditions": "Reporter fixture session fx-hq1 (day 44, MERGED - vars.keepMerger true). h = melaus (guid-d2168c9d71f6484ca3f777d1a3682076, the manifest's last host), c = Client1. Dev build with RIVALS-HOST-SWITCH-1 part 1 (rivalhealth / hostcarry levers, BAMP_DEV). The fixture's client store holds only Client1's own copy; the host's .hsg reaches it through the coordinated save's store mirror (step 'save'). Part 2 is built (decision 55 D4: no fake income series on clients, RivalsHelper.RunDaily and DefeatRival skipped on clients, the client's Rivals app reads the host's stats): after the swap the CLIENT h is asserted too - 0 DefeatRival runs, ident7 not grown from its value at join (rivalhealth base / ident7Delta), the Rivals figures read from the stats (cWkFromStats), RunDaily skipped. 10-day skip: the consensus skip (skipvote +<n>h = that far ahead of this machine's clock, both machines vote; skiprate is local, so both set it) in two +120h legs.",
+  "instances": 2,
+  "vars": {
+    "clientPid": "Client1",
+    "hostPid": "melaus",
+    "hostStable": "guid-d2168c9d71f6484ca3f777d1a3682076",
+    "session": "fx-hq1",
+    "keepMerger": true
+  },
+  "oracles_absent": [
+    "\\[Guard\\]",
+    "(?<!swallowed )NullReferenceException",
+    "HOST HANDOFF CARRY: none",
+    "HOST HANDOFF CARRY order check: [0-9]+ hourly/daily pass\\(es\\) already ran",
+    "HOST HANDOFF CARRY: torn"
+  ],
+  "oracles_report": [
+    "\\[MPSave\\] HOST HANDOFF",
+    "\\[RivalAttn\\] rival .* surrenders",
+    "DefeatRival",
+    "\\[Rest\\] skip GOAL reached",
+    "skipped on client",
+    "\\[RivalStats\\] client",
+    "\\[RivalStats\\] session end"
+  ],
+  "steps": [
+    {
+      "role": "h",
+      "cmd": "host",
+      "expect_result": "^OK",
+      "seq": 1
+    },
+    {
+      "role": "c",
+      "cmd": "join",
+      "expect_result": "^OK",
+      "seq": 2
+    },
+    {
+      "role": "h",
+      "cmd": "hostload ${session}",
+      "expect_result": "^OK",
+      "expect_log": [
+        {
+          "role": "h",
+          "regex": "\\[BAMP\\] \\[LoadProf\\].*HOST ReleaseStartupHold \\(all players world-ready\\)",
+          "within_s": 300
+        },
+        {
+          "role": "h",
+          "regex": "\\[BAMP\\] \\[Lifecycle\\] WorldReady",
+          "within_s": 60
+        }
+      ],
+      "seq": 3
+    },
+    {
+      "role": "both",
+      "cmd": "mark TEST T-HOSTSWITCH1 START",
+      "expect_result": "OK MARK",
+      "seq": 4
+    },
+    {
+      "role": "h",
+      "sleep_s": 20,
+      "note": "both worlds settle",
+      "seq": 5
+    },
+    {
+      "role": "h",
+      "cmd": "status",
+      "expect_result": "settled=True",
+      "seq": 6
+    },
+    {
+      "role": "c",
+      "cmd": "status",
+      "expect_result": "settled=True",
+      "seq": 7
+    },
+    {
+      "role": "h",
+      "cmd": "hostcarry",
+      "expect_result": "^OK hostcarry next=on last='mode=same-host'",
+      "note": "h hosted last in the fixture: no host switch, so the carry is not needed (silent)",
+      "seq": 8
+    },
+    {
+      "role": "h",
+      "cmd": "rivalhealth",
+      "expect_result": "^OK rivalhealth day=",
+      "capture": {
+        "bDay": "day=(\\d+)",
+        "bAi": "aiRun=(\\d+)",
+        "bNz": "nonZeroIncome=(\\d+)",
+        "bNzPct": "nzPct=([0-9.]+)",
+        "bId7": "ident7=(\\d+)",
+        "bNsDue": "nsDue=(\\d+)",
+        "bNsF0": "nsForce0=(\\d+)",
+        "bFlat": "histFlat=(\\d+)",
+        "bSpec": "specialDefeated=(\\d+)",
+        "bLens": "lens=(\\S+)",
+        "bNeg7": "neg7=(\\d+)",
+        "bEmpty": "empty=(\\d+)"
+      },
+      "note": "BASELINE on the previous host (design D6 step 2): the world-only health just before the coordinated save",
+      "seq": 9
+    },
+    {
+      "role": "c",
+      "cmd": "rivalhealth",
+      "expect_result": "^OK rivalhealth day=",
+      "capture": {
+        "cbDay": "day=(\\d+)",
+        "cbAi": "aiRun=(\\d+)",
+        "cbNz": "nonZeroIncome=(\\d+)",
+        "cbNzPct": "nzPct=([0-9.]+)",
+        "cbId7": "ident7=(\\d+)",
+        "cbNsDue": "nsDue=(\\d+)",
+        "cbNsF0": "nsForce0=(\\d+)",
+        "cbFlat": "histFlat=(\\d+)",
+        "cbSpec": "specialDefeated=(\\d+)",
+        "cbLens": "lens=(\\S+)",
+        "cbNeg7": "neg7=(\\d+)",
+        "cbEmpty": "empty=(\\d+)"
+      },
+      "note": "REPORT: the client's own copy (the fake / frozen state the bug continues from)",
+      "seq": 10
+    },
+    {
+      "role": "c",
+      "cmd": "rivalattn report",
+      "expect_result": "^OK rivalattn report sent",
+      "note": "fold G3 setup: the client's self-report - the host answers with its stats snapshot (ClientRivalStats fills)",
+      "seq": 11
+    },
+    {
+      "role": "c",
+      "sleep_s": 8,
+      "note": "the snapshot arrives",
+      "seq": 12
+    },
+    {
+      "role": "c",
+      "cmd": "rivalview n",
+      "expect_result": "^OK rivalview n=[1-9][0-9]*$",
+      "note": "fold G3: the client holds the host's stats before it leaves",
+      "seq": 13
+    },
+    {
+      "role": "h",
+      "cmd": "save",
+      "expect_result": "^OK",
+      "expect_log": [
+        {
+          "role": "c",
+          "regex": "\\[MPSave\\] \\.hsg WRITE session='${session}' char='${hostStable}' [0-9]+B \\(store mirror\\)",
+          "within_s": 120
+        }
+      ],
+      "note": "the coordinated save: both copies land at the same moment and the host's .hsg is mirrored into c's store",
+      "seq": 14
+    },
+    {
+      "role": "h",
+      "sleep_s": 15,
+      "seq": 15
+    },
+    {
+      "role": "c",
+      "cmd": "leavegame menu",
+      "expect_result": "^OK leavegame menu",
+      "seq": 16
+    },
+    {
+      "role": "c",
+      "sleep_s": 10,
+      "seq": 17
+    },
+    {
+      "role": "c",
+      "cmd": "rivalview n",
+      "expect_result": "^OK rivalview n=0$",
+      "note": "FOLD G3: leaving the city emptied the host's rival stats on this machine",
+      "seq": 18
+    },
+    {
+      "role": "h",
+      "drop": true,
+      "seq": 19
+    },
+    {
+      "role": "c",
+      "drop": true,
+      "seq": 20
+    },
+    {
+      "role": "h",
+      "relaunch": true,
+      "seq": 21
+    },
+    {
+      "role": "c",
+      "relaunch": true,
+      "seq": 22
+    },
+    {
+      "role": "h",
+      "sleep_s": 20,
+      "seq": 23
+    },
+    {
+      "role": "c",
+      "cmd": "host",
+      "expect_result": "^OK",
+      "note": "ROLE SWAP: the former client hosts",
+      "seq": 24
+    },
+    {
+      "role": "h",
+      "cmd": "join",
+      "expect_result": "^OK",
+      "seq": 25
+    },
+    {
+      "role": "c",
+      "cmd": "hostload ${session}",
+      "expect_result": "^OK",
+      "expect_log": [
+        {
+          "role": "c",
+          "regex": "\\[MPSave\\] HOST HANDOFF: '${session}' was last hosted by",
+          "within_s": 120
+        },
+        {
+          "role": "c",
+          "regex": "HOST HANDOFF CARRY: mode=full from=${hostStable} \\S+=-?[0-9]+ aiCarried=[1-9][0-9]* keptPlayer=([0-9]+) keptUnknown=[0-9]+ conflicts=0 .* ledger=\\1 keptLedger=\\1 ",
+          "within_s": 300
+        },
+        {
+          "role": "c",
+          "regex": "HOST HANDOFF CARRY health: day=[0-9]+ [0-9:]+ aiRun=${bAi} lens=\\S+ empty=[0-9]+ ident7=${bId7} nonZeroIncome=${bNz} nzPct=\\S+ neg7=[0-9]+ nsDue=${bNsDue} nsForce0=[0-9]+ nsNamed=[0-9]+ rivalHist=\\S+ histFlat=${bFlat} specialDefeated=${bSpec} carry=full carryFrom=${hostStable}",
+          "within_s": 300
+        },
+        {
+          "role": "c",
+          "regex": "\\[BAMP\\] \\[LoadProf\\].*HOST ReleaseStartupHold \\(all players world-ready\\)",
+          "within_s": 300
+        },
+        {
+          "role": "c",
+          "regex": "\\[BAMP\\] \\[Lifecycle\\] WorldReady",
+          "within_s": 60
+        },
+        {
+          "role": "c",
+          "regex": "HOST HANDOFF CARRY order check: the first (hourly|daily) pass on this world ran AFTER the carry",
+          "within_s": 300
+        }
+      ],
+      "note": "THE CARRY (design D2/D6 steps 4-5) + the DEV order assert (D2 step 2: the loaded world's first hourly pass ran after the carry): mode=full from the previous host; conflicts=0; keptPlayer = the ledger's player shops (= keptLedger); the carry-time health equals the step-9 baseline (aiRun, ident7, nonZeroIncome, nsDue, histFlat, specialDefeated)",
+      "seq": 26
+    },
+    {
+      "role": "both",
+      "cmd": "mark TEST T-HOSTSWITCH1 CARRIED",
+      "expect_result": "OK MARK",
+      "seq": 27
+    },
+    {
+      "role": "c",
+      "sleep_s": 20,
+      "seq": 28
+    },
+    {
+      "role": "c",
+      "cmd": "status",
+      "expect_result": "settled=True",
+      "seq": 29
+    },
+    {
+      "role": "h",
+      "cmd": "status",
+      "expect_result": "settled=True",
+      "seq": 30
+    },
+    {
+      "role": "h",
+      "cmd": "rivalhealth base",
+      "expect_result": "^OK rivalhealth base ident7=\\d+ \\| day=",
+      "capture": {
+        "hId7": "ident7=(\\d+)",
+        "hNz": "nonZeroIncome=(\\d+)",
+        "hAi": "aiRun=(\\d+)"
+      },
+      "note": "PART 2: the client's ident7 at join (its loaded copy) - the end check prints ident7Delta against it",
+      "seq": 31
+    },
+    {
+      "role": "c",
+      "cmd": "hostcarry",
+      "expect_result": "^OK hostcarry next=on last='mode=full from=${hostStable} ",
+      "note": "the bug-report stamp (MPSaveCoordinator.LastHostCarry)",
+      "seq": 32
+    },
+    {
+      "role": "c",
+      "cmd": "rivalhealth",
+      "expect_result": "^OK rivalhealth .*carry=full carryFrom=${hostStable}",
+      "capture": {
+        "sDay": "day=(\\d+)",
+        "sAi": "aiRun=(\\d+)",
+        "sNz": "nonZeroIncome=(\\d+)",
+        "sNzPct": "nzPct=([0-9.]+)",
+        "sId7": "ident7=(\\d+)",
+        "sNsDue": "nsDue=(\\d+)",
+        "sNsF0": "nsForce0=(\\d+)",
+        "sFlat": "histFlat=(\\d+)",
+        "sSpec": "specialDefeated=(\\d+)",
+        "sLens": "lens=(\\S+)",
+        "sNeg7": "neg7=(\\d+)",
+        "sEmpty": "empty=(\\d+)"
+      },
+      "seq": 33
+    },
+    {
+      "role": "c",
+      "cmd": "exitbuilding",
+      "abort_on_fail": false,
+      "note": "report-only: the skip is taken outdoors",
+      "seq": 34
+    },
+    {
+      "role": "h",
+      "cmd": "exitbuilding",
+      "abort_on_fail": false,
+      "seq": 35
+    },
+    {
+      "role": "c",
+      "sleep_s": 8,
+      "seq": 36
+    },
+    {
+      "role": "both",
+      "cmd": "skiprate 300",
+      "expect_result": "^OK skiprate",
+      "seq": 37
+    },
+    {
+      "role": "c",
+      "cmd": "skipvote +120h",
+      "expect_result": "^OK skipvote goal=",
+      "seq": 38
+    },
+    {
+      "role": "h",
+      "cmd": "skipvote +120h",
+      "expect_result": "^OK skipvote goal=",
+      "expect_log": [
+        {
+          "role": "c",
+          "regex": "\\[Rest\\] CONSENSUS \\(2/2\\)",
+          "within_s": 60
+        },
+        {
+          "role": "c",
+          "regex": "\\[Rest\\] skip GOAL reached",
+          "within_s": 900
+        }
+      ],
+      "note": "SKIP LEG 1 of 2 (+120 game-hours)",
+      "seq": 39
+    },
+    {
+      "role": "c",
+      "sleep_s": 10,
+      "seq": 40
+    },
+    {
+      "role": "both",
+      "cmd": "skipvote off",
+      "expect_result": "^OK skipvote goal=-",
+      "seq": 41
+    },
+    {
+      "role": "c",
+      "cmd": "skipstate",
+      "abort_on_fail": false,
+      "note": "report: the clock after the leg",
+      "seq": 42
+    },
+    {
+      "role": "c",
+      "cmd": "skipvote +120h",
+      "expect_result": "^OK skipvote goal=",
+      "seq": 43
+    },
+    {
+      "role": "h",
+      "cmd": "skipvote +120h",
+      "expect_result": "^OK skipvote goal=",
+      "expect_log": [
+        {
+          "role": "c",
+          "regex": "\\[Rest\\] CONSENSUS \\(2/2\\)",
+          "within_s": 60
+        },
+        {
+          "role": "c",
+          "regex": "\\[Rest\\] skip GOAL reached",
+          "within_s": 900
+        }
+      ],
+      "note": "SKIP LEG 2 of 2 (+120 game-hours)",
+      "seq": 44
+    },
+    {
+      "role": "c",
+      "sleep_s": 10,
+      "seq": 45
+    },
+    {
+      "role": "both",
+      "cmd": "skipvote off",
+      "expect_result": "^OK skipvote goal=-",
+      "seq": 46
+    },
+    {
+      "role": "c",
+      "cmd": "skipstate",
+      "abort_on_fail": false,
+      "note": "report: the clock after the leg",
+      "seq": 47
+    },
+    {
+      "role": "c",
+      "sleep_s": 30,
+      "note": "the last day's queued valuation updates drain",
+      "seq": 48
+    },
+    {
+      "role": "c",
+      "cmd": "rivalhealth",
+      "capture": {
+        "eDay": "day=(\\d+)",
+        "eAi": "aiRun=(\\d+)",
+        "eNz": "nonZeroIncome=(\\d+)",
+        "eNzPct": "nzPct=([0-9.]+)",
+        "eId7": "ident7=(\\d+)",
+        "eNsDue": "nsDue=(\\d+)",
+        "eNsF0": "nsForce0=(\\d+)",
+        "eFlat": "histFlat=(\\d+)",
+        "eSpec": "specialDefeated=(\\d+)",
+        "eLens": "lens=(\\S+)",
+        "eNeg7": "neg7=(\\d+)",
+        "eEmpty": "empty=(\\d+)"
+      },
+      "note": "10 days later, on the HOST: nonZeroIncome >= 95% of aiRun (nzPct); aiRun / specialDefeated are compared with T-HOSTSWITCH1-CTRL in the report",
+      "expect_result": "^OK rivalhealth day=5[4-9] .*nzPct=(9[5-9]|100)\\.[0-9] ",
+      "seq": 49
+    },
+    {
+      "role": "c",
+      "cmd": "rivalattn mono",
+      "expect_result": "^OK rivalattn mono",
+      "capture": {
+        "eDefeats": "defeats=(\\d+)"
+      },
+      "note": "DefeatRuns on the host (compare with the control)",
+      "seq": 50
+    },
+    {
+      "role": "h",
+      "cmd": "rivalattn report",
+      "expect_result": "^OK rivalattn report sent",
+      "abort_on_fail": false,
+      "note": "the client's self-report: the host answers with a fresh stats snapshot (ClientRivalStats)",
+      "seq": 51
+    },
+    {
+      "role": "h",
+      "sleep_s": 8,
+      "note": "the snapshot arrives",
+      "seq": 52
+    },
+    {
+      "role": "h",
+      "cmd": "rivals",
+      "expect_result": "^OK rows=",
+      "abort_on_fail": false,
+      "note": "the leaderboard data path on the client (native GetRivalLeaderboardData: the WeeklyIncome getter, the native defeat test, the populate that used to write the fake series)",
+      "seq": 53
+    },
+    {
+      "role": "h",
+      "cmd": "rivalattn mono",
+      "expect_result": "^OK rivalattn mono .*defeats=0$",
+      "capture": {
+        "oDefeats": "defeats=(\\d+)"
+      },
+      "abort_on_fail": false,
+      "note": "PART 2 (D4b): DefeatRival never runs on the client (the guard logs 'skipped on client'; DefeatRuns stays 0)",
+      "seq": 54
+    },
+    {
+      "role": "h",
+      "cmd": "rivalhealth",
+      "capture": {
+        "oDay": "day=(\\d+)",
+        "oAi": "aiRun=(\\d+)",
+        "oNz": "nonZeroIncome=(\\d+)",
+        "oNzPct": "nzPct=([0-9.]+)",
+        "oId7": "ident7=(\\d+)",
+        "oNsDue": "nsDue=(\\d+)",
+        "oNsF0": "nsForce0=(\\d+)",
+        "oFlat": "histFlat=(\\d+)",
+        "oSpec": "specialDefeated=(\\d+)",
+        "oLens": "lens=(\\S+)",
+        "oNeg7": "neg7=(\\d+)",
+        "oEmpty": "empty=(\\d+)",
+        "oId7Delta": "ident7Delta=(-?\\d+)",
+        "oStats": "cStats=(\\d+)",
+        "oDefSkips": "cDefeatSkips=(\\d+)"
+      },
+      "note": "PART 2 (D4a) on the CLIENT h: ident7 not grown since join (ident7Delta <= 0), every AI rival with a host stats entry reads WeeklyIncome from it (cWkFromStats = cStats > 0), RivalsHelper.RunDaily skipped (cRunDailySkips > 0)",
+      "expect_result": "^OK rivalhealth day=.* ident7Delta=(0|-[0-9]+) cStats=([1-9][0-9]*) cWkFromStats=\\2 cWkServed=[1-9][0-9]* cChartSwaps=[0-9]+ cDefeatSkips=[0-9]+ cRunDailySkips=[1-9][0-9]*$",
+      "seq": 55
+    },
+    {
+      "role": "h",
+      "cmd": "rivalview chart",
+      "expect_result": "^OK rivalview chart id=\\S+ hostInc=[1-9][0-9]* hostBiz=[1-9][0-9]* swapped=1 bizFromHost=1 filled=1 swInc=7 swBiz=7 savedSame=1 .*defAgree=([1-9][0-9]*)/\\1 defHost=",
+      "note": "FOLDS G1/G4/G2 on the CLIENT h (no UI): the host sends the AI business-count series (hostBiz), the chart swap takes it (bizFromHost), FillRivalState run during the swap touches only the copies (savedSame=1: the saved lists are the same objects with the same points), and every AI leaderboard row's 'defeated' flag equals the host's (defAgree n/n)",
+      "seq": 56
+    },
+    {
+      "role": "both",
+      "cmd": "mark TEST T-HOSTSWITCH1 END",
+      "expect_result": "OK MARK",
+      "seq": 57
+    }
+  ]
+}

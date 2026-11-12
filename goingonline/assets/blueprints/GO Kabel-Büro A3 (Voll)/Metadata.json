@@ -1,0 +1,32 @@
+{
+    "blueprintType": 1,
+    "blueprintVersion": 2,
+    "buildNumber": 3674,
+    "itemId": 0,
+    "price": 392115.0,
+    "buildingType": "ba:buildingtype_office",
+    "buildingSizeInfo": {
+        "buildingSize": "ba:buildingsize_a",
+        "buildingVersion": 3
+    },
+    "requiredModIds": [],
+    "otherData": [
+        {
+            "dataElement": 8,
+            "value": "goingonline:businesstype_cableprovider"
+        },
+        {
+            "dataElement": 3,
+            "value": "100"
+        },
+        {
+            "dataElement": 4,
+            "value": "4"
+        },
+        {
+            "dataElement": 5,
+            "value": "0"
+        }
+    ],
+    "isWorkshopReviewPending": false
+}

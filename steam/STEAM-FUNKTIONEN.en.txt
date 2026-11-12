@@ -1,0 +1,78 @@
+[h1]Going Public Server – the built-in modules[/h1]
+Going Public Server comes with its own versions of popular mods: our own code, modelled on them and built for a shared server. Here is what the modules do and what they do better in multiplayer.
+
+[h2]All modules[/h2]
+[list]
+[*][b]One subscription instead of eleven:[/b] no extra mods and no libraries – camera, planner, insights, navigation, radio, phone pages and the new businesses are part of the mod.
+[*][b]Always matching:[/b] the server and every player run the same version – no module drifts apart after an update or gets in another's way.
+[*][b]Built for multiplayer:[/b] what others should see reaches everyone – shop signs, the station on the shop loudspeakers, the car radio for passengers, opening hours and shifts. What only concerns you stays on your machine: camera, navigation and insights.
+[*][b]The server decides:[/b] each module can be switched off on its own in AMP – its app then leaves the phone too.
+[*][b]23 languages:[/b] every text in every language of the game.
+[*][b]Your own keys[/b] for the modules under Options → Controls.
+[*][b]Linux and Steam Deck:[/b] tested with GE-Proton.
+[/list]
+
+[h2]RPG camera (F6, settings F8) – modelled on Immersion[/h2]
+[list]
+[*]A third-person camera on foot and in the car: angle and distance with the right mouse button and the wheel; in the car it turns around the vehicle and swings back once you drive on.
+[*]Adjustable: height, shoulder, sensitivity, dead zone, field of view and view distance – inside buildings too if you like.
+[*]The server can set the camera for everyone (in AMP, section RPG camera).
+[/list]
+
+[h2]Planner (Shift+F9) – modelled on BAScheduler[/h2]
+[list]
+[*]Checks every schedule with the game's own rules: open hours without staff, shifts while the business is closed, double bookings, more than 12 hours a day, workplaces that are gone, people without a shift and staff wishes that are not met.
+[*]Estimates per skill whether the staff is enough.
+[*]"Auto-fill" with the game's own planner, one business at a time, with "Undo".
+[*][b]Opening hours by demand:[/b] a weekly grid (7 × 24 hours) of the business type's customer demand, a suggestion, hours toggled by click.
+[*]In multiplayer everyone sees what the planner changes; it never touches shared or merged businesses.
+[/list]
+
+[h2]Insights (Shift+F10) – modelled on SmartSuite[/h2]
+[list]
+[*]Overview with the alerts of the last 7 days, profit per business, history as bars, staff, sales per product and real estate – read from the game's own books, nothing is changed.
+[*][b]Sell a business[/b] where the server allows it: with goodwill worth 30 days of average profit; the minimum age and profitable days are set by the server.
+[*][b]The same rules for everyone:[/b] rent income, building prices, the loan limit and business sales are set by the server – a building costs the same for every player.
+[/list]
+
+[h2]Navigation (Shift+F11) and autopilot – modelled on Voogle Route[/h2]
+[list]
+[*]Search a destination – any business by name or street, your own places, bookmarks – or click it on the map; walk there, drive there or just navigate, right from there.
+[*]The route as a line on screen and on the map, in the car along the game's road network; a navigation device in the phone with turns, streets, arrival and lane choice.
+[*][b]Autopilot:[/b] uses the blinkers, stops at red lights, brakes for cars, people on foot and other players, drives 60 km/h on long straights and up to 90 km/h on bridges.
+[*][b]Parks by itself at the destination[/b] (can be switched off) – or drives into the car park.
+[*][b]Follows people from your Steam friends list[/b] through the city if you like.
+[*]No extra libraries.
+[/list]
+
+[h2]Radio – modelled on Big Ambitions Radio[/h2]
+[list]
+[*]A radio app of its own in the phone: the game's stations, your own streams and the server's station list, with favourites, search and the song that is playing.
+[*]Radio on foot too, and on the loudspeakers of your businesses.
+[*][b]In multiplayer:[/b] passengers hear the driver's station, and everyone in a shop hears the station on its loudspeakers.
+[/list]
+
+[h2]Phone pages – modelled on Aluna's Phone Pages[/h2]
+[list]
+[*]The apps on pages of eight, with arrows, a page number and dots; drag apps to reorder them.
+[*]The modules' apps are in it right away; apps of modules the server switches off stay out.
+[/list]
+
+[h2]New businesses – modelled on IT Business Expansion, Skill Kit and Spotless[/h2]
+[list]
+[*][b]IT firm[/b] in an office: IT support, software development and cloud services, with blade servers, rack servers and mainframes that cost power every day.
+[*][b]Cleaning company[/b] in an office: the crews clean your own businesses first, then paying clients of the city; floor scrubbers, carpet extractors and window kits make them faster.
+[*][b]Laundromat[/b] in a shop: washers and dryers; the neighbourhood washes, dries or drops off its laundry.
+[*]Founded in BizMan, staff from the recruitment agencies – no Skill Kit needed. In multiplayer each business runs on the machine of the player it belongs to.
+[/list]
+
+[h2]Plus modules of our own[/h2]
+[list]
+[*][b]Going Online[/b] (Shift+F12): a cable provider of your own with internet, TV and phone.
+[*][b]Shop signs[/b] (F7): your own pictures, the business logo beside the name and light effects – everyone sees them.
+[*][b]Livery[/b] (in the vehicle, next to "Park Vehicle"): every side of your vehicle with its own design, colour and your logo – everyone sees it.
+[*]Taxes by phone, chat translation German–English, mergers of several players' companies into one.
+[/list]
+
+[h2]Thanks[/h2]
+All modules are our own implementations, no code of others. Thanks to everyone who made the originals – the links are in the description under "Credits".

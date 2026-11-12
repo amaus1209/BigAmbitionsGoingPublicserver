@@ -1,0 +1,133 @@
+using System;
+using HarmonyLib;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>Sweep batch 12 (2026-08-18, user-approved): guards around native code that
+    /// throws in MP-only states.  DESIGN (user ruling): every guard REPORTS when it fires,
+    /// classified two ways —
+    ///
+    ///  * PARITY guards protect native code from states that are NORMAL in MP but impossible
+    ///    solo (a remote player's collider in a trigger volume, a remote player in a chair).
+    ///    Firing is expected life: logged once per launch per site (with a running count on
+    ///    later summaries), and does NOT indicate a deeper bug.
+    ///
+    ///  * TRIPWIRE guards protect against states that should not exist at all.  EVERY firing
+    ///    is evidence of an unrooted upstream defect: logged WARN with context, throttled per
+    ///    site.  The guard keeps the session alive; the line is the case file for rooting the
+    ///    real cause.  A guard that absorbed silently would be a bandaid hiding its own
+    ///    evidence.
+    ///
+    /// All guards pass exceptions through untouched outside MP (single-player behavior is
+    /// native, unguarded — these states cannot occur there and masking a real SP bug would
+    /// be wrong).</summary>
+    internal static class NativeGuardReport
+    {
+        internal static bool InMp => MPServer.IsRunning || MPClient.InMpGame;
+
+        private static readonly System.Collections.Generic.Dictionary<string, int>   _count  = new();
+        private static readonly System.Collections.Generic.Dictionary<string, float> _nextAt = new();
+
+        /// <summary>Throttled, counted report. Parity sites use a long interval (fire-once
+        /// feel); tripwires a short one so recurrence stays visible.</summary>
+        internal static void Fire(string site, bool tripwire, string context)
+        {
+            try
+            {
+                _count.TryGetValue(site, out var n); _count[site] = ++n;
+                float now = UnityEngine.Time.unscaledTime;
+                if (_nextAt.TryGetValue(site, out var at) && now < at) return;
+                _nextAt[site] = now + (tripwire ? 30f : 600f);
+                if (tripwire)
+                    Plugin.Logger.LogWarning($"[Guard] TRIPWIRE {site} fired (#{n}) — an upstream state that should be impossible; needs rooting. {context}");
+                else
+                    Plugin.Logger.LogInfo($"[Guard] parity {site} absorbed an MP-normal case (#{n}). {context}");
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>PARITY: happiness trigger volumes throw when a collider without the expected
+    /// local-player plumbing enters/exits — remote-player puppets are the standing suspect
+    /// (4+ field bundles, enter/exit pairs tracking remote movement).  Swallowed in MP: the
+    /// volume simply doesn't register that crossing.</summary>
+    [HarmonyPatch(typeof(LocationHappinessTrigger), "OnTriggerEnter")]
+    public static class Guard_HappinessTrigger_Enter
+    {
+        static Exception? Finalizer(Exception __exception)
+        {
+            if (__exception == null || !NativeGuardReport.InMp) return __exception;
+            NativeGuardReport.Fire("LocationHappinessTrigger.OnTriggerEnter", tripwire: false, $"{__exception.GetType().Name}");
+            return null;
+        }
+    }
+    [HarmonyPatch(typeof(LocationHappinessTrigger), "OnTriggerExit")]
+    public static class Guard_HappinessTrigger_Exit
+    {
+        static Exception? Finalizer(Exception __exception)
+        {
+            if (__exception == null || !NativeGuardReport.InMp) return __exception;
+            NativeGuardReport.Fire("LocationHappinessTrigger.OnTriggerExit", tripwire: false, $"{__exception.GetType().Name}");
+            return null;
+        }
+    }
+
+    /// <summary>PARITY: clicking a slot machine whose chair state involves a remote occupant
+    /// NREs in SetChairOccupied (field 20260816-213224 ×7, both click and walk-over paths).
+    /// Swallowed in MP: the interaction aborts cleanly instead of throwing out of the click.</summary>
+    [HarmonyPatch(typeof(SlotMachineController), nameof(SlotMachineController.SetChairOccupied))]
+    public static class Guard_SlotMachine_Chair
+    {
+        static Exception? Finalizer(Exception __exception)
+        {
+            if (__exception == null || !NativeGuardReport.InMp) return __exception;
+            NativeGuardReport.Fire("SlotMachineController.SetChairOccupied", tripwire: false, $"{__exception.GetType().Name} (remote occupant suspected)");
+            return null;
+        }
+    }
+
+    // (Batch 12's CalculateAiOwnedValuation guard REMOVED 2026-08-18 same-day: round-204b/255
+    //  already finalizes this method (MPPatches.Patch_AiValuation_ClientEmptyIncomeFallback)
+    //  and substitutes the HOST-SYNCED valuation — strictly better than this guard's 0, which
+    //  registering first would have displaced.  Same patch-inventory lesson as the storm guard.)
+
+    // (Batch 12's HasPaidForAllItems guard REMOVED 2026-08-18 (user-driven re-audit): the NRE's
+    //  root chain — IsUsingVehicle=true with GetCurrentVehicle()=null while pushing a borrowed
+    //  cart — is documented at GameStatePatcher:2373 and was FIXED by round-243's ghost-parity
+    //  postfix; every storm bundle is 0.1.14-era.  And OUR OWN patches call this method at two
+    //  "shopper flow keeps priority" gates (BusinessPatches:392/:680) whose semantics a forced
+    //  TRUE would flip on corrupted state.  Root-fixed + own-caller risk = no guard.)
+
+    /// <summary>TRIPWIRE: the pedestrian camera's input handler died permanently after
+    /// parking (field 20260816-004749: 12,809 per-frame NREs to end of log — the reported
+    /// "stuck after parking").  Swallowing keeps the camera loop alive frame to frame
+    /// instead of storming; the vehicle-exit state that nulls its target is the root to
+    /// hunt, and the throttled tripwire counts it without becoming the next log storm.</summary>
+    [HarmonyPatch(typeof(CameraControllers.PedestrianCam), "Update")]
+    public static class Guard_PedestrianCam_Update
+    {
+        static Exception? Finalizer(Exception __exception)
+        {
+            if (__exception == null || !NativeGuardReport.InMp) return __exception;
+            NativeGuardReport.Fire("PedestrianCam.Update", tripwire: true, $"{__exception.GetType().Name} — vehicle-exit camera state suspected.");
+            return null;
+        }
+    }
+    [HarmonyPatch(typeof(CameraControllers.PedestrianCam), "UpdateInput")]
+    public static class Guard_PedestrianCam_UpdateInput
+    {
+        static Exception? Finalizer(Exception __exception)
+        {
+            if (__exception == null || !NativeGuardReport.InMp) return __exception;
+            NativeGuardReport.Fire("PedestrianCam.UpdateInput", tripwire: true, $"{__exception.GetType().Name} — vehicle-exit camera state suspected.");
+            return null;
+        }
+    }
+
+    // (Batch 15's StationaryAiBehavior attribution guard REMOVED same-day: the round-199
+    //  shield (MPPatches.Patch_StationaryAi_HealStuckCombinedFlag) already roots AND heals
+    //  this storm — a native one-way _isPlayingCombinedAnimation flag, MP-amplified by
+    //  weather-sync re-rolls — and a second finalizer on the same method registered first
+    //  would have displaced that heal (verifier catch, 2026-08-18).  Lesson: grep OUR OWN
+    //  patch classes for the target method before adding a patch to it.)
+}

@@ -1,0 +1,3490 @@
+using System;
+using System.Collections.Generic;
+using BigAmbitions.Characters.Skills;   // SkillName
+using Entities;                          // EmployeeInstance
+using UnityEngine;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Player-staffed cash registers (Wave-2; design:
+    /// .modding/03-systems/cross-player-shopping.md).
+    ///
+    /// Duty mirrors the game's own Work mechanic (user spec): the owner clicks
+    /// their register, picks Work, a WorkActivity runs, we broadcast ON duty;
+    /// stopping work broadcasts OFF.  No keybinds anywhere.
+    ///
+    /// Buying in a duty-staffed shop: shelves/basket are native; the register
+    /// click routes to the game's SELF-CHECKOUT flow (Patch_RegisterInteract_
+    /// SelfCheckout) and the ORDER is finalized by the MP finalizer
+    /// (Patch_MPOrderFinalizer) — charge from the synced store table, revenue
+    /// + authoritative stock decrement on the owner side via RemoteSale.
+    ///
+    /// TWO duty kinds (user ruling 2026-06-12):
+    ///  * PERSONAL — the owner works the register; their avatar is the visual,
+    ///    nothing is spawned.
+    ///  * EMPLOYEE — the owner's hired staff covers the station (data-driven
+    ///    scan on the owner's machine).  Receivers spawn a VISIBLE synthetic
+    ///    staff NPC for immersion (roster + WorkShift injection + forced
+    ///    staffing gate — resurrected from the deleted owner-mime experiment,
+    ///    where invisible-NPC-as-owner was the wrong idea; visible-NPC-as-staff
+    ///    is the right one).  Commerce never depends on the NPC: the buyer
+    ///    "never knows if it's a system auto ringing them up or the employee."
+    ///
+    /// Registers are keyed by rounded world position (stable across peers --
+    /// interiors are host-snapshot replicas at identical coordinates;
+    /// verified cross-machine 2026-06-11: '900:0:-4' matched on both).
+    /// </summary>
+    public static class MPRegisterSync
+    {
+        public const string SyntheticDutyEmployeeIdPrefix = "BAMP_DUTY_";
+
+        // posKey → cashier.  CONCURRENT: Apply runs on the network poll thread
+        // (RegisterCashier handler) and the main thread (local duty echo), while
+        // the checkout-routing Harmony patches read it on the main thread.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string playerId, Vector3 pos, bool employee, string address, string stationId)> _cashiers = new();
+
+        /// <summary>[CrossOwner] probe: employee ids already reported this session.</summary>
+        private static readonly HashSet<string> _crossOwnerLogged = new();
+
+        public static void Reset()
+        {
+            _injectedOwner.Clear(); _poolByOwner.Clear(); _benchGrace.Clear();   // shared-shop slice 3: bench bookkeeping dies with the scene (the records go with _injectedStaff below)
+            // Audit 2026-08-26: the hidden-body registry survived the world. The sweep resolves a station
+            // by WORLD POSITION within 2.5 m, and the city layout is identical in every save — so a
+            // leftover entry from session A re-targets a real station in session B and can hold a
+            // stand-in renderer-disabled, re-asserted every frame, for the rest of the session. The
+            // real-employee guard stops a genuine hire being hidden but does not tell a personal-duty
+            // stand-in from an employee-post one.
+            _hideBodyAt.Clear(); _hidden.Clear(); _hiddenTpc.Clear(); _hideMissLogged.Clear();
+            // Remove the synthetic duty NPCs we injected from the live game first,
+            // so a scene-exit/disconnect autosave can't write them into a save (they
+            // are runtime-only and would otherwise orphan — they live in gi.Employee-
+            // Instances but not in _synthetics after a load).  RemoveSynthetic clears
+            // each from gi + the dictionary + its work shifts; iterate a key copy
+            // because it mutates _synthetics.
+            foreach (var key in new List<string>(_synthetics.Keys)) RemoveSynthetic(key);
+            // WS3: injected roster records die with the scene too (runtime-only, like the synthetics).
+            foreach (var id in new List<string>(_injectedStaff.Keys)) RemoveInjectedStaff(id);
+            lock (_rosterByAddr) { _rosterByAddr.Clear(); }
+            _rosterApplied.Clear(); _rosterSigSent.Clear(); _rosterLogSig.Clear(); _rosterNotSentLogged.Clear();
+            _cashiers.Clear(); _empDuty.Clear(); _synthetics.Clear(); _crossOwnerLogged.Clear(); _noStandInLogged.Clear(); _standInPassLogged.Clear(); _onDuty = false; CurrentShopOwner = ""; CurrentShopAddress = "";
+        }
+
+        // ── Current building context (set by the building entry patch) ────────
+        // After the rival-translation, businessOwnerRivalId holds the OWNING
+        // PLAYER's id for player businesses (a real rival GUID for AI ones —
+        // the host validates against the lobby roster, so AI ids fall out).
+        public static string CurrentShopOwner   { get; private set; } = "";
+        public static string CurrentShopAddress { get; private set; } = "";
+
+        public static void SetCurrentShop(string ownerId, string address)
+        {
+            // DIAG [ShopCtx] (2026-07-07, flatbed cluster): the interior mask hid a hand-vehicle
+            // ghost with mine='' while the player stood INSIDE the tagged building — trace every
+            // context transition so the next run shows whether entry set it and what cleared it.
+            if (CurrentShopAddress != (address ?? ""))
+                Plugin.Logger.LogInfo($"[ShopCtx] '{CurrentShopAddress}' → '{address ?? ""}' (owner '{ownerId ?? ""}')");
+            CurrentShopOwner = ownerId ?? "";
+            CurrentShopAddress = address ?? "";
+        }
+
+        // ── Context self-heal (2026-07-07, [ShopCtx]-proven): entering a building while PUSHING a
+        // hand vehicle skips the DelayedEnterBuildingActions entry hook entirely — the context stayed
+        // '' and the interior mask hid the pushed flatbed from its own pusher. Poll the game's OWN
+        // authority (BuildingManager.buildingRegistration: set while indoors, nulled by ResetIndoors)
+        // so the context converges regardless of WHICH native entry/exit path ran. Frontload principle:
+        // never gate correctness on a specific flow having fired.
+        private static float _ctxNextPoll, _ctxEmptySince = -1f;
+
+        public static void TickContextHeal()
+        {
+            if (UnityEngine.Time.unscaledTime < _ctxNextPoll) return;
+            _ctxNextPoll = UnityEngine.Time.unscaledTime + 0.5f;
+            if (!MPServer.IsRunning && !MPClient.IsClientInWorld && !MPClient.OfflineFork) return;   // H-FORK-1 r2 (review #1): the shop context must keep tracking in the offline fork — the register-order shield reads it
+            try
+            {
+                var bm  = InstanceBehavior<BuildingManager>.Instance;
+                var reg = bm != null ? bm.buildingRegistration : null;
+                if (reg != null)
+                {
+                    _ctxEmptySince = -1f;
+                    string key = GameStateReader.AddressKey(reg);
+                    if (!string.IsNullOrEmpty(key) && key != CurrentShopAddress)
+                        SetCurrentShop(reg.businessOwnerRivalId?.ToString() ?? "", key);   // hook missed → heal
+                }
+                else if (!string.IsNullOrEmpty(CurrentShopAddress))
+                {
+                    // Exit hook missed too (hand-vehicle exit): clear after 2s of provably-outdoors —
+                    // hysteresis absorbs the null reads during entry/exit transitions.
+                    if (_ctxEmptySince < 0f) _ctxEmptySince = UnityEngine.Time.unscaledTime;
+                    else if (UnityEngine.Time.unscaledTime - _ctxEmptySince > 2f)
+                        SetCurrentShop("", "");
+                }
+                else _ctxEmptySince = -1f;
+            }
+            catch { }
+        }
+
+        private static string Key(Vector3 p)
+            => $"{Mathf.RoundToInt(p.x)}:{Mathf.RoundToInt(p.y)}:{Mathf.RoundToInt(p.z)}";
+
+        /// <summary>Sweep item 7 (2026-08-18): STATION IDENTITY.  The rounded-position key
+        /// split identities whenever a till sat on a rounding boundary — field bundle
+        /// 20260713-223138 measured one checkout row keyed as BOTH 1106:1:z and 1107:1:z
+        /// (x≈1106.5), which minted duplicate synthetics, unresolvable BAMP_DUTY ids
+        /// (7,000+ native "Employee not found" lines) and ON/OFF churn between the two
+        /// keys.  The ItemInstance id already rides every duty payload and is preserved
+        /// identically across machines by interior replication (round-122) — it is the
+        /// identity; position remains the fallback for entries that genuinely have no
+        /// instance id (and the value everywhere for proximity/display).</summary>
+        private static string RegKey(string? stationId, Vector3 pos)
+            => string.IsNullOrEmpty(stationId) ? Key(pos) : "sid:" + stationId;
+
+        /// <summary>The registry key for a live station object (serve mirror + duty capture
+        /// use the same derivation so key strings compare equal across machines).  Takes the
+        /// BASE station type — ItemInstance lives on EmployeeStationController and the serve
+        /// mirror hands us whatever station kind the stand-in is working.</summary>
+        internal static string RegKeyForStation(EmployeeStationController? c)
+        {
+            string id = ""; try { id = c?.ItemInstance?.id ?? ""; } catch { }
+            return RegKey(id, c != null ? c.transform.position : Vector3.zero);
+        }
+
+        /// <summary>Field 20260830-150521: POSITION IS NOT IDENTITY ACROSS BUILDINGS.
+        /// Same-template interiors mount on identical world coordinates, so a REMEMBERED
+        /// position sits within metres of stations in a DIFFERENT building whenever that
+        /// other interior is the loaded one (127/127 staffing-sweep invocations in that
+        /// bundle bound cross-building; a hairdresser's remembered till matched a BANK's).
+        /// Registry records are keyed by the station's ItemInstance id since item 7 —
+        /// resolving the LIVE object must use the SAME identity, so this is the one
+        /// resolver every record→live-station lookup goes through.  Legacy position-keyed
+        /// records (no instance id on the wire) fall back to nearest-position but only
+        /// accept a station whose BUILDING matches the record's.</summary>
+        private static EmployeeStationController? FindStationByRegKey(UnityEngine.Object[]? stations,
+            string regKey, Vector3 recordPos, string recordAddr)
+        {
+            if (stations == null || string.IsNullOrEmpty(regKey)) return null;
+            if (regKey.StartsWith("sid:", StringComparison.Ordinal))
+            {
+                string want = regKey.Substring(4);   // bare-id compare — no per-station string mint
+                foreach (var o in stations)
+                {
+                    var c = o as EmployeeStationController;
+                    if (c == null || !IsLiveStation(c)) continue;
+                    string cid = ""; try { cid = c.ItemInstance?.id ?? ""; } catch { }
+                    if (cid.Length > 0 && cid == want) return c;
+                }
+                return null;
+            }
+            var near = NearestStationIn(stations, recordPos, 2.5f);
+            return near != null && StationAddr(near) == recordAddr ? near : null;
+        }
+
+        /// <summary>Review F11: the station registry keeps stations from toggled-INACTIVE
+        /// layouts (pooled interiors are disabled, not destroyed), and an inactive station's
+        /// lazily-created BuildingContext answers with the building the player is in NOW —
+        /// which would defeat the address gate. "Live" = active in the scene.</summary>
+        private static bool IsLiveStation(EmployeeStationController? c)
+        {
+            try { return c != null && c.gameObject.activeInHierarchy; } catch { return false; }
+        }
+
+        /// <summary>The building a LIVE station actually sits in ("" when unresolvable).</summary>
+        private static string StationAddr(EmployeeStationController? st)
+        {
+            try
+            {
+                var r = st?.BuildingContext?.Registration;
+                return r == null ? "" : GameStateReader.AddressKey(r);
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>Sweep batch 11 (2026-08-18): the building that CONTAINS a station, resolved
+        /// from the station's stable instance id (reliable since item 7).  Duty toggles used to
+        /// trust the entry-hook shop context, and entry paths that skip the hook (hand-vehicle
+        /// entry etc.) shipped Address="" — which the host's owns-or-granted check can never
+        /// pass (grants explicitly require a non-empty address), so every registration from an
+        /// affected player was dropped (×407/×420/×30 field storms = "can't work at the till"
+        /// with permissions in perfect order).  "" = unresolvable.  Pure managed reads — safe
+        /// from the network poll thread; any race with a main-thread list mutation falls out
+        /// as "" (the old behavior).</summary>
+        internal static string ResolveAddressForStation(string? stationId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(stationId)) return "";
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return "";
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    try
+                    {
+                        if (reg?.itemInstances != null && reg.itemInstances.ContainsKey(stationId))
+                            return GameStateReader.AddressKey(reg);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return "";
+        }
+
+#if BAMP_DEV
+        /// <summary>Round-263 test hooks (TestDrive 'schedfilter'): inject/remove a duty
+        /// synthetic at a fabricated station so the schedule-surface filter can be
+        /// exercised headlessly. Same code path as real duty (TryStaffSynthetic /
+        /// RemoveSynthetic) — no separate write path.</summary>
+        internal static string TestInjectSynthetic(string addressKey)
+        {
+            var pos = new Vector3(-9999f, -9999f, -9999f);
+            TryStaffSynthetic(addressKey, "TESTDUTY", "BAMP_TESTSTATION", pos);
+            return RegKey("BAMP_TESTSTATION", pos);   // item 7: the registry key the injection actually used
+        }
+        internal static void TestRemoveSynthetic(string stationKey) => RemoveSynthetic(stationKey);
+#endif
+
+        // ── Round-120: personal-duty stand-ins whose BODY must stay hidden ──────────────────────────────
+        // RegKey → (addressKey, pos) — item 7.  The game spawns a serving NPC from the roster record a frame or more
+        // after we inject it, so concealment cannot happen at injection time — it is retried on a slow tick
+        // until the body exists.  Hiding uses the game's own ThirdPersonCharacter.ToggleVisibility, NOT a
+        // root SetActive: round-87 proved that deactivating a character at the root strips its collider and
+        // traffic then drives through where it stood.
+        // Item 7: value carries the position (keys are no longer parseable to positions).
+        private static readonly Dictionary<string, (string addr, Vector3 pos)> _hideBodyAt = new();
+        private static readonly HashSet<string> _hidden = new();
+        private static readonly HashSet<string> _hideMissLogged = new();   // round-125: one "not present yet" line per station
+        private static readonly Dictionary<string, ThirdPersonCharacter> _hiddenTpc = new();   // round-126: per-frame re-assert target
+        private static readonly List<Renderer> _rendBuf = new();                              // round-126: allocation-free renderer walk
+        private static float _nextHideSweep;
+
+        /// <summary>Round-120: is this player personally working a till (not an employee post)?  Used to drop
+        /// player-to-player physical collision while someone is behind a counter.</summary>
+        internal static bool IsOnPersonalDuty(string playerId)
+        {
+            if (string.IsNullOrEmpty(playerId)) return false;
+            foreach (var kv in _cashiers)
+                if (!kv.Value.employee && kv.Value.playerId == playerId) return true;
+            return false;
+        }
+
+        /// <summary>MAIN THREAD, slow tick: conceal the body of any personal-duty stand-in once the game has
+        /// spawned it.  The record stays — it is what makes customers queue at that till — but the visible
+        /// person there is the actual player's synced avatar, so a second NPC beside them would read as two
+        /// staff at one register.</summary>
+        public static void TickHideSynthetics()
+        {
+            try
+            {
+                if (_hideBodyAt.Count == 0) return;
+
+                // ROUND-126: re-assert the concealment EVERY FRAME for bodies we have already found.
+                // A serve gives the worker a bag (ThirdPersonCharacter.SetHandContent parents the prop UNDER
+                // the character, ThirdPersonCharacter.cs:575), and each grab creates a NEW object — so with a
+                // 1s sweep every bag was visible for up to a second, repeatedly, which reads as "the bag isn't
+                // hidden".  Same for any other held prop in any other shop type.  Allocation-free via the
+                // List overload of GetComponentsInChildren, so per-frame is cheap for one or two stand-ins.
+                foreach (var key in _hidden)
+                {
+                    if (!_hiddenTpc.TryGetValue(key, out var ht) || ht == null) continue;
+                    try
+                    {
+                        _rendBuf.Clear();
+                        ht.GetComponentsInChildren<Renderer>(true, _rendBuf);
+                        for (int i = 0; i < _rendBuf.Count; i++)
+                            if (_rendBuf[i] != null && _rendBuf[i].enabled) _rendBuf[i].enabled = false;
+                    }
+                    catch { }
+                }
+
+                if (Time.unscaledTime < _nextHideSweep) return;
+                _nextHideSweep = Time.unscaledTime + 1f;
+
+                // ROUND-125: search ALL EmployeeStationControllers, not only CashRegisterControllers.
+                // FindNearestRegister is CashRegisterController-only, so a till of any other station type was
+                // invisible to this sweep and its stand-in body was never hidden — field symptom: the hide fired
+                // for one till and not the other, leaving a visible worker standing on that player's avatar.
+                // This is the same mistake round-30 already fixed elsewhere ("any EmployeeStationController
+                // counts — the CashRegisterController-only search was the visitor-side twin of the owner-side
+                // checkout whitelist"), so the all-station scan is the established shape here.
+                // Round-186 (field 'laggy as hell when driving', bamp-bug-20260729-133551): this 1Hz
+                // sweep ran a WHOLE-SCENE FindObjectsOfType (~85-95ms with the city streamed) for as
+                // long as any other player sat on personal duty — and with that station's interior
+                // not loaded here, it retried forever finding nothing.  The round-166 registry is
+                // the sweep-free answer: stations announce themselves; this just reads the list.
+                var stationObjs = GetStationsCached();
+                foreach (var kv in _hideBodyAt)
+                {
+                    var reg = FindStationByRegKey(stationObjs, kv.Key, kv.Value.pos, kv.Value.addr);   // field 150521: identity-first (position matched other buildings' tills)
+                    var emp = reg?.employee;
+                    var tpc = emp?.employeeTpc;
+                    if (tpc == null)
+                    {
+                        // Say so once per station: a silent skip here is indistinguishable from "the feature
+                        // does not work", which is exactly how the last two rounds were spent.
+                        if (_hideMissLogged.Add(kv.Key))
+                            Plugin.Logger.LogInfo($"[SynthStaff] stand-in body at {kv.Key} not present yet "
+                                + $"(station={(reg == null ? "NOT FOUND" : "found")}, employee={(emp == null ? "none" : "no tpc")}) — retrying each sweep.");
+                        continue;
+                    }
+                    if (emp!.employeeInstance == null
+                        || emp.employeeInstance.id == null
+                        || !emp.employeeInstance.id.StartsWith(SyntheticDutyEmployeeIdPrefix, StringComparison.Ordinal))
+                        continue;                                   // a REAL employee is on this till — never hide them
+                    // ROUND-124 — RENDERERS ONLY.  My first cut called ThirdPersonCharacter.ToggleVisibility(false),
+                    // which I had NOT read: it does navmeshAgent.enabled = false, capsuleCollider.enabled = false,
+                    // gameObject.SetActive(false), isKinematic = true and localScale = zero.  A DEACTIVATED object
+                    // runs no coroutines, so the stand-in could not serve at all — field symptom: "customer went to
+                    // the till and just stood there doing nothing".  I had even written a comment warning against a
+                    // root SetActive and then called a method that performs one internally.
+                    //
+                    // Disabling renderers hides the body while the agent, collider, Update and the serve coroutine
+                    // all keep running.  Re-asserted every sweep rather than once, because the character re-enables
+                    // its own renderers on appearance changes.
+                    int off = 0;
+                    try
+                    {
+                        foreach (var r in tpc.GetComponentsInChildren<Renderer>(true))
+                            if (r != null && r.enabled) { r.enabled = false; off++; }
+                    }
+                    catch { continue; }
+                    _hiddenTpc[kv.Key] = tpc;
+                    if (off > 0 && _hidden.Add(kv.Key))
+                        Plugin.Logger.LogInfo($"[SynthStaff] hid the stand-in body at {kv.Key} in '{kv.Value}' ({off} renderer(s)) — "
+                            + "the player working that till is already visible there as their own avatar; the stand-in stays ACTIVE so it can serve.");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] hide sweep: {ex.Message}"); }
+        }
+
+        /// <summary>Round-143 - the ORIGIN-STAGING poison, measured end to end by [QueueInit]: the game
+        /// runs a register's queue-init while the item is IN HAND / being staged (transform AND data position
+        /// both (0,0,0), no queue data yet), which writes a line anchored at the world origin into the item's
+        /// customPositions.  Vanilla heals that locally by re-initializing after placement, but the staged
+        /// intermediate reached the other machine over our wire and froze there (customPositions predated the
+        /// diff hash), and round-137's owner-authoritative sync then kept restoring it.  The signature is
+        /// unambiguous: anchor 0 is the front-of-counter position and always sits within arm's reach of the
+        /// register - the poisoned one is ~950m away.  Data failing this check is dropped so the native
+        /// loader rebuilds the line at the item's true position (the same healing vanilla does).</summary>
+        internal static bool IsPoisonedQueue(System.Collections.Generic.List<SerializableVector3> list, Vector3 itemPos)
+        {
+            if (list == null || list.Count == 0) return false;
+            Vector3 a0 = list[0];
+            return Vector3.Distance(a0, itemPos) > 10f;
+        }
+
+        /// <summary>Round-137 - repair the TRUNCATED-QUEUE signature.  ItemInstance.customPositions encodes a
+        /// drawn queue as [anchors..., Vector3.zero separator, spots...] (WaitingLineData.SplitAnchorsAndSpots).
+        /// A list that decodes to two-or-more anchors with EXACTLY ONE stored spot is the corruption this
+        /// session field-proved (same register: 8 entries on the placing machine, 4 on the receiver): the lone
+        /// stored spot makes the native rebuild guard (spots.Count == 0) skip SetUpWaitingLine, so the till is
+        /// capped at ONE queue place every load, forever.  Dropping that lone spot leaves [anchors + separator],
+        /// which decodes to zero spots - and the native guard then rebuilds the line by pathing between the
+        /// anchors.  A legitimately tiny drawn queue (anchors under 0.8m apart) rebuilds to the same single
+        /// spot, so the repair cannot shrink anything real.</summary>
+        internal static int RepairTruncatedQueue(System.Collections.Generic.List<SerializableVector3> list)
+        {
+            if (list == null || list.Count < 4) return 0;
+            int sep = -1;
+            for (int i = 0; i < list.Count; i++) { Vector3 v = list[i]; if (v == Vector3.zero) { sep = i; break; } }
+            if (sep < 2) return 0;                        // fewer than two anchors -> not the signature
+            if (list.Count - sep - 1 != 1) return 0;      // only the exact one-stored-spot truncation
+            list.RemoveAt(list.Count - 1);
+            return 1;
+        }
+
+        /// <summary>Round-137 - after the in-place item apply copies a changed drawn queue, rebuild the LIVE
+        /// line (the interior is only loaded when the local player is inside; elsewhere the next interior load
+        /// rebuilds from the repaired data anyway).  Uses the game's own SetCustomAnchors -> SetUpWaitingLine.</summary>
+        internal static void RebuildDrawnQueueAt(Vector3 pos, string? stationId, System.Collections.Generic.List<SerializableVector3> customPositions)
+        {
+            try
+            {
+                var stations = GetStationsCached();   // round-186: registry, never a scene walk
+                // Field 150521: the applied ItemInstance's id IS the station identity — prefer it.
+                // Review F12: the LIVE controller may not carry its id yet (ItemInstance is
+                // assigned post-construction), so a failed id-match falls back to nearest-position
+                // — safe here because the queue apply only runs for the interior the local player
+                // is inside, so the fallback cannot cross buildings.
+                var st = (string.IsNullOrEmpty(stationId) ? null : FindStationByRegKey(stations, "sid:" + stationId, pos, ""))
+                    ?? NearestStationIn(stations, pos, 2.5f);
+                var wl = (st as EmployeeStations.IWaitingLineHolder)?.GetWaitingLine();
+                if (wl == null) return;
+                var anchors = new System.Collections.Generic.List<Vector3>();
+                if (customPositions != null)
+                    foreach (var sp in customPositions) { Vector3 v = sp; if (v == Vector3.zero) break; anchors.Add(v); }
+                if (anchors.Count < 2) return;
+                // ROUND-140: showChanges:true also runs visuals.Show(), which displays the interior designer's
+                // queue markers (the anchor flag and spot dots) in normal play - the client saw the flag standing
+                // in the shop (field report 2026-07-28).  Those visuals are only ever meant for the queue tool.
+                // Set the data silently, rebuild the spots ourselves, and force the markers hidden.
+                wl.SetCustomAnchors(anchors, showChanges: false);
+                try { wl.creator.SetUpWaitingLine(); } catch { }
+                try { wl.visuals.Hide(); } catch { }
+                Plugin.Logger.LogInfo($"[QueueSync] drawn queue rebuilt at {Key(pos)} from {anchors.Count} anchor(s) - capacity follows the updated data.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[QueueSync] rebuild: {ex.Message}"); }
+        }
+
+        /// <summary>Task-28 fix 3 — the CLEAR counterpart of RebuildDrawnQueueAt: the owner's copy
+        /// carries no line data, so reset the live line to its template at the item's real position
+        /// (the game's own creator.Reset), then re-null the instance copy — Reset's onDataChange
+        /// callback writes the rebuilt template line back into it, and the data must keep matching
+        /// the owner's (null) so repeated empty pushes stay no-ops.</summary>
+        internal static void ResetQueueAt(Vector3 pos, BigAmbitions.Items.ItemInstance owner)
+        {
+            try
+            {
+                var stations = GetStationsCached();   // round-186: registry, never a scene walk
+                // Field 150521 + review F12: identity-first with the same positional fallback
+                // as RebuildDrawnQueueAt above (same same-interior-by-construction rationale).
+                string ownId = ""; try { ownId = owner?.id ?? ""; } catch { }
+                var st = (string.IsNullOrEmpty(ownId) ? null : FindStationByRegKey(stations, "sid:" + ownId, pos, ""))
+                    ?? NearestStationIn(stations, pos, 2.5f);
+                var wl = (st as EmployeeStations.IWaitingLineHolder)?.GetWaitingLine();
+                if (wl == null) return;   // interior not loaded here — the nulled data rebuilds the line natively on next load
+                try { wl.creator?.Reset(); } catch { }
+                try { wl.visuals.Hide(); } catch { }
+                try { if (owner != null) owner.customPositions = null; } catch { }
+                Plugin.Logger.LogInfo($"[QueueSync] drawn queue cleared at {Key(pos)} — line reset to its template at the item's position.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[QueueSync] clear: {ex.Message}"); }
+        }
+
+        // (ParseKey removed 2026-08-31: dead since item 7 — keys no longer parse to positions
+        //  and every record→live-station lookup goes through FindStationByRegKey.)
+
+        /// <summary>Round-119: the rounded-position key of the till THIS player is personally working
+        /// ("" = not on personal duty).  Position keys are the identifier that has been verified to match
+        /// across machines, which is why the serve mirror addresses tills this way rather than by station id.</summary>
+        internal static string LocalPersonalDutyKey()
+        {
+            foreach (var kv in _cashiers)
+                if (!kv.Value.employee && kv.Value.playerId == MPConfig.PlayerId) return kv.Key;
+            return "";
+        }
+
+        // (Round-119's StationKeyOf(pos) removed — item 7: the serve mirror derives keys via
+        //  RegKeyForStation so its wire strings match the id-keyed duty registry.)
+
+        /// <summary>Round-41 (customer puppets): the player on PERSONAL register duty at this address
+        /// ("" = none). The simulator election gives the register worker authority — serving requires
+        /// simulating (the serve loop needs real customer AI on the serving machine).</summary>
+        internal static string PersonalDutyHolderAt(string addressKey)
+        {
+            if (string.IsNullOrEmpty(addressKey)) return "";
+            foreach (var kv in _cashiers)
+                if (!kv.Value.employee && kv.Value.address == addressKey) return kv.Value.playerId;
+            return "";
+        }
+
+        /// <summary>Apply an on/off-duty state (local echo + remote).</summary>
+        public static void Apply(RegisterCashierPayload? p)
+        {
+            if (p == null || string.IsNullOrEmpty(p.PlayerId)) return;
+            var pos = new Vector3(p.X, p.Y, p.Z);
+            string k = RegKey(p.StationId, pos);   // item 7: instance id is the identity; position is the fallback
+            if (p.On)
+            {
+                _cashiers[k] = (p.PlayerId, pos, p.Employee, p.Address ?? "", p.StationId ?? "");
+#if BAMP_DEV
+                Plugin.Logger.LogInfo($"[Register] '{p.PlayerId}' ON duty at {k}{(p.Employee ? " (employee)" : "")}.");   // round-187b: per-toggle detail is dev-only (field logs carried 15k of these; StaffDiag summarizes)
+#endif
+                // Duty on ANOTHER machine → stand the till up locally.  Main-thread: Apply can run on the
+                // network poll thread.
+                //
+                // ROUND-120: this used to require p.Employee, i.e. only a shop run by the owner's HIRED staff
+                // got a stand-in.  A PERSONAL duty (a player working the till themselves) sends
+                // Employee=false, so their till was staffed on THEIR machine only — and since exactly one
+                // machine simulates the customers, the simulator saw a single staffed till and queued
+                // everyone there.  Field-confirmed by the user's two-register test: both duties known on both
+                // machines, "synthetics=0" on the host, every customer at one register.
+                //
+                // A personal-duty stand-in is the MECHANISM (it is what makes customers queue and be served);
+                // its BODY is redundant, because the player it stands in for is already visible there as a
+                // synced avatar.  So personal-duty stand-ins are marked for concealment — see TickHideSynthetics.
+                if (p.PlayerId != MPConfig.PlayerId && !string.IsNullOrEmpty(p.Address))
+                {
+                    string addr = p.Address; string pid = p.PlayerId; string st = p.StationId;
+                    var dutyPos = pos;
+                    string hk = k;   // item 7: the registry key, captured — never re-derive inside the lambda
+                    bool personal = !p.Employee;
+                    GameStatePatcher.EnqueueOnMainThread(() =>
+                    {
+                        // H-STAFFBODY-1 (user-approved 2026-09-22): a HIRED-staff duty needs no stand-in on a
+                        // machine that already holds the owner's real roster copies AND the owner's schedule for
+                        // the shop - the game's own spawner builds the real bodies from them, and a 0-24 stand-in
+                        // there is an EXTRA body (it even fills the hours the real schedule leaves empty).
+                        // A PLAYER on duty (personal) always keeps its stand-in: it is the queueing mechanism.
+                        // H-STAFFBODY-1 fold F5 (2026-09-28): with the owner's roster copies already held for the
+                        // address, the ON apply creates nothing - the recurring stand-in pass (TickRosterApply, 10 s)
+                        // decides per station and hour whether the game's own spawner covers this station.
+                        if (!personal && LiveRosterCopiesAt(addr ?? "") > 0) { NoteNoStandIn(addr ?? "", LiveRosterCopiesAt(addr ?? "")); return; }
+                        TryStaffSynthetic(addr, pid, st, dutyPos);
+                        if (personal) _hideBodyAt[hk] = (addr, dutyPos);   // the player's own avatar is the visual
+                    });
+                }
+            }
+            else
+            {
+                // Item 7: an OFF whose key form differs from the ON it retracts (a sender that
+                // lost the StationId) falls back to a same-player position match — the split
+                // this restructure removes must not be reintroduced by a mixed-form packet.
+                if (!_cashiers.TryGetValue(k, out var e) || e.playerId != p.PlayerId)
+                {
+                    k = ""; e = default;
+                    string pk = Key(pos);
+                    foreach (var kv in _cashiers)
+                        if (kv.Value.playerId == p.PlayerId && Key(kv.Value.pos) == pk
+                            // Field 150521: same player + same rounded position can exist in TWO buildings
+                            // (same-template interiors share coordinates) — the address must agree too.
+                            && (string.IsNullOrEmpty(p.Address) || string.IsNullOrEmpty(kv.Value.address) || kv.Value.address == p.Address))
+                        { k = kv.Key; e = kv.Value; break; }
+                }
+                if (!string.IsNullOrEmpty(k) && e.playerId == p.PlayerId)
+                {
+                    _cashiers.TryRemove(k, out _);
+#if BAMP_DEV
+                    Plugin.Logger.LogInfo($"[Register] '{p.PlayerId}' OFF duty at {k}.");   // round-187b: dev-only
+#endif
+                    // Round-120: mirror the ON gate — a personal-duty stand-in must be torn down too, or the till
+                    // stays staffed by a phantom after the player walks away.
+                    if (p.PlayerId != MPConfig.PlayerId)
+                    {
+                        var offKey = k;
+                        GameStatePatcher.EnqueueOnMainThread(() => { _hideBodyAt.Remove(offKey); RemoveSyntheticAtStation(offKey); });
+                    }
+                }
+            }
+        }
+
+        /// <summary>A player disconnected — their duty posts clear.</summary>
+        public static void RemovePlayer(string playerId)
+        {
+            var dead = new List<string>();
+            foreach (var kv in _cashiers) if (kv.Value.playerId == playerId) dead.Add(kv.Key);
+            foreach (var k in dead)
+            {
+                bool wasEmployee = _cashiers[k].employee;
+                _cashiers.TryRemove(k, out _);
+                if (wasEmployee && playerId != MPConfig.PlayerId)
+                {
+                    var key = k;
+                    GameStatePatcher.EnqueueOnMainThread(() => RemoveSyntheticAtStation(key));
+                }
+            }
+            if (dead.Count > 0) Plugin.Logger.LogInfo($"[Register] cleared {dead.Count} duty post(s) of departed '{playerId}'.");
+        }
+
+        private static Controllers.CashRegisterController? FindNearestRegister(Vector3 from, float maxDist)
+        {
+            Controllers.CashRegisterController? best = null;
+            float bestD2 = maxDist * maxDist;
+            var arr = GetStationsCached();   // round-186: registry (registers are stations); the cast below filters
+            if (arr != null)
+                foreach (var o in arr)
+                {
+                    var c = o as Controllers.CashRegisterController;
+                    if (c == null) continue;
+                    float d2 = (c.transform.position - from).sqrMagnitude;
+                    if (d2 < bestD2) { bestD2 = d2; best = c; }
+                }
+            return best;
+        }
+
+        // ── Duty: driven by the NATIVE Work mechanic (user spec) — click your
+        // register → "Work" → the game runs a WorkActivity; we mirror that
+        // activity into the duty map.  Stop working (any way the game allows)
+        // → off duty.  No extra keybind for the cashier.
+        private static float _nextDutyAt;
+        private static bool _onDuty;
+        private static Vector3 _dutyPos;
+        private static string _dutyStationId = "";   // item 7: the till's instance id rides every toggle incl. OFF
+
+        public static void TickDuty()
+        {
+            // Round-187 (user directive, field 20260729-141854: a pure-SP session logged 13,808
+            // [Register] lines): the mod is MULTIPLAYER-ONLY — duty tracking, the employee-station
+            // scan and their logging have no business running in plain single-player.
+            if (!MPServer.IsRunning && !MPClient.InMpGame) return;
+            TickEmployeeDutySliced();   // round-161: every frame under a ~2ms budget (was a 60-65ms single-frame scan)
+            if (Time.unscaledTime < _nextDutyAt) return;
+            _nextDutyAt = Time.unscaledTime + 1f;
+            try
+            {
+                bool working = MPRestSync.CurrentActivityName() == "Work";
+                if (working && !_onDuty)
+                {
+                    // The EXACT station from the live WorkActivity (it holds
+                    // _employeeStationController — decompile sweep 2026-06-12;
+                    // replaces the nearest-register-in-5m guess that could bind
+                    // duty to the wrong till in dense shops).
+                    Controllers.CashRegisterController? reg = null;
+                    try
+                    {
+                        var act = MPRestSync.CurrentActivityObject;
+                        if (act != null)
+                            reg = MPReflect.Get(act.GetType(), act, "_employeeStationController")
+                                  as Controllers.CashRegisterController;
+                    }
+                    catch { }
+                    if (reg == null)
+                    {
+                        // Fallback: proximity (activity shape drifted / non-register station type).
+                        var ch = Helpers.PlayerHelper.PlayerController?.Character?.transform;
+                        if (ch == null) return;
+                        reg = FindNearestRegister(ch.position, 5f);
+                    }
+                    if (reg == null) return;   // working some other station — not register duty
+                    _onDuty = true;
+                    _dutyPos = reg.transform.position;
+                    // ROUND-122: carry the till's ITEM-INSTANCE id.  Without it the receiver's stand-in is
+                    // created with "0 shift(s), station ''" — and the work shift is the ONLY thing that tells
+                    // the game which station a worker mans, so the till was never actually staffed on the
+                    // other machine and its customer AI had nothing to queue for.  That is why two players on
+                    // two tills still saw every customer at one register even after the gate, per-till and id
+                    // fixes: those got a stand-in created, this is what puts it BEHIND THE COUNTER.
+                    string myStationId = "";
+                    try { myStationId = reg.ItemInstance?.id ?? ""; } catch { }
+                    if (string.IsNullOrEmpty(myStationId))
+                        Plugin.Logger.LogWarning("[Register] personal duty: could not resolve the till's item-instance id — "
+                            + "the stand-in on other machines will have no shift and that till will not serve.");
+                    _dutyStationId = myStationId;   // item 7: OFF must retract the SAME identity
+                    // If this station was broadcast as EMPLOYEE-staffed (the
+                    // schedule query also matches the working owner), retract
+                    // that first — personal duty owns the till now.
+                    string myKey = RegKey(myStationId, _dutyPos);
+                    if (_empDuty.TryGetValue(myKey, out var ed))
+                    {
+                        SendToggle(ed.pos, false, employee: true, stationId: ed.stationId);
+                        _empDuty.Remove(myKey);
+                    }
+                    // Batch 11: live-read the address at commitment — the entry-hook context can
+                    // be empty (hook-skipping entry paths); the station itself names its building.
+                    string dutyAddr = CurrentShopAddress;
+                    if (string.IsNullOrEmpty(dutyAddr))
+                    {
+                        dutyAddr = ResolveAddressForStation(myStationId);
+                        if (!string.IsNullOrEmpty(dutyAddr))
+                            Plugin.Logger.LogInfo($"[Register] shop context was empty at duty-on — resolved '{dutyAddr}' from the station (batch 11).");
+                        else
+                            Plugin.Logger.LogWarning("[Register] duty-on with NO shop context and an unresolvable station — the host will drop this registration (batch 11).");
+                    }
+                    SendToggle(_dutyPos, true, address: string.IsNullOrEmpty(dutyAddr) ? null : dutyAddr, stationId: myStationId);
+                    // Worker-side price-table snapshot — cross-machine evidence
+                    // pairing for any future price dispute.
+                    try
+                    {
+                        var gi = SaveGameManager.Current;
+                        if (gi != null)
+                            foreach (var r in gi.BuildingRegistrations)
+                                if (r != null && GameStateReader.AddressKey(r) == CurrentShopAddress)
+                                { LogShopPrices(r, "[Register/prices]"); break; }
+                    }
+                    catch { }
+                }
+                else if (!working && _onDuty)
+                {
+                    _onDuty = false;
+                    SendToggle(_dutyPos, false, stationId: _dutyStationId);   // item 7: OFF carries the identity
+                    _dutyStationId = "";
+                }
+
+                // (employee-staffed stations now scanned by TickEmployeeDutySliced above — round-161)
+                // Round-164: the 60-70ms worst-frame survived the round-161 slice, so the real consumer
+                // is one of THESE five — sub-bracketed so the perf line names it instead of us guessing.
+                long _s1 = MPPerf.Begin(); TickStaffEvaluator();                           MPPerf.End("StaffEval",  _s1);
+                long _s2 = MPPerf.Begin(); TickRosterPublish();                            MPPerf.End("RosterPub",  _s2);
+                long _s3 = MPPerf.Begin(); TickRosterApply();                              MPPerf.End("RosterApp",  _s3);
+                long _s4 = MPPerf.Begin(); MPPatches.Patch_MPOrderFinalizer.TickPending(); MPPerf.End("OrderFin",   _s4);
+                long _s5 = MPPerf.Begin(); LogStaffDiagOwner();                            MPPerf.End("StaffDiag",  _s5);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Register] duty: {ex.Message}"); }
+        }
+
+        /// <summary>Is this register staffed by another player?  The duty map's ONE
+        /// consumer-facing question — gates the self-checkout routing and the queue
+        /// guard.  Field 150521: takes the STATION (identity), not its position.</summary>
+        public static bool IsStaffedByOtherPlayer(EmployeeStationController? station)
+            => TryFindCashierForStation(station, out var e) && e.playerId != MPConfig.PlayerId;
+
+        /// <summary>Field 150521 identity rule: match a LIVE station against the duty map by
+        /// the station's own registry key (same derivation both sides — item 7); a legacy
+        /// position-keyed entry must also name this station's building, because same-template
+        /// interiors in other buildings share these coordinates ("" address = sender never
+        /// knew it — accepted, cannot be disproved).</summary>
+        private static bool TryFindCashierForStation(EmployeeStationController? st,
+            out (string playerId, Vector3 pos, bool employee, string address, string stationId) e)
+        {
+            e = default;
+            if (st == null) return false;
+            // Review F2: the direct hit is identity-safe ONLY for a real "sid:" key — a station
+            // without an ItemInstance keys by rounded POSITION, and position keys collide across
+            // buildings (the very defect this change removes). Position matches must always go
+            // through the address-gated loop below.
+            string liveKey = RegKeyForStation(st);
+            if (liveKey.StartsWith("sid:", StringComparison.Ordinal) && _cashiers.TryGetValue(liveKey, out e)) return true;
+            string pk = Key(st.transform.position);
+            string addr = StationAddr(st);
+            foreach (var kv in _cashiers)
+            {
+                if (kv.Key.StartsWith("sid:", StringComparison.Ordinal)) continue;   // id-keyed — handled above
+                var v = kv.Value;
+                if (Key(v.pos) == pk && (string.IsNullOrEmpty(v.address) || v.address == addr)) { e = v; return true; }
+            }
+            e = default; return false;
+        }
+
+        /// <summary>Snapshot of the current duty posts, as ON payloads — for
+        /// re-syncing a (re)joining peer.  Duty is EVENT-tracked (broadcast only
+        /// when it changes via SendToggle), and a (re)connect runs Reset() during
+        /// the world reload, wiping the peer's map.  The reconnect resync re-sends
+        /// world/rivals/business but NOT duty, so a reconnected client saw staffed
+        /// tills as unstaffed ("no employees") until a toggle re-broadcast (field
+        /// bug 2026-06-13: host personally on the till, client reconnected mid-
+        /// session, couldn't buy until the host toggled off/on).  The host's map is
+        /// the authoritative union (it applies + relays every RegisterCashier).</summary>
+        public static List<RegisterCashierPayload> SnapshotDuty()
+        {
+            var list = new List<RegisterCashierPayload>();
+            foreach (var kv in _cashiers)
+            {
+                var e = kv.Value;
+                list.Add(new RegisterCashierPayload
+                {
+                    PlayerId = e.playerId, X = e.pos.x, Y = e.pos.y, Z = e.pos.z,
+                    On = true, Employee = e.employee, Address = e.address, StationId = e.stationId
+                });
+            }
+            return list;
+        }
+
+        private static void SendToggle(Vector3 pos, bool on, string? address = null,
+                                       bool employee = false, string stationId = "")
+        {
+            var p = new RegisterCashierPayload
+            {
+                PlayerId = MPConfig.PlayerId, X = pos.x, Y = pos.y, Z = pos.z, On = on,
+                Address = address ?? CurrentShopAddress,   // personal duty: worker is inside the shop
+                Employee = employee,
+                StationId = stationId
+            };
+            Apply(p);   // local echo first — instant feedback
+            var env = MessageEnvelope.Create(MessageType.RegisterCashier, MPConfig.PlayerId, p);
+            if (MPServer.IsRunning) MPServer.BroadcastAny(env);
+            else MPClient.SendEnvelope(env);
+        }
+
+        // ── Employee-staffed registers (user batch, 2026-06-12): a shop run by
+        // MY HIRED EMPLOYEES must be shoppable for visitors even when I'm not
+        // at the till.  Their machines can't simulate my employees (the
+        // staffing evaluator refuses rival-translated shops), so the OWNER's
+        // machine answers from DATA: every 5s, for each of my businesses, each
+        // checkout-station item instance, ask the game's own
+        // IsEmployeeStationEmployedAtHour and broadcast duty ON/OFF.  Visitors
+        // then buy through the same self-checkout + RemoteSale path.  KNOWN
+        // cosmetic gap: visitors see no cashier body at employee-run tills.
+        private static float _nextEmpScanAt;
+        private static readonly Dictionary<string, (Vector3 pos, string stationId)> _empDuty = new();   // RegKey → (pos, stationId) — item 7
+
+        // Round-161 — the 5s scan walked EVERY registration + every owned shop's schedules in ONE
+        // frame: 60-65ms worst-frame on a 28-business save, the recurring hitch both the field pair's
+        // machines and the rig felt.  Same work, same cadence, sliced: a sweep still starts every 5s,
+        // but processes registrations under a ~2ms/frame budget and commits the ON/OFF transitions
+        // when the sweep completes a few frames later — well inside the cadence, and transitions are
+        // computed against a coherent single-sweep snapshot exactly as before.
+        private static List<BuildingRegistration>? _empSweepRegs;
+        private static int _empSweepIx;
+        private static Dictionary<string, (Vector3 pos, string addr, string stationId)>? _empSweepLive;
+        private static readonly System.Diagnostics.Stopwatch _empSweepSw = new();
+
+        private static void TickEmployeeDutySliced()
+        {
+            try
+            {
+                if (_empSweepRegs == null)
+                {
+                    if (Time.unscaledTime < _nextEmpScanAt) return;
+                    _nextEmpScanAt = Time.unscaledTime + 5f;
+                    var gi = SaveGameManager.Current;
+                    if (gi?.BuildingRegistrations == null) return;
+                    _empSweepRegs = new List<BuildingRegistration>(gi.BuildingRegistrations);
+                    _empSweepIx   = 0;
+                    _empSweepLive = new Dictionary<string, (Vector3 pos, string addr, string stationId)>();
+                }
+                _empSweepSw.Restart();
+                var live = _empSweepLive!;
+                while (_empSweepIx < _empSweepRegs.Count)
+                {
+                    if (_empSweepSw.Elapsed.TotalMilliseconds > 2.0) return;   // budget spent — resume next frame
+                    var reg = _empSweepRegs[_empSweepIx++];
+                    if (reg == null) continue;
+                    bool mine; try { mine = MergerFlip.TrulyMine(reg); } catch { continue; }   // TrulyMine: no station/duty claims on flipped shops
+                    if (!mine || reg.itemInstances == null) continue;
+                    string addr = GameStateReader.AddressKey(reg);
+                    // Round-30 (WS2): stations are derived STRUCTURALLY from the schedule — any item
+                    // instance a work shift references IS a workstation. The old 3-name checkout whitelist
+                    // (checkoutcounterright/left, cashregister) silently missed every other station type —
+                    // shops staffed at non-checkout stations broadcast nothing and visitors saw no one
+                    // (StaffDiag's UNRECOGNIZED-till-like counter existed for exactly this suspicion).
+                    var stationIds = new HashSet<string>();
+                    try
+                    {
+                        if (reg.scheduleDays != null)
+                            foreach (var sd in reg.scheduleDays)
+                                if (sd?.workShifts != null)
+                                    foreach (var w in sd.workShifts)
+                                        if (w != null && !string.IsNullOrEmpty(w.itemInstanceId)
+                                            && !string.IsNullOrEmpty(w.employeeId)
+                                            // ROUND-123: never count OUR OWN stand-in as a hired employee.
+                                            // TryStaffSynthetic gives the stand-in a blanket 0-24h shift on the
+                                            // till so the game staffs it — and this scan reads the schedule
+                                            // structurally, so that shift looked exactly like a real hire.  The
+                                            // result was a FEEDBACK LOOP: a stand-in for player B's till made
+                                            // this machine broadcast the same till as EMPLOYEE-staffed under
+                                            // its own name, the other machine then injected a stand-in for THAT
+                                            // duty, and employee-duty stand-ins are not concealed — so a visible
+                                            // worker appeared standing on top of player B.  Field-confirmed:
+                                            // "[Register] 'melaus' ON duty at 952:1:-2 (employee)" four lines
+                                            // after a stand-in was injected for Client1 at 952.
+                                            && !IsSyntheticDuty(w.employeeId))
+                                            stationIds.Add(w.itemInstanceId);
+                    }
+                    catch { }
+                    foreach (var stationId in stationIds)
+                    {
+                        BigAmbitions.Items.ItemInstance? ii = null;
+                        try { reg.itemInstances.TryGetValue(stationId, out ii); } catch { }
+                        if (ii == null) continue;
+                        bool staffed = false;
+                        // CURRENT HOUR, not -1 (RED ROC reports, 2026-07-09): the native query does a plain
+                        // InRange(hour, shift) — hour -1 NEVER matches a shift, so this check was false for
+                        // every scheduled employee since the feature shipped (2026-06-12). Only the
+                        // owner-personally-working early-return could pass — employee-run shops never
+                        // broadcast duty, visitors never saw synthetic staff (their logs: synthetics=0,
+                        // dutyToggles=0, every register "unstaffed" at every hour).
+                        try { staffed = Helpers.EmployeeHelper.IsEmployeeStationEmployedAtHour(reg, stationId, SaveGameManager.Current.Hour); }
+                        catch { }
+                        if (!staffed) continue;
+                        var pos = new Vector3(ii.position.x, ii.position.y, ii.position.z);
+                        // The OWNER personally working reads as "employed" to the
+                        // schedule query — that's PERSONAL duty, not staff (user
+                        // saw a staff NPC spawn on top of their working avatar).
+                        if (_onDuty && RegKey(_dutyStationId, _dutyPos) == RegKey(stationId, pos)) continue;
+                        // H-STAFFBODY-1 fold F6 (2026-09-28): _onDuty covers registers only - the native schedule
+                        // query also reads "employed" for ANY station the owner stands at working (EmployeeHelper
+                        // GetEmployeeAtStationAndHour returns the player there first). Same exclusion, live-read.
+                        bool ownerWorksHere = false;
+                        try { ownerWorksHere = Helpers.PlayerHelper.IsPlayerWorkingInEmployeeStation(stationId); } catch { }
+                        if (ownerWorksHere) continue;
+                        live[RegKey(stationId, pos)] = (pos, addr, stationId);   // item 7: instance id is the identity
+                    }
+                }
+                // Newly staffed stations → ON; no-longer-staffed → OFF.
+                foreach (var kv in live)
+                    if (!_empDuty.ContainsKey(kv.Key))
+                    {
+                        _empDuty[kv.Key] = (kv.Value.pos, kv.Value.stationId);
+                        SendToggle(kv.Value.pos, true, kv.Value.addr, employee: true, stationId: kv.Value.stationId);
+#if BAMP_DEV
+                        Plugin.Logger.LogInfo($"[Register] employee-staffed station ON at {kv.Key} ({kv.Value.addr}).");   // round-187b: dev-only
+#endif
+                    }
+                var stale = new List<string>();
+                foreach (var kv in _empDuty)
+                    if (!live.ContainsKey(kv.Key)) stale.Add(kv.Key);
+                foreach (var k in stale)
+                {
+                    // Don't stomp PERSONAL duty at the same register.
+                    if (!(_onDuty && RegKey(_dutyStationId, _dutyPos) == k))
+                        SendToggle(_empDuty[k].pos, false, employee: true, stationId: _empDuty[k].stationId);   // item 7: OFF carries the identity
+                    _empDuty.Remove(k);
+#if BAMP_DEV
+                    Plugin.Logger.LogInfo($"[Register] employee-staffed station OFF at {k}.");   // round-187b: dev-only
+#endif
+                }
+                _empSweepRegs = null; _empSweepLive = null;   // sweep complete
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[Register] employee duty: {ex.Message}");
+                _empSweepRegs = null; _empSweepLive = null;   // abandon this sweep; the next starts fresh
+            }
+        }
+
+        // ── [StaffDiag] comprehensive staffing diagnostic (2026-06-25) ──────────────────────────────────
+        // Bug: a visitor entering another player's shop sees NO workers. The chain (TickEmployeeDuty detects a
+        // staffed till → broadcasts duty → visitor's Apply injects a BAMP_DUTY_ synthetic) logged ZERO activity
+        // in a report, so the OWNER's detection never fired — but the existing logs only fire on a successful
+        // ON-transition, so a "detected nothing" pass is invisible. This dumps the FULL staffing picture on
+        // BOTH sides so ONE report (with the partner's log, which the report tool already requests) pins the
+        // break whichever link failed. Release-safe + throttled. REMOVE once the no-workers root is found.
+        private static float _nextStaffDiagAt = -999f;
+
+        // One-line full snapshot of a shop's staffing — used by both the owner scan and the visitor entry dump.
+        // Covers every candidate root: ownership, recognized-vs-unrecognized checkout items, the game's
+        // IsEmployeeStationEmployedAtHour verdict per till, and the work-shift roster (synthetic vs real-present
+        // vs real-MISSING vs real-ORPHANED employees) + the current hour.
+        private static void DumpShopStaffing(BuildingRegistration reg, string addr, string tag, bool forced = false)
+        {
+            try
+            {
+                if (reg == null) return;
+                bool mine = false; try { mine = MergerFlip.TrulyMine(reg); } catch { }   // TrulyMine (merger flip excluded)
+                string bldgOwner = ""; string bizOwner = "";
+                try { bldgOwner = reg.buildingOwnerRivalId?.ToString() ?? ""; } catch { }
+                try { bizOwner  = reg.businessOwnerRivalId?.ToString() ?? ""; } catch { }
+                int hour = -1; try { hour = (int)GameStateReader.GetGameTime().hourOfDay; } catch { }
+
+                int nTills = 0, unrecognized = 0;
+                bool tillGap = false;   // a till reads unstaffed while a shift SHOULD cover this hour — the real anomaly
+                var tills = new System.Text.StringBuilder();
+                try
+                {
+                    if (reg.itemInstances != null)
+                        foreach (var kv in reg.itemInstances)
+                        {
+                            var ii = kv.Value; if (ii == null) continue;
+                            string n = ii.itemName ?? "";
+                            if (n == "ba:itemname_checkoutcounterright" || n == "ba:itemname_checkoutcounterleft" || n == "ba:itemname_cashregister")
+                            {
+                                nTills++;
+                                string sid = ii.id?.ToString() ?? "";
+                                // CURRENT HOUR, not -1 — see TickEmployeeDuty: -1 never matches a shift, so
+                                // this diag reported every register "unstaffed" regardless of the schedule.
+                                bool staffed = false; try { staffed = Helpers.EmployeeHelper.IsEmployeeStationEmployedAtHour(reg, sid, SaveGameManager.Current.Hour); } catch { }
+                                if (!staffed && StationHasShiftNow(reg, sid, hour)) tillGap = true;
+                                tills.Append($"{n.Replace("ba:itemname_", "")}={(staffed ? "STAFFED" : "unstaffed")} ");
+                            }
+                            else if (n.IndexOf("register", StringComparison.OrdinalIgnoreCase) >= 0
+                                  || n.IndexOf("checkout", StringComparison.OrdinalIgnoreCase) >= 0
+                                  || n.IndexOf("counter",  StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                unrecognized++;   // a till-like item NOT in the recognized set (root b)
+                                // 2026-07-09 (RED ROC review): the counter alone was unresolvable from a
+                                // report — the NAME says whether it's a real serving station the whitelist
+                                // misses (ticket booth?) or just furniture matching "counter". Once per type.
+                                if (_unrecognizedTillNames.Add(n))
+                                {
+                                    // Round-53b (KuyuSuyu review, 'counter2'): the NAME can't answer whether
+                                    // this is a staffable station the whitelist misses or plain furniture —
+                                    // the item's native TYPE FLAGS can (PointOfSale/EmployeeWorkstation =
+                                    // needs the whitelist; anything else = name-heuristic false positive).
+                                    string flags = "";
+                                    try { var it = BigAmbitions.Items.ItemsGetter.GetByName(n); flags = it == null ? "unknown-item" : it.type.ToString(); } catch { flags = "unreadable"; }
+                                    Plugin.Logger.LogWarning($"[StaffDiag] unrecognized till-like item type: '{n}' (first seen at '{addr}', native type flags: [{flags}])");
+                                }
+                            }
+                        }
+                }
+                catch { }
+
+                int shifts = 0, synth = 0, present = 0, missing = 0, orphan = 0;
+                try
+                {
+                    if (reg.scheduleDays != null)
+                        foreach (var sd in reg.scheduleDays)
+                        {
+                            if (sd?.workShifts == null) continue;
+                            foreach (var w in sd.workShifts)
+                            {
+                                if (w == null) continue;
+                                shifts++;
+                                string eid = w.employeeId ?? "";
+                                if (eid.StartsWith(SyntheticDutyEmployeeIdPrefix, StringComparison.Ordinal)) { synth++; continue; }
+                                if (!Helpers.EmployeeHelper.EmployeeInstancesDictionary.TryGetValue(eid, out var e) || e == null) { missing++; continue; }
+                                bool resolvable = false;
+                                try { resolvable = Helpers.BuildingHelper.GetBuildingRegistration(e.assignedAddress) != null; } catch { }
+                                if (resolvable) present++; else orphan++;
+                            }
+                        }
+                }
+                catch { }
+
+                // Any SCHEDULED station (office desk, factory bench, DJ booth…) with a shift due now but
+                // no employee working = the same gap class as a till (RED ROC "office staff not giving
+                // outputs", 2026-07-09 — offices have no till, so the old diag never looked at them).
+                int schedStations = 0, schedStaffedNow = 0; bool stationGap = false;
+                try
+                {
+                    var stationIds = new HashSet<string>();
+                    if (reg.scheduleDays != null)
+                        foreach (var sd in reg.scheduleDays)
+                            if (sd?.workShifts != null)
+                                foreach (var w in sd.workShifts)
+                                    if (w != null && !string.IsNullOrEmpty(w.itemInstanceId) && !string.IsNullOrEmpty(w.employeeId))
+                                        stationIds.Add(w.itemInstanceId);
+                    schedStations = stationIds.Count;
+                    foreach (var sid in stationIds)
+                    {
+                        bool st = false; try { st = Helpers.EmployeeHelper.IsEmployeeStationEmployedAtHour(reg, sid, SaveGameManager.Current.Hour); } catch { }
+                        if (st) schedStaffedNow++;
+                        else if (StationHasShiftNow(reg, sid, hour)) stationGap = true;
+                    }
+                }
+                catch { }
+
+                // Anomaly gate (2026-07-09, RED ROC report review): the hourly narrator buried real
+                // signal — a report carried 100+ healthy snapshots ("unstaffed at 10pm, no shift due" is
+                // EXPECTED). Speak only when the data contradicts itself: shift employees the roster
+                // can't resolve (MISSING), employees whose shop can't be resolved (ORPHAN), or any
+                // station unstaffed during an hour a shift SHOULD cover (tillGap/stationGap). Visitor-
+                // side entry dumps (forced=true) keep logging unconditionally — one line per entry is
+                // the cross-machine evidence pair and self-throttles by the entry event itself.
+                bool anomaly = missing > 0 || orphan > 0 || tillGap || stationGap;
+                if (!anomaly && !forced) return;
+                Plugin.Logger.LogWarning(
+                    $"{tag} '{addr}' mine={mine} bldgOwner='{bldgOwner}' bizOwner='{bizOwner}' h{hour} | tills={nTills} [{tills.ToString().Trim()}]"
+                    + $" stations={schedStations} staffedNow={schedStaffedNow}"
+                    + (tillGap ? " TILL-GAP(unstaffed with shift due)" : "")
+                    + (stationGap ? " STATION-GAP(scheduled station unstaffed with shift due)" : "")
+                    + (unrecognized > 0 ? $" +{unrecognized} UNRECOGNIZED-till-like" : "")
+                    + $" | shifts={shifts} (synthetic={synth} realPresent={present} realMISSING={missing} realORPHAN={orphan})");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"{tag} dump '{addr}': {ex.Message}"); }
+        }
+
+        private static readonly HashSet<string> _unrecognizedTillNames = new();
+        private static string _lastStaffSummary = "";
+        private static float _nextStaffSummaryHeartbeatAt;
+
+        // ── [EconProbe] midnight digest (approved diagnostics batch, 2026-07-09) ──────────────────
+        // One line per OWNED business per game-day, read straight from the native ledgers: yesterday's
+        // orderHistory entry (customers + revenue — what the game itself deposited) + today's customer-
+        // entry stats. Answers "my X isn't earning" from the report alone, offices and retail alike.
+        private static int _lastDigestDay = -1;
+
+        public static void TickEconDigest()
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return;
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                int day = gi.Day;
+                if (_lastDigestDay < 0) { _lastDigestDay = day; return; }   // arm on first sight
+                if (day == _lastDigestDay) return;
+                _lastDigestDay = day;
+
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    bool mine; try { mine = MergerFlip.TrulyMine(reg); } catch { continue; }
+                    if (!mine) continue;
+                    string biz = ""; try { biz = reg.businessTypeName ?? ""; } catch { }
+                    if (string.IsNullOrEmpty(biz) || biz == "ba:businesstype_empty") continue;
+
+                    int customers = -1; float revenue = -1f;
+                    try
+                    {
+                        if (reg.orderHistory != null)
+                            foreach (var h in reg.orderHistory)
+                                if (h != null && h.dayNumber == day - 1) { customers = h.totalCustomers; revenue = h.totalRevenue; break; }
+                    }
+                    catch { }
+                    var (entries, entriesDone) = CustomerEntrySync.EntryStatsFor(reg.Address);
+                    Plugin.Logger.LogInfo($"[EconProbe] day {day - 1} digest '{GameStateReader.AddressKey(reg)}' biz='{reg.BusinessName}' ({biz.Replace("ba:businesstype_", "")}): " +
+                                          $"customers={customers} revenue=${revenue:N0} todayEntries={entries}/{entriesDone}done" +
+                                          (customers == 0 || revenue == 0f ? "  ← EARNED NOTHING yesterday" : customers < 0 ? "  ← no ledger row for yesterday" : ""));
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[EconProbe] digest: {ex.Message}"); }
+        }
+
+        // ── Duty-broadcast activation summary (TEMPORARY probe, 2026-07-09) ───────────────────────
+        // The hour=-1 fix ACTIVATES schedule-driven duty broadcasting for the first time in the field —
+        // this watches the activation in both failure directions (all-zero while shops have shifts =
+        // the fix didn't take; runaway counts = over-fire). 10-min cadence while in MP. RETIRE after
+        // a couple of clean field sessions (probe lifecycle).
+        private static float _nextDutySummaryAt;
+
+        public static void TickDutySummary()
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return;
+                if (Time.unscaledTime < _nextDutySummaryAt) return;
+                _nextDutySummaryAt = Time.unscaledTime + 600f;
+
+                int shopsWithShifts = 0;
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations != null)
+                    foreach (var reg in gi.BuildingRegistrations)
+                    {
+                        if (reg == null) continue;
+                        bool mine; try { mine = MergerFlip.TrulyMine(reg); } catch { continue; }
+                        if (!mine || reg.scheduleDays == null) continue;
+                        foreach (var sd in reg.scheduleDays)
+                            if (sd?.workShifts != null && sd.workShifts.Count > 0) { shopsWithShifts++; break; }
+                    }
+                // ── [CrossOwner] probe (approved 2026-07-16): the load-time sweep
+                // (MPSaveIntegrity Class 6) cleans cross-owner assignments at
+                // world-ready and the known assign dropdowns are filtered, so an
+                // OWN employee sitting on a partner business MID-SESSION proves an
+                // unguarded producer we haven't found yet.  Names the record and
+                // timestamps the damage (ring log correlation); one line per
+                // employee per session.  Doubles as a permanent invariant tripwire
+                // — silence across field sessions = the dropdowns were the only
+                // holes.
+                try
+                {
+                    if (gi?.EmployeeInstances != null)
+                        foreach (var emp in gi.EmployeeInstances)
+                        {
+                            if (emp == null || emp.assignedAddress == null) continue;
+                            string eid = ""; try { eid = emp.id ?? ""; } catch { }
+                            if (eid.Length == 0 || eid.StartsWith(SyntheticDutyEmployeeIdPrefix)) continue;
+                            if (_injectedStaff.ContainsKey(eid) || _crossOwnerLogged.Contains(eid)) continue;
+                            BuildingRegistration? xreg = null;
+                            try { xreg = Helpers.BuildingHelper.GetBuildingRegistration(emp.assignedAddress); } catch { }
+                            if (!GameStatePatcher.IsForeignPlayerBusiness(xreg)) continue;
+                            _crossOwnerLogged.Add(eid);
+                            string en = ""; try { en = emp.characterData?.name ?? ""; } catch { }
+                            Plugin.Logger.LogWarning($"[CrossOwner] employee '{en}' ({eid}) is assigned to partner business '{xreg!.BusinessName}' MID-SESSION — an unguarded assign path still exists.");
+                        }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[CrossOwner] probe: {ex.Message}"); }
+
+                // Foreign-todo purge rides the same 10-min cadence (field 2026-07-20:
+                // the objectives panel alerted about another player's staff LIVE —
+                // the load-time sweep alone can't clear mid-session creations).
+                try { MPSaveIntegrity.PurgeForeignTodos("periodic"); } catch { }
+
+                if (shopsWithShifts == 0 && _empDuty.Count == 0 && _cashiers.Count == 0 && _synthetics.Count == 0) return;   // nothing to watch
+                Plugin.Logger.LogInfo($"[Register] duty summary (10m): empDutyOut={_empDuty.Count} dutyIn={_cashiers.Count} synthetics={_synthetics.Count} ownShopsWithShifts={shopsWithShifts}");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Register] duty summary: {ex.Message}"); }
+        }
+
+        /// <summary>Does any work shift reference this station for the CURRENT hour today? (The
+        /// "should be covered" half of the till-gap anomaly test.)</summary>
+        private static bool StationHasShiftNow(BuildingRegistration reg, string stationId, int hour)
+        {
+            try
+            {
+                if (hour < 0 || string.IsNullOrEmpty(stationId)) return false;
+                var today = Helpers.BuildingHelper.GetTodaySchedule(reg);
+                if (today?.workShifts == null) return false;
+                foreach (var w in today.workShifts)
+                    if (w != null && w.itemInstanceId == stationId
+                        && !string.IsNullOrEmpty(w.employeeId)
+                        && hour >= w.startingHour && hour < w.endingHour)
+                        return true;
+            }
+            catch { }
+            return false;
+        }
+
+        // OWNER side: every 60s, snapshot every shop the local player owns (the source of the duty broadcast).
+        // The SUMMARY line ALWAYS logs (even ownedShops=0) so its presence confirms the tick runs at all, and
+        // ownedShops=0 while the player owns shops = an ownership/RentedByPlayer gap (root c).
+        public static void LogStaffDiagOwner()
+        {
+            if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return;
+            if (Time.unscaledTime - _nextStaffDiagAt < 60f) return;
+            _nextStaffDiagAt = Time.unscaledTime;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                int owned = 0, ownedWithTill = 0;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    bool mine = false; try { mine = MergerFlip.TrulyMine(reg); } catch { }   // TrulyMine (merger flip excluded)
+                    if (!mine) continue;
+                    owned++;
+                    bool hasTill = false;
+                    try
+                    {
+                        if (reg.itemInstances != null)
+                            foreach (var kv in reg.itemInstances)
+                            {
+                                var n = kv.Value?.itemName ?? "";
+                                if (n == "ba:itemname_checkoutcounterright" || n == "ba:itemname_checkoutcounterleft" || n == "ba:itemname_cashregister") { hasTill = true; break; }
+                            }
+                    }
+                    catch { }
+                    // Offices/factories have no till but DO have scheduled stations — the old till-only
+                    // gate made "office staff not producing" invisible to every report (2026-07-09).
+                    bool hasScheduledStations = false;
+                    try
+                    {
+                        if (reg.scheduleDays != null)
+                            foreach (var sd in reg.scheduleDays)
+                                if (sd?.workShifts != null && sd.workShifts.Count > 0) { hasScheduledStations = true; break; }
+                    }
+                    catch { }
+                    if (!hasTill && !hasScheduledStations) continue;
+                    if (hasTill) ownedWithTill++;
+                    DumpShopStaffing(reg, GameStateReader.AddressKey(reg), "[StaffDiag/own]");   // anomaly-gated (2026-07-09)
+                }
+                // Summary: on CHANGE or as a 10-min heartbeat (was every 60s — a per-minute narrator).
+                // Its presence still proves the tick runs; ownedShops=0 while shops are owned = root c.
+                string summary = $"[StaffDiag/own] SUMMARY ownedShops={owned} withCheckout={ownedWithTill} synthetics={_synthetics.Count} dutyToggles={_cashiers.Count}";
+                if (summary != _lastStaffSummary || Time.unscaledTime >= _nextStaffSummaryHeartbeatAt)
+                {
+                    _lastStaffSummary = summary;
+                    _nextStaffSummaryHeartbeatAt = Time.unscaledTime + 600f;
+                    Plugin.Logger.LogWarning(summary);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffDiag/own] {ex.Message}"); }
+        }
+
+        // VISITOR side: on entering a shop (with a till) — dump what THIS machine has for it: the synced
+        // work-shifts + whether a duty toggle / synthetic arrived. Pairs with the owner dump to span the chain.
+        public static void LogStaffDiagOnEntry(BuildingRegistration reg, string addr)
+        {
+            try
+            {
+                if ((!MPServer.IsRunning && !MPClient.IsClientInWorld) || reg == null || string.IsNullOrEmpty(addr)) return;
+                bool hasTill = false;
+                try
+                {
+                    if (reg.itemInstances != null)
+                        foreach (var kv in reg.itemInstances)
+                        {
+                            var n = kv.Value?.itemName ?? "";
+                            if (n == "ba:itemname_checkoutcounterright" || n == "ba:itemname_checkoutcounterleft" || n == "ba:itemname_cashregister") { hasTill = true; break; }
+                        }
+                }
+                catch { }
+                if (!hasTill) return;   // not a till shop — irrelevant to the no-workers bug
+                bool synthHere = false;
+                try { foreach (var kv in _synthetics) if (kv.Value.addressKey == addr) { synthHere = true; break; } } catch { }
+                int togglesHere = 0; try { foreach (var kv in _cashiers) if (kv.Value.address == addr) togglesHere++; } catch { }
+                DumpShopStaffing(reg, addr, "[StaffDiag/visit]", forced: true);   // event-driven (one per entry) — keep unconditional
+                Plugin.Logger.LogWarning($"[StaffDiag/visit] '{addr}' synthetic-here={synthHere} duty-toggles-here={togglesHere}");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffDiag/visit] '{addr}': {ex.Message}"); }
+        }
+
+        /// <summary>The CURRENT shop's set price for an item (synced store
+        /// table — the only charge source that matters per user), or -1 when
+        /// the table has no entry.</summary>
+        public static float GetShopPrice(string itemName)
+            => GetShopPriceAt(CurrentShopAddress, itemName);
+
+        /// <summary>Same lookup for an arbitrary shop address key.</summary>
+        public static float GetShopPriceAt(string addressKey, string itemName)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null || string.IsNullOrEmpty(addressKey)) return -1f;
+                foreach (var r in gi.BuildingRegistrations)
+                {
+                    if (r == null || GameStateReader.AddressKey(r) != addressKey) continue;
+                    var prices = r.retailPrices;
+                    if (prices != null)
+                        for (int i = 0; i < prices.Count; i++)
+                        {
+                            var rp = prices[i];
+                            if (rp != null && rp.itemName == itemName) return rp.price;
+                        }
+                    return -1f;
+                }
+            }
+            catch { }
+            return -1f;
+        }
+
+        // ── Visible staff NPC (employee duty only; user ruling 2026-06-12) ────
+        // Receivers inject a real EmployeeInstance (game's own factory) into
+        // the roster + a blanket WorkShift on the station, force the staffing
+        // gate (the evaluator refuses rival-translated shops), and invoke the
+        // evaluator until the game spawns the serving NPC.  The NPC stays
+        // VISIBLE — it represents the owner's staff.  One synthetic per
+        // ADDRESS (v1; multi-station shops get one body).  Commerce never
+        // depends on this: self-checkout + RemoteSale run regardless.
+        // ROUND-120: keyed by STATION (rounded duty position), NOT by building.  It used to be one entry per
+        // ADDRESS, and TryStaffSynthetic's "already have one here?" guard therefore refused a second stand-in
+        // anywhere in the same shop — so with two players on two tills only the FIRST till was ever staffed on
+        // the other machines, and the simulator queued every customer at the one till it could see.  That was
+        // invisible while the feature only served employee-staffed shops (one stand-in per shop was enough).
+        private static readonly Dictionary<string, (string playerId, string addressKey, EmployeeInstance inst, Vector3 pos)> _synthetics = new();
+        private static float _nextEvalAt;
+
+        /// <summary>Is this station under EMPLOYEE duty (used by the staffing
+        /// gate override — personal duty must never force the gate).  Field 150521:
+        /// takes the station, matched by identity via TryFindCashierForStation.</summary>
+        public static bool IsEmployeeDutyStation(EmployeeStationController? station)
+            => TryFindCashierForStation(station, out var e) && e.employee;
+
+        /// <summary>Round-144 / field 150521 - true when THIS station is a till WE staffed with a
+        /// stand-in.  Scope guard for the ShouldUpdateEmployee ownership bypass (BusinessPatches):
+        /// only OUR stations get it.  Identity-first (was a bare position compare, which let a
+        /// same-coordinate station in a DIFFERENT building borrow the bypass); legacy position-
+        /// keyed records must also name this station's building.</summary>
+        internal static bool HasSyntheticFor(EmployeeStationController? st)
+        {
+            try
+            {
+                if (st == null) return false;
+                // Review F2: direct hit only for "sid:" keys — see TryFindCashierForStation.
+                string liveKey = RegKeyForStation(st);
+                if (liveKey.StartsWith("sid:", StringComparison.Ordinal) && _synthetics.ContainsKey(liveKey)) return true;
+                string pk = Key(st.transform.position);
+                string addr = StationAddr(st);
+                foreach (var kv in _synthetics)
+                {
+                    if (kv.Key.StartsWith("sid:", StringComparison.Ordinal)) continue;   // id-keyed — handled above
+                    // Exact address required (no empty tolerance): safe because TryStaffSynthetic
+                    // refuses an empty addressKey, so every record carries one.
+                    if (Key(kv.Value.pos) == pk && kv.Value.addressKey == addr) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        // ── H-STAFFBODY-1 (user-approved 2026-09-22): no hired-staff stand-in where the real staff are held ──
+        private static readonly HashSet<string> _noStandInLogged = new();   // addresses already said (once per shop per session)
+
+        /// <summary>H-STAFFBODY-1: does THIS machine hold the owner's real staff for the shop - roster copies we
+        /// injected for the address (present in the live roster) AND the owner's schedule applied here (at least
+        /// one shift in the registration's own days naming one of those copies)? Read from the records
+        /// themselves, never from a flag. MAIN THREAD (_injectedStaff and the schedule days are main-thread state).</summary>
+        internal static bool HoldsOwnerStaff(string addressKey, out int rosterCopies)
+        {
+            rosterCopies = 0;
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return false;
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return false;
+                var ids = LiveRosterCopyIds(addressKey);
+                rosterCopies = ids.Count;
+                if (ids.Count == 0) return false;
+                foreach (var r in gi.BuildingRegistrations)
+                {
+                    if (r == null || GameStateReader.AddressKey(r) != addressKey) continue;
+                    if (r.scheduleDays == null) return false;
+                    foreach (var sd in r.scheduleDays)
+                        if (sd?.workShifts != null)
+                            foreach (var w in sd.workShifts)
+                                if (w != null && !string.IsNullOrEmpty(w.employeeId) && ids.Contains(w.employeeId)) return true;
+                    return false;
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] holds-owner-staff '{addressKey}': {ex.Message}"); }
+            return false;
+        }
+
+        private static void NoteNoStandIn(string addressKey, int rosterCopies)
+        {
+            try
+            {
+                if (_noStandInLogged.Add(addressKey))
+                    Plugin.Logger.LogInfo($"[SynthStaff] '{addressKey}': no hired-staff stand-in - this machine holds the owner's roster ({rosterCopies}) and schedule; the game's own staff appear");
+            }
+            catch { }
+        }
+
+        /// <summary>H-STAFFBODY-1 fold: ids of the roster copies WE injected for the address that are still the
+        /// live records in the game's staff list. MAIN THREAD.</summary>
+        private static HashSet<string> LiveRosterCopyIds(string addressKey)
+        {
+            var ids = new HashSet<string>();
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return ids;
+                foreach (var kv in _injectedStaff)
+                {
+                    if (kv.Value.addr != addressKey || kv.Value.inst == null) continue;
+                    bool live = false;
+                    try { live = Helpers.EmployeeHelper.EmployeeInstancesDictionary.TryGetValue(kv.Key, out var li) && ReferenceEquals(li, kv.Value.inst); } catch { }
+                    if (live) ids.Add(kv.Key);
+                }
+            }
+            catch { }
+            return ids;
+        }
+
+        internal static int LiveRosterCopiesAt(string addressKey) => LiveRosterCopyIds(addressKey).Count;
+
+        /// <summary>H-STAFFBODY-1 fold F4 (2026-09-28): will THIS machine's own spawner put one of the owner's roster
+        /// copies at this station this hour? The game's own test (EmployeeHelper.GetEmployeeAtStationAndHour); when
+        /// our own stand-in's 0-24 shift is the one it hits, the same walk is repeated past stand-in shifts.
+        /// MAIN THREAD.</summary>
+        private static bool RosterCopyStaffsStation(BuildingRegistration reg, string stationId, int hour)
+        {
+            try
+            {
+                if (reg == null || string.IsNullOrEmpty(stationId)) return false;
+                EmployeeInstance? e = null;
+                try { e = Helpers.EmployeeHelper.GetEmployeeAtStationAndHour(reg, stationId, hour); } catch { }
+                if (e != null && !IsSyntheticDuty(e.id)) return IsInjectedStaff(e.id);
+                if (e == null) return false;
+                // The native walk stopped at our stand-in's shift: repeat it (EmployeeHelper.cs 407-434) past stand-ins.
+                var today = Helpers.BuildingHelper.GetTodaySchedule(reg);
+                if (today?.workShifts == null) return false;
+                foreach (var w in today.workShifts)
+                {
+                    if (w == null || w.itemInstanceId != stationId || IsSyntheticDuty(w.employeeId)) continue;
+                    if (hour < w.startingHour || hour > w.endingHour - 1) continue;
+                    if (w.employeeId == null) return false;
+                    var r = Helpers.EmployeeHelper.GetEmployeeById(w.employeeId, showError: false);
+                    return r != null && r.IsEmployeeAvailable() && IsInjectedStaff(r.id);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] reconcile stand-ins test '{stationId}': {ex.Message}"); }
+            return false;
+        }
+
+        /// <summary>H-STAFFBODY-1 fold: does the schedule WE hold name any real (non-stand-in) worker at this station
+        /// this hour? Used only to hold a stand-in back while the owner's OFF for an emptied station is in flight.</summary>
+        private static bool AnyRealShiftNow(BuildingRegistration reg, string stationId, int hour)
+        {
+            try
+            {
+                var today = Helpers.BuildingHelper.GetTodaySchedule(reg);
+                if (today?.workShifts == null) return false;
+                foreach (var w in today.workShifts)
+                    if (w != null && w.itemInstanceId == stationId && !string.IsNullOrEmpty(w.employeeId) && !IsSyntheticDuty(w.employeeId)
+                        && hour >= w.startingHour && hour < w.endingHour) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private static readonly HashSet<string> _standInPassLogged = new();   // "key|hour|verb" - one line per station per hour
+
+        private static void NoteStandInPass(string key, int hour, string verb, string addr)
+        {
+            try
+            {
+                if (_standInPassLogged.Count > 512) _standInPassLogged.Clear();
+                if (_standInPassLogged.Add(key + "|" + hour + "|" + verb))
+                    Plugin.Logger.LogInfo($"[SynthStaff] stand-in pass '{addr}' {key} hour {hour}: {verb}");
+            }
+            catch { }
+        }
+
+        /// <summary>H-STAFFBODY-1 folds F3/F4/F5 (2026-09-28): the recurring stand-in pass (after every roster apply,
+        /// 10 s). For every HIRED-staff duty entry that is not this player's, keep a BAMP_DUTY stand-in exactly when
+        /// this machine's own spawner will NOT put one of the owner's roster copies at that station this hour
+        /// (create or retire as needed). Never touches a PLAYER's stand-in (the key is held by _hideBodyAt) or a
+        /// stand-in made for a different player than the entry names (a hired ON that overwrote a player's entry).
+        /// Held back: no stand-in when the owner's schedule we hold names nobody at the station now (the owner's
+        /// OFF is on its way). MAIN THREAD (TickRosterApply).</summary>
+        private static void RetireRedundantStandIns()
+        {
+            try
+            {
+                if (_cashiers.IsEmpty) return;
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                int hour = gi.Hour;
+                var regByAddr = new Dictionary<string, BuildingRegistration?>();
+                var holdsByAddr = new Dictionary<string, bool>();
+                List<(string key, string addr)>? dead = null;
+                HashSet<string>? created = null;
+                foreach (var kv in _cashiers)
+                {
+                    var d = kv.Value;
+                    if (!d.employee || d.playerId == MPConfig.PlayerId || string.IsNullOrEmpty(d.address)) continue;
+                    if (_hideBodyAt.ContainsKey(kv.Key)) continue;                                  // F3: a player's stand-in holds this key
+                    try { if (!string.IsNullOrEmpty(d.stationId) && Helpers.PlayerHelper.IsPlayerWorkingInEmployeeStation(d.stationId)) continue; } catch { }   // re-check #2: this machine's player works it
+                    if (!regByAddr.TryGetValue(d.address, out var reg))
+                    {
+                        reg = null;
+                        foreach (var r in gi.BuildingRegistrations)
+                            if (r != null && GameStateReader.AddressKey(r) == d.address) { reg = r; break; }
+                        regByAddr[d.address] = reg;
+                    }
+                    if (reg == null) continue;
+                    if (MergerAbsence.SimulatesHere(d.address)) continue;                            // our records ARE the staff there
+                    bool real = RosterCopyStaffsStation(reg, d.stationId ?? "", hour);
+                    bool have = _synthetics.TryGetValue(kv.Key, out var s);
+                    if (real && have)
+                    {
+                        if (s.playerId != d.playerId) continue;                                     // F3: not this duty's stand-in
+                        (dead ??= new()).Add((kv.Key, d.address));
+                    }
+                    else if (!real && !have)
+                    {
+                        if (!holdsByAddr.TryGetValue(d.address, out bool holds)) { holds = HoldsOwnerStaff(d.address, out _); holdsByAddr[d.address] = holds; }
+                        if (holds && !AnyRealShiftNow(reg, d.stationId ?? "", hour)) continue;       // transient: the owner's OFF is due
+                        TryStaffSynthetic(d.address, d.playerId, d.stationId ?? "", d.pos);
+                        if (_synthetics.ContainsKey(kv.Key)) { NoteStandInPass(kv.Key, hour, "stand-in created (no roster copy staffs it here)", d.address); (created ??= new()).Add(d.address); }
+                    }
+                }
+                if (dead == null && created == null) return;
+                var prod = created ?? new HashSet<string>();
+                var goneIds = new HashSet<string>();
+                foreach (var (key, addr) in dead ?? new List<(string key, string addr)>())
+                {
+                    try { if (_synthetics.TryGetValue(key, out var s) && s.inst?.id != null) goneIds.Add(s.inst.id); } catch { }
+                    RemoveSynthetic(key); prod.Add(addr);
+                    NoteStandInPass(key, hour, "stand-in retired (a roster copy staffs it here)", addr);
+                }
+                // Standing inside: the retired stand-in's BODY goes now (F2 - its record is gone), then the stations
+                // re-evaluate so the real shift takes over at once (otherwise the native hourly pass picks it up).
+                try
+                {
+                    if (!string.IsNullOrEmpty(CurrentShopAddress) && prod.Contains(CurrentShopAddress))
+                    {
+                        var arr = GetStationsCached();
+                        if (arr != null)
+                        {
+                            foreach (var o in arr)
+                            {
+                                var st = o as EmployeeStationController;
+                                if (st == null) continue;
+                                try
+                                {
+                                    var body = st.employee;
+                                    string wid = st.employeeInstance?.id ?? body?.employeeInstance?.id ?? "";
+                                    if (body != null && !body.isPlayer && goneIds.Contains(wid)) st.UnassignEmployee();
+                                }
+                                catch { }
+                            }
+                            foreach (var o in arr)
+                                (o as EmployeeStationController)?.UpdateEmployee(false);
+                        }
+                    }
+                }
+                catch { }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] reconcile stand-ins: {ex.Message}"); }
+        }
+
+        /// <summary>H-STAFFBODY-1 fold F1 (2026-09-28): the station's current worker (a non-player body) can no longer
+        /// be trusted to hand over by itself on a machine where the shop is not the local player's: 1 = it is one of the
+        /// owner's roster copies (the native hourly update never runs there), 2 = its record is gone from the live
+        /// staff list (a retired stand-in or a removed copy). 0 = none of these.</summary>
+        internal static int StaleStationWorker(EmployeeStationController? st)
+        {
+            try
+            {
+                if (st == null) return 0;
+                var body = st.employee;
+                if (body == null || body.isPlayer) return 0;
+                var inst = body.employeeInstance ?? st.employeeInstance;
+                string id = inst?.id ?? "";
+                if (id.Length == 0) return 0;
+                if (IsInjectedStaff(id)) return 1;
+                bool live = false;
+                try { live = Helpers.EmployeeHelper.EmployeeInstancesDictionary.TryGetValue(id, out var li) && ReferenceEquals(li, inst); } catch { }
+                return live ? 0 : 2;
+            }
+            catch { return 0; }
+        }
+
+        /// <summary>H-STAFFBODY-1 readout (TestDrive 'staffbody'): stand-ins this machine keeps for the address.</summary>
+        internal static int StandInCountAt(string addressKey)
+        {
+            int n = 0;
+            try { foreach (var kv in _synthetics) if (kv.Value.addressKey == addressKey) n++; } catch { }
+            return n;
+        }
+
+        private static void TryStaffSynthetic(string addressKey, string playerId, string stationId, Vector3 dutyPos)
+        {
+            try
+            {
+                string stationKey = RegKey(stationId, dutyPos);   // item 7: stable identity → stable BAMP_DUTY id
+                if (string.IsNullOrEmpty(addressKey) || _synthetics.ContainsKey(stationKey)) return;
+                var gi = SaveGameManager.Current;
+                if (gi == null) return;
+
+                BuildingRegistration? reg = null;
+                foreach (var r in gi.BuildingRegistrations)
+                    if (r != null && GameStateReader.AddressKey(r) == addressKey) { reg = r; break; }
+                if (reg == null)
+                {
+                    Plugin.Logger.LogWarning($"[SynthStaff] no registration found for '{addressKey}' — cannot staff.");
+                    return;
+                }
+
+                var inst = Helpers.EmployeeHelper.CreateAIEmployeeInstance("ba:skill_customerservice");
+                if (inst == null) { Plugin.Logger.LogWarning("[SynthStaff] factory returned null."); return; }
+                // ROUND-121: the id MUST include the station.  It used to be player+address only, which was
+                // unique while the registry allowed one stand-in per shop.  Now that stand-ins are per TILL, a
+                // shop with several staffed stations produces several records with the SAME player and address
+                // — and the duplicate-guard below would delete each previous roster entry as the next was
+                // added, leaving one staffed till and two records pointing at instances no longer in the
+                // roster.  That is the very symptom the per-till re-key was meant to remove.
+                inst.id = $"{SyntheticDutyEmployeeIdPrefix}{playerId}_{addressKey.Replace(' ', '_')}_{stationKey}";
+                inst.hourlyWage = 0f;
+                inst.satisfaction = 100f;
+                inst.assignedAddress = new Address(reg.StreetName, reg.StreetNumber);
+                // REQUIRED: the AI-employee factory leaves characterData.name null, but this synthetic is added
+                // to gi.EmployeeInstances + EmployeeInstancesDictionary, which the game iterates. A null name
+                // throws ArgumentNullException in the phone Contacts list-build (ContactScrollerController
+                // .BuildEmployeeByNameLookup → ContainsKey(null)) and in EmployeeTooltip (name.Localize()) —
+                // breaking the Contacts app. Any non-empty name closes both. (2026-06-19 bug fix.)
+                inst.characterData.name = "On-Duty Staff";
+                // Also give it a sane adult age — the factory leaves ageInDays = 0, which reads as a newborn
+                // and skews the retirement-notice math in the daily employee tick. Use the game's own helper.
+                inst.characterData.ageInDays = Helpers.RecruitmentHelper.GetRandomEmployeeAgeInDays();
+
+                // Backstop against duplicate roster entries: a prior save could have
+                // persisted a synthetic with this same deterministic id before the
+                // load-boundary strip ran.  Drop any existing match before adding.
+                for (int i = gi.EmployeeInstances.Count - 1; i >= 0; i--)
+                    if (gi.EmployeeInstances[i]?.id == inst.id) gi.EmployeeInstances.RemoveAt(i);
+
+                gi.EmployeeInstances.Add(inst);
+                try { Helpers.EmployeeHelper.EmployeeInstancesDictionary[inst.id] = inst; } catch { }
+                _synthetics[stationKey] = (playerId, addressKey, inst, dutyPos);
+
+                int shifts = 0;
+                if (!string.IsNullOrEmpty(stationId) && reg.scheduleDays != null)
+                    for (int i = 0; i < reg.scheduleDays.Count; i++)
+                    {
+                        var day = reg.scheduleDays[i];
+                        if (day == null) continue;
+                        day.AddWorkShift(new WorkShift
+                        {
+                            startingHour   = 0,
+                            endingHour     = 24,
+                            employeeId     = inst.id,
+                            itemInstanceId = stationId,
+                            type           = WorkShiftType.Default,
+                        });
+                        shifts++;
+                    }
+                Plugin.Logger.LogInfo(
+                    $"[SynthStaff] staff NPC injected for '{playerId}' at '{addressKey}' " +
+                    $"({shifts} shift(s), station '{stationId}').");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] staff '{addressKey}': {ex}"); }
+        }
+
+        /// <summary>Duty went OFF at a station — remove the synthetic whose
+        /// duty position matches.</summary>
+        private static void RemoveSyntheticAtStation(string posKey)
+        {
+            RemoveSynthetic(posKey);   // round-120: the registry IS keyed by station now
+        }
+
+        private static void RemoveSynthetic(string stationKey)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(stationKey) || !_synthetics.TryGetValue(stationKey, out var s)) return;
+                _synthetics.Remove(stationKey);
+                string addressKey = s.addressKey;   // round-120: the rest of this method is address-scoped
+                // Freeze-correlation probe (2026-07-16): the record removal below makes
+                // the native engine despawn the serving NPC; if the LOCAL player is
+                // standing in this shop, that despawn is the suspected trigger for the
+                // stuck-selection freeze (see Patch_MouseController_ResetSelected_
+                // FreezeGuard).  One line so field logs pair trigger and guard.
+                try
+                {
+                    if (!string.IsNullOrEmpty(CurrentShopAddress) && CurrentShopAddress == addressKey)
+                        Plugin.Logger.LogInfo($"[SynthStaff] removing staff at '{addressKey}' while the local player is INSIDE — if a freeze follows, expect an [IoGuard] line next.");
+                }
+                catch { }
+                // A schedule auto-fill may be IN FLIGHT for this business on a background thread
+                // (ScheduleAutoFillerHelper: new Thread(FillWithEmployees)).  Native roster mutations
+                // abort it (fire → EmployeeInstance.RemoveEmployee → AbortAutoFillForBusiness); ours
+                // must too, or the filler keeps writing shifts for the id we sweep below — those
+                // become permanently orphaned ("New Text" field report, 2026-07-09).  Cheap no-op
+                // when nothing is running; null-guarded internally.
+                try
+                {
+                    var fillReg = Helpers.BuildingHelper.GetBuildingRegistration(s.inst.assignedAddress);
+                    if (fillReg != null) UI.Smartphone.Apps.BizMan.Schedule.BizManSchedule.AbortAutoFillForBusiness(fillReg);
+                }
+                catch { }
+                var gi = SaveGameManager.Current;
+                // H-SCHEDNULL-1 (2026-09-21): THE ORDER OF THE NEXT TWO BLOCKS MATTERS.  Our own strip runs
+                // FIRST, the native unassign second.  Native RemoveAllWorkShiftsThatMatchPredicate
+                // (ScheduleDay.cs:40-59) sets employeeId = null on every matching shift BEFORE dropping it
+                // from the day; an OPEN schedule page still holds that very WorkShift object in
+                // ScheduleHelper's cache, and a null id makes GetEmployeeColor throw ArgumentNullException
+                // inside WorkShiftSlider.SetUp (field bundle 20260920-154253, 15x).  Stripping first with
+                // day.RemoveWorkShift (which never nulls) leaves the native pass nothing to match, so it
+                // nulls nothing; the rest of its housekeeping (UnAssignWork, to-dos) still runs after it.
+                BuildingRegistration? strippedReg = null;
+                try
+                {
+                    if (gi?.BuildingRegistrations != null)
+                        foreach (var r in gi.BuildingRegistrations)
+                        {
+                            if (r == null || GameStateReader.AddressKey(r) != addressKey) continue;
+                            strippedReg = r;   // H-SCHEDNULL-1: captured BEFORE the unassign, which clears assignedAddress
+                            if (r.scheduleDays != null)
+                                for (int i = 0; i < r.scheduleDays.Count; i++)
+                                {
+                                    var day = r.scheduleDays[i];
+                                    if (day?.workShifts == null) continue;
+                                    var dead = new List<WorkShift>();
+                                    for (int j = 0; j < day.workShifts.Count; j++)
+                                    {
+                                        var w = day.workShifts[j];
+                                        if (w != null && w.employeeId == s.inst.id) dead.Add(w);
+                                    }
+                                    foreach (var w in dead) day.RemoveWorkShift(w);
+                                }
+                            break;
+                        }
+                }
+                catch (Exception sx) { Plugin.Logger.LogWarning($"[SynthStaff] shift strip: {sx.Message}"); }
+                try { Helpers.EmployeeHelper.UnassignEmployeeFromAllWorkshifts(s.inst); }
+                catch (Exception ux) { Plugin.Logger.LogWarning($"[SynthStaff] unassign: {ux.Message}"); }
+                SharedShopSchedule.NoteShiftsRemoved(strippedReg, "synthetic-retire");   // H-SCHEDNULL-1: an open page draws from the CACHE, not the day list
+                if (gi?.EmployeeInstances != null) gi.EmployeeInstances.Remove(s.inst);
+                try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(s.inst.id); } catch { }
+                try { var ev = MergerEmployeeSync.CountShiftsNaming(gi, s.inst.id); MergerEmployeeSync.LogStaffRemoval("synthetic-retire", s.inst.id, MergerEmployeeSync.StaffNameOf(s.inst), ev.shifts, ev.regs); } catch { }   // STAFF-EVIDENCE-1
+                Plugin.Logger.LogInfo($"[SynthStaff] staff NPC removed at '{addressKey}'.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] remove at station '{stationKey}': {ex.Message}"); }
+        }
+
+        /// <summary>Remove ORPHANED synthetic duty employees.
+        /// left in gi.EmployeeInstances by a prior save.  Synthetic staff are
+        /// runtime-only and tracked in _synthetics; after a load _synthetics is empty
+        /// but the deserialized copies remain in the roster, where they accumulate one
+        /// duplicate per save/load cycle and are unreachable for cleanup.  Run at the
+        /// world-ready load boundary, where no live serving NPC exists yet, so it is
+        /// safe to strip every such entry NOT currently tracked in _synthetics (the
+        /// live ones — e.g. injected during join quiesce — are kept).</summary>
+        public static int StripOrphanSyntheticEmployees(string when)
+        {
+            int removed = 0;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                var list = gi?.EmployeeInstances;
+                if (list == null) return 0;
+                var live = new HashSet<string>();
+                foreach (var kv in _synthetics)
+                    if (kv.Value.inst != null && !string.IsNullOrEmpty(kv.Value.inst.id)) live.Add(kv.Value.inst.id);
+                // WS3: injected roster records that leaked into a save have REAL ids (no prefix). Post-load
+                // the registry is empty, so detect them structurally: an employee assigned to a building the
+                // LOCAL player does not rent is not the local player's hire — the game never creates that.
+                // (Unresolvable addresses are SKIPPED — never strip on uncertainty.)
+                bool NotMyBuilding(EmployeeInstance? e)
+                {
+                    try
+                    {
+                        if (e?.assignedAddress == null) return false;
+                        var r = Helpers.BuildingHelper.GetBuildingRegistration(e.assignedAddress);
+                        return r != null && !r.RentedByPlayer;
+                    }
+                    catch { return false; }
+                }
+                var liveInjected = new HashSet<string>(_injectedStaff.Keys);
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    string id = list[i]?.id ?? "";
+                    bool synthetic = id.StartsWith(SyntheticDutyEmployeeIdPrefix);
+                    bool orphanInjected = !synthetic && !liveInjected.Contains(id) && NotMyBuilding(list[i]);
+                    if (orphanInjected)
+                    {
+                        // Records only — their shifts are the SYNCED schedule, not ours to strip.
+                        try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(id); } catch { }
+                        list.RemoveAt(i);
+                        removed++;
+                        Plugin.Logger.LogInfo($"[StaffRoster] orphan injected staff stripped ({when}): '{id}'.");
+                        continue;
+                    }
+                    if (!synthetic || live.Contains(id)) continue;
+                    // Strip this employee's work shifts from every registration first.
+                    try
+                    {
+                        if (gi!.BuildingRegistrations != null)
+                            foreach (var r in gi.BuildingRegistrations)
+                            {
+                                if (r?.scheduleDays == null) continue;
+                                for (int d = 0; d < r.scheduleDays.Count; d++)
+                                {
+                                    var day = r.scheduleDays[d];
+                                    if (day?.workShifts == null) continue;
+                                    var dead = new List<WorkShift>();
+                                    for (int j = 0; j < day.workShifts.Count; j++)
+                                        if (day.workShifts[j]?.employeeId == id) dead.Add(day.workShifts[j]);
+                                    foreach (var w in dead) day.RemoveWorkShift(w);
+                                }
+                            }
+                    }
+                    catch (Exception sx) { Plugin.Logger.LogWarning($"[SynthStaff] orphan shift strip ({when}): {sx.Message}"); }
+                    list.RemoveAt(i);
+                    try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(id); } catch { }
+                    removed++;
+                    Plugin.Logger.LogInfo($"[SynthStaff] orphan staff stripped ({when}): '{id}'.");
+                }
+
+                // Round-55 (Westi 2026-07-22): a native system that messaged the synthetic (the
+                // rival poach offer, pre-fix) left a persistent "On-Duty Staff" CONTACT thread in
+                // the save — contacts are keyed by character NAME and survive the employee strip.
+                // No legitimate contact ever carries our invented name; purge it.
+                try
+                {
+                    var contacts = gi?.Contacts;
+                    if (contacts != null)
+                    {
+                        int purged = contacts.RemoveAll(c => c != null && c.id == "On-Duty Staff");
+                        if (purged > 0)
+                            Plugin.Logger.LogInfo($"[SynthStaff] purged {purged} stale 'On-Duty Staff' contact thread(s) ({when}) — native message to a synthetic (round-55).");
+                    }
+                }
+                catch (Exception cx) { Plugin.Logger.LogWarning($"[SynthStaff] contact purge ({when}): {cx.Message}"); }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] orphan strip ({when}): {ex.Message}"); }
+            return removed;
+        }
+
+        /// <summary>NEGO-ORPHAN (user ruling 2026-09-12, re-cut after reviews r1/r2): the ONE test the live-session
+        /// strip and the `negotiations` verb share.  A salary negotiation EMBEDS a whole EmployeeInstance; before
+        /// commit 033e705 a negotiation opened for a PARTNER's person wrote that copy into this save.  The only
+        /// PROVENANCE this machine can be sure of is the registry: the person is an injected partner copy here
+        /// (IsInjectedStaff) or an injected partner candidate (CompanyCandidates.IsInjectedCandidate) - the very
+        /// test the save-time M4 block uses.  No list-based guess: an id in no list can also be native's own
+        /// lingering offer (a candidate that expired, a worker who quit or was fired - EmployeeHelper.cs:245/:260,
+        /// EmployeeInstance.cs:833 - none of which closes the negotiation, and ContactsApp :679-693 still lets the
+        /// player accept it), or a rival/poach negotiation whose target lives in no list by design.  Those stay.</summary>
+        internal static bool IsStrippableNegotiation(AI.Employees.SalaryNegotiation.CandidateSalaryNegotiation? n)
+        {
+            try
+            {
+                string eid = n?.employeeInstance?.id ?? "";
+                if (eid.Length == 0) return false;
+                return IsInjectedStaff(eid) || CompanyCandidates.IsInjectedCandidate(eid);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>LIVE-SESSION strip, the complement of the M4 block in StripSyntheticsForSave: that block keeps a
+        /// partner's copy out of every save (and puts the objects back after serialising, so the running session
+        /// still holds them); this one drops the same negotiations from the running session for good, the moment
+        /// a partner's copies have landed (the roster and bench applies), so a leaked OPEN offer can no longer be
+        /// acted on here (accepting it would mint a duplicate real record).  A save written before 033e705 is
+        /// therefore clean in memory as soon as that partner's people arrive, and clean on disk at the next save.
+        /// Value-based and idempotent: nothing to take = nothing logged.  Never runs off a session (the applies
+        /// do not).</summary>
+        public static int StripOrphanNegotiations(string when)
+        {
+            int n = 0;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) return 0;
+                var ids = new List<string>();
+                var negs = gi.candidateSalaryNegotiations;
+                if (negs != null)
+                    for (int i = negs.Count - 1; i >= 0; i--)
+                    {
+                        if (!IsStrippableNegotiation(negs[i])) continue;
+                        string nid = ""; try { nid = negs[i]?.employeeInstance?.id ?? ""; } catch { }
+                        ids.Add(nid.Length > 0 ? nid : "(no id)");
+                        negs.RemoveAt(i); n++;
+                    }
+                // Headhunter replacement data is NOT walked here (review r1): a replacement embeds a person built for
+                // the plan; the save-time M4 block strips the injected ones at every save.
+                if (n > 0)
+                {
+                    int cap = ids.Count > 12 ? 12 : ids.Count;
+                    string shown = string.Join(", ", ids.GetRange(0, cap).ToArray()) + (ids.Count > 12 ? ", ..." : "");
+                    Plugin.Logger.LogWarning($"[SynthStaff] stripped {n} partner-copy salary negotiation(s) at {when} - each named a "
+                                           + $"partner's person that is only a copy here (leaked into this save before 033e705; the save "
+                                           + $"cleaner drops them from disk, this drops them from the running session): {shown}");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] orphan negotiation strip ({when}): {ex.Message}"); }
+            return n;
+        }
+
+        /// <summary>REPAIR ("New Text" field report, 2026-07-09): remove WorkShifts whose employeeId
+        /// carries our BAMP_DUTY_ prefix but has NO matching employee record anywhere in the roster.
+        /// Creation vector: schedule auto-fill runs on a BACKGROUND thread (ScheduleAutoFillerHelper:
+        /// new Thread(FillWithEmployees)) with the business roster INCLUDING our synthetic (its
+        /// assignedAddress is the shop, so the BizMan employee query returns it); when duty ends
+        /// mid-fill, RemoveSynthetic sweeps the record + existing shifts but the filler then writes
+        /// NEW shifts for the dead id.  Every cleanup we had iterated EMPLOYEES — an id existing only
+        /// in shifts survived every sweep and serialized forever.  In the schedule UI such a shift
+        /// renders as "New Text" (WorkShiftSlider.UpdateState NREs before setting the label) and
+        /// cannot be removed (UpdateEmployeeAfterWorkShiftChange throws before the UI refresh).
+        /// The prefix is ours alone → zero-false-positive removal, any mode, any ownership.
+        /// DIAGNOSTIC (wide net, quiet logs): also LOGS — never removes — unresolvable REAL-id
+        /// shifts on the player's own businesses, in case field ghosts are not prefix-tagged
+        /// (would mean this diagnosis is wrong/partial; next report's log settles it).  Real-id
+        /// shifts on OTHER owners' businesses are the synced schedule — expected, not logged.</summary>
+        /// <summary>Real-id orphan count from the latest repair pass — consumed by
+        /// MPSaveIntegrity's sweep summary (detect-only class).</summary>
+        public static int LastRealIdOrphans;
+
+        /// <summary>STAFF-EVIDENCE-1 (B3): is this employee id one a PARTNER is known to hold?
+        /// The registries the mod actually keeps, all consulted here:
+        ///   • _injectedStaff — every roster copy AND every shared-bench copy (SharedShopStaff keeps no
+        ///     second cache of its own: its ApplyPool hands the bench straight to ApplySharedPool, which
+        ///     registers the copies HERE with addr "").
+        ///   • MergerAbsence.PromotedStaff — the absent-owner promoted registry.
+        ///   • _rosterByAddr — the latest roster each owner published for each address.
+        /// Detect-only: nothing is removed, moved or rewritten on either verdict.</summary>
+        /// <summary>True once ANY partner roster / bench / promoted record is held - before that PartnerKnownId cannot
+        /// know anybody and its 'unknown' verdict is provisional (world-ready always is).</summary>
+        private static bool RostersLoadedForClassification()
+        {
+            try
+            {
+                if (_injectedStaff.Count > 0) return true;
+                lock (_rosterByAddr) if (_rosterByAddr.Count > 0) return true;
+                try { foreach (var _ in MergerAbsence.PromotedStaff) return true; } catch { }
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool PartnerKnownId(string id)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(id)) return false;
+                if (_injectedStaff.ContainsKey(id)) return true;
+                try { foreach (var k in MergerAbsence.PromotedStaff) if (k == id) return true; } catch { }
+                lock (_rosterByAddr)
+                    foreach (var kv in _rosterByAddr)
+                    {
+                        var st = kv.Value.staff;
+                        if (st == null) continue;
+                        foreach (var s in st) if (s != null && s.Id == id) return true;
+                    }
+            }
+            catch { }
+            return false;
+        }
+
+        public static int RepairOrphanDutyShifts(string when)
+        {
+            int removed = 0, realIdOrphans = 0;
+            var orphanIds = new HashSet<string>();   // B3: distinct shift-employees, classified once each
+            var orphanClass = new Dictionary<string, bool>();   // review M1: PartnerKnownId once per distinct id, not per shift (this sweep runs at every save)
+            int orphanKnown = 0, orphanUnknown = 0;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return 0;
+                var known = new HashSet<string>();
+                if (gi.EmployeeInstances != null)
+                    foreach (var e in gi.EmployeeInstances)
+                        if (!string.IsNullOrEmpty(e?.id)) known.Add(e.id);
+                foreach (var r in gi.BuildingRegistrations)
+                {
+                    if (r?.scheduleDays == null) continue;
+                    bool mine = false; try { mine = r.RentedByPlayer; } catch { }
+                    for (int d = 0; d < r.scheduleDays.Count; d++)
+                    {
+                        var day = r.scheduleDays[d];
+                        if (day?.workShifts == null) continue;
+                        List<WorkShift>? dead = null;
+                        for (int j = 0; j < day.workShifts.Count; j++)
+                        {
+                            var w = day.workShifts[j];
+                            string id = w?.employeeId ?? "";
+                            if (string.IsNullOrEmpty(id) || known.Contains(id)) continue;
+                            if (id.StartsWith(SyntheticDutyEmployeeIdPrefix))
+                            {
+                                (dead ??= new List<WorkShift>()).Add(w!);
+                                Plugin.Logger.LogWarning($"[ScheduleRepair] orphan duty shift ({when}): '{id}' biz='{r.BusinessName}' station='{w!.itemInstanceId}' day={d} h{w.startingHour}-{w.endingHour} — removing.");
+                            }
+                            else if (mine)
+                            {
+                                // B3 CLASSIFICATION (detect-only): a shift naming an employee this game does
+                                // not hold is NORMAL when the id is one a partner holds — that is the
+                                // partner's schedule for the partner's staff.  'unknown' is the interesting
+                                // class.  trulyMine/rented are printed so double tenancy shows.
+                                if (!orphanClass.TryGetValue(id, out bool partnerKnown))
+                                {
+                                    partnerKnown = PartnerKnownId(id);
+                                    orphanClass[id] = partnerKnown;
+                                    if (orphanIds.Add(id)) { if (partnerKnown) orphanKnown++; else orphanUnknown++; }
+                                }
+                                if (realIdOrphans < 20)
+                                {
+                                    realIdOrphans++;
+                                    bool tmine = false; try { tmine = MergerFlip.TrulyMine(r); } catch { }
+                                    bool rented = false; try { rented = r.RentedByPlayer; } catch { }
+                                    Plugin.Logger.LogWarning($"[ScheduleDiag] REAL-ID ORPHAN shift ({when}): '{id}' biz='{r.BusinessName}' station='{w!.itemInstanceId}' day={d} h{w.startingHour}-{w.endingHour} — left in place. class={(partnerKnown ? "partner-known" : "unknown")} trulyMine={tmine} rented={rented}");
+                                }
+                            }
+                        }
+                        if (dead != null) { foreach (var w in dead) day.RemoveWorkShift(w); removed += dead.Count; }
+                    }
+                }
+                if (removed > 0 || realIdOrphans > 0)
+                    Plugin.Logger.LogWarning($"[ScheduleRepair] {when}: removed {removed} orphan duty shift(s); {realIdOrphans} real-id orphan(s) logged only."
+                                           + $" shift-employees x{orphanIds.Count} logged (partner-known {orphanKnown}, unknown {orphanUnknown})"
+                                           // Rig 2026-09-18: at world-ready no partner roster has arrived yet, so every id read 'unknown'
+                                           // (172 of 172). Say so - 'unknown' only means something once a roster is loaded.
+                                           + (RostersLoadedForClassification() ? "" : " - NO partner roster loaded yet: 'unknown' is provisional"));
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[ScheduleRepair] {when}: {ex.Message}"); }
+            LastRealIdOrphans = realIdOrphans;
+            return removed;
+        }
+
+        /// <summary>SAVE-path strip (anti-pattern Class 5): the synthetic register cashiers (BAMP_DUTY_*) and
+        /// their injected WorkShifts are MP-only runtime objects and must NOT be serialised into the .hsg —
+        /// they would leak into a single-player load, where the world-ready cleanup never runs.  Unlike
+        /// StripOrphanSyntheticEmployees, this removes ALL of them (live ones included), then RESTORES the exact
+        /// objects via the returned delegate so the live MP session is undisturbed (only the on-disk bytes are
+        /// clean).  Call the delegate AFTER serialization finishes (JoinSaveGameThreads) — NEVER before, since
+        /// mutating gi mid-serialise corrupts the save.  Safe to call on a save that has none (returns a no-op).</summary>
+        public static System.Action StripSyntheticsForSave(string when)
+        {
+            // Orphan duty shifts (id-only leftovers with no record) must never serialize — sweep
+            // them permanently before capturing the live synthetics (no restore for garbage).
+            try { RepairOrphanDutyShifts(when + "-save"); } catch { }
+            var removedEmployees = new List<EmployeeInstance>();
+            var removedShifts    = new List<(ScheduleDay day, WorkShift shift)>();
+            try
+            {
+                var gi   = SaveGameManager.Current;
+                var list = gi?.EmployeeInstances;
+                if (list == null) return () => { };
+                var injectedStripped = new List<string>();   // STAFF-EVIDENCE-1: ids taken out by the WS3 branch below
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    var emp = list[i];
+                    string id = emp?.id ?? "";
+                    // WS3: injected roster records (REAL ids, registry-tracked) are runtime-only exactly like
+                    // the synthetics — strip the RECORDS from the save (their shifts are the synced schedule
+                    // and stay; the ids simply read as missing to a single-player load, which is native-shaped).
+                    if (_injectedStaff.ContainsKey(id))
+                    {
+                        removedEmployees.Add(emp!);
+                        list.RemoveAt(i);
+                        try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(id); } catch { }
+                        injectedStripped.Add(id);   // STAFF-EVIDENCE-1
+                        continue;
+                    }
+                    if (!id.StartsWith(SyntheticDutyEmployeeIdPrefix)) continue;
+                    // Capture + strip this synthetic's work shifts from every registration.
+                    try
+                    {
+                        if (gi!.BuildingRegistrations != null)
+                            foreach (var r in gi.BuildingRegistrations)
+                            {
+                                if (r?.scheduleDays == null) continue;
+                                for (int d = 0; d < r.scheduleDays.Count; d++)
+                                {
+                                    var day = r.scheduleDays[d];
+                                    if (day?.workShifts == null) continue;
+                                    var dead = new List<WorkShift>();
+                                    for (int j = 0; j < day.workShifts.Count; j++)
+                                        if (day.workShifts[j]?.employeeId == id) dead.Add(day.workShifts[j]);
+                                    foreach (var w in dead) { removedShifts.Add((day, w)); day.RemoveWorkShift(w); }
+                                }
+                            }
+                    }
+                    catch (Exception sx) { Plugin.Logger.LogWarning($"[SynthStaff] save shift strip ({when}): {sx.Message}"); }
+                    removedEmployees.Add(emp!);
+                    list.RemoveAt(i);
+                    try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(id); } catch { }
+                }
+                // STAFF-EVIDENCE-1: the WS3 branch RESTORES these records after serialisation, so this is
+                // a once-per-session census with totals, not a per-save line.  Their shifts are the synced
+                // schedule and stay on purpose — the count is evidence, not a fault.
+                try
+                {
+                    if (injectedStripped.Count > 0 && MergerEmployeeSync.StaffEvidenceWanted("save-strip-injected"))   // review H1: once per session, decided BEFORE the walk
+                    {
+                        int evS = 0, evR = 0;
+                        foreach (var iid in injectedStripped)
+                        { var ev = MergerEmployeeSync.CountShiftsNaming(gi, iid); evS += ev.shifts; evR += ev.regs; }
+                        MergerEmployeeSync.LogStaffRemoval("save-strip-injected", $"{injectedStripped.Count} record(s)",
+                                                           "session total", evS, evR, "save-strip-injected");
+                    }
+                }
+                catch { }
+                if (removedEmployees.Count > 0)
+                    Plugin.Logger.LogInfo($"[SynthStaff] stripped {removedEmployees.Count} synthetic(s) for save ({when}); restore after serialize.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] save strip ({when}): {ex.Message}"); }
+
+            // MERGER PHASE 4b (PEOPLE) part 1, same choke point: a partner's CANDIDATE copies live in the
+            // OTHER list (gi.CandidateEmployeeInstances), which this loop never walks - they come out here
+            // and go back in the restore below, exactly as the injected employee records do.
+            var removedCandidates = CompanyCandidates.StripInjected("the save");
+
+            // M4 (found in the hands-on saves 2026-09-12), same choke point: an OPEN SALARY NEGOTIATION embeds the
+            // WHOLE EmployeeInstance (decompile AI.Employees.SalaryNegotiation/CandidateSalaryNegotiation.cs:18)
+            // and gi.candidateSalaryNegotiations (GameInstance.cs:187) is serialized - so a negotiation opened here
+            // for a partner's person wrote a full copy of THEIR employee into THIS .hsg. The exact objects come out
+            // and go back in the restore below, as the candidate and message copies do. Entities/
+            // HeadhunterReplacementData.cs:11 holds one too and rides gi.headhunterPlans (GameInstance.cs:220) into
+            // the save, so it is stripped the same way. (Employee.cs:23 and EmployeeStationController.cs:44 also
+            // hold one, but both are scene MonoBehaviours - nothing serializes them into the .hsg.)  Its LOAD-side
+            // complement is StripOrphanNegotiations above (the live-session strip, run when a partner's copies land):
+            // this block keeps a partner's copy out of every save
+            // written from here, that one takes out what a save older than 033e705 already carries.
+            var removedNegotiations = new List<AI.Employees.SalaryNegotiation.CandidateSalaryNegotiation>();
+            var removedReplacements = new List<(Buildings.Office.Headquarters.HeadhunterPlan Plan, Entities.HeadhunterReplacementData Data)>();
+            try
+            {
+                var gneg = SaveGameManager.Current;
+                var negs = gneg?.candidateSalaryNegotiations;
+                if (negs != null)
+                    for (int i = negs.Count - 1; i >= 0; i--)
+                    {
+                        string nid = ""; try { nid = negs[i]?.employeeInstance?.id ?? ""; } catch { }
+                        if (nid.Length == 0) continue;
+                        if (!_injectedStaff.ContainsKey(nid) && !CompanyCandidates.IsInjectedCandidate(nid)) continue;
+                        removedNegotiations.Add(negs[i]); negs.RemoveAt(i);
+                    }
+                if (gneg?.headhunterPlans != null)
+                    foreach (var plan in gneg.headhunterPlans)
+                    {
+                        var rl = plan?.headhunterReplacementDataList;
+                        if (rl == null) continue;
+                        for (int i = rl.Count - 1; i >= 0; i--)
+                        {
+                            string rid = ""; try { rid = rl[i]?.employeeInstance?.id ?? ""; } catch { }
+                            if (rid.Length == 0) continue;
+                            if (!_injectedStaff.ContainsKey(rid) && !CompanyCandidates.IsInjectedCandidate(rid)) continue;
+                            removedReplacements.Add((plan, rl[i])); rl.RemoveAt(i);
+                        }
+                    }
+            }
+            catch (Exception nx) { Plugin.Logger.LogWarning($"[SynthStaff] negotiation strip ({when}): {nx.Message}"); }
+            if (removedNegotiations.Count > 0 || removedReplacements.Count > 0)
+                Plugin.Logger.LogInfo($"[SynthStaff] stripped {removedNegotiations.Count} partner salary negotiation(s) + {removedReplacements.Count} headhunter replacement(s) for save ({when}); restore after serialize.");
+
+            // CROSS-HR-1b K1(c), the same choke point: an INSURANCE OFFER names its HR plan by id
+            // (Entities/HealthInsurancePlanOffer.hrManagerPlanId) and gi.healthInsurancePlanOffers rides the
+            // .hsg, so an offer minted here against a partner's SHADOW - by an older build, before the two
+            // guards in MPPatches closed that route - would write a partner's plan id into THIS save. The
+            // exact objects come out and go back in the restore below, as the negotiations do.
+            var removedInsuranceOffers = new List<Entities.HealthInsurancePlanOffer>();
+            try
+            {
+                var offers = SaveGameManager.Current?.healthInsurancePlanOffers;
+                if (offers != null)
+                    for (int i = offers.Count - 1; i >= 0; i--)
+                    {
+                        string oid = ""; try { oid = offers[i]?.hrManagerPlanId ?? ""; } catch { }
+                        if (oid.Length == 0 || !CompanyPlans.IsShadowHrPlanId(oid)) continue;
+                        removedInsuranceOffers.Add(offers[i]); offers.RemoveAt(i);
+                    }
+            }
+            catch (Exception ox) { Plugin.Logger.LogWarning($"[SynthStaff] insurance offer strip ({when}): {ox.Message}"); }
+            if (removedInsuranceOffers.Count > 0)
+                Plugin.Logger.LogInfo($"[SynthStaff] stripped {removedInsuranceOffers.Count} insurance offer(s) naming a partner's display copy for save ({when}); restore after serialize.");
+
+            // MERGER PHASE 4b (PEOPLE) P4, the same choke point: a partner's relayed MESSAGES are display
+            // copies too - they live in gi.Contacts, which nothing above walks - so they come out here and
+            // go back in the restore below. A .hsg never carries another member's phone.
+            var restoreMessages = CompanyMessages.StripForSave("the save");
+
+            // MIRROR-1 (2026-09-17), the same choke point: a co-member's MIRRORED objective-panel alerts
+            // are display copies of the OWNER's tasks and live in gi.TodoTasks, which nothing above walks.
+            // They come out here and go back in the restore below, exactly as the phone messages do - a
+            // .hsg written from this machine holds none of another member's alerts.
+            var restoreMirrors = TaskMirror.StripForSave(when);
+
+            // Restore delegate — re-add the EXACT objects after serialization completes (dup-guarded; the main
+            // thread is blocked through the save, so no tick can re-inject during the window, but be defensive).
+            return () =>
+            {
+                try
+                {
+                    // PHASE 5 / P8 (2026-09-12): the candidate and message restores come FIRST. They do not
+                    // touch gi.EmployeeInstances, so the employee guard below was silently swallowing them on
+                    // any save where that list was null — a stripped partner candidate or phone message would
+                    // then never go back. The guard stays for the employee/shift loops that do need it.
+                    CompanyCandidates.RestoreInjected(removedCandidates, "the save");
+                    restoreMessages();
+                    restoreMirrors();   // MIRROR-1: same P8 reason - it does not touch gi.EmployeeInstances
+                    // M4: the negotiations and headhunter replacements go back here for the same P8 reason - they
+                    // do not touch gi.EmployeeInstances, so the employee null-guard below must not swallow them.
+                    try
+                    {
+                        var gback = SaveGameManager.Current;
+                        if (gback?.candidateSalaryNegotiations != null)
+                            foreach (var n in removedNegotiations)
+                                if (n != null && !gback.candidateSalaryNegotiations.Contains(n)) gback.candidateSalaryNegotiations.Add(n);
+                        foreach (var rr in removedReplacements)
+                            if (rr.Plan?.headhunterReplacementDataList != null && rr.Data != null
+                                && !rr.Plan.headhunterReplacementDataList.Contains(rr.Data)) rr.Plan.headhunterReplacementDataList.Add(rr.Data);
+                        // CROSS-HR-1b K1(c): the stripped insurance offers go back the same way.
+                        var goff = gback?.healthInsurancePlanOffers;
+                        if (goff != null)
+                            foreach (var o in removedInsuranceOffers)
+                                if (o != null && !goff.Contains(o)) goff.Add(o);
+                    }
+                    catch (Exception nx) { Plugin.Logger.LogWarning($"[SynthStaff] negotiation restore ({when}): {nx.Message}"); }
+                    var gi = SaveGameManager.Current;
+                    if (gi?.EmployeeInstances == null) return;
+                    foreach (var emp in removedEmployees)
+                    {
+                        if (emp == null || string.IsNullOrEmpty(emp.id)) continue;
+                        bool exists = false;
+                        for (int i = 0; i < gi.EmployeeInstances.Count; i++)
+                            if (gi.EmployeeInstances[i]?.id == emp.id) { exists = true; break; }
+                        if (!exists) gi.EmployeeInstances.Add(emp);
+                        try { Helpers.EmployeeHelper.EmployeeInstancesDictionary[emp.id] = emp; } catch { }
+                    }
+                    foreach (var (day, shift) in removedShifts)
+                    {
+                        if (day?.workShifts == null || shift == null) continue;
+                        bool present = false;
+                        for (int j = 0; j < day.workShifts.Count; j++)
+                            if (ReferenceEquals(day.workShifts[j], shift)) { present = true; break; }
+                        if (!present) day.AddWorkShift(shift);
+                    }
+                    if (removedEmployees.Count > 0)
+                        Plugin.Logger.LogInfo($"[SynthStaff] restored {removedEmployees.Count} synthetic(s) after save ({when}).");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] save restore ({when}): {ex.Message}"); }
+            };
+        }
+
+        // ── WS3 (round-30): FULL STAFF-ROSTER SYNC ─────────────────────────────────────────────────────
+        // The synced schedule (BusinessSync) already names REAL employee ids per station+hour; the only
+        // thing other machines lack is the employee RECORDS those ids point to (gi.EmployeeInstances is
+        // per-save). Owners publish a compact roster per business (30s heartbeat, signature-gated, so any
+        // hire/fire/sickness reaches every machine within ~30s); receivers inject lightweight records with
+        // the REAL ids so the game's OWN staffing engine — with the [StaffEval] gate override extended to
+        // roster shops — spawns EVERY scheduled worker at the right station at the right hour, natively.
+        // Injected records are runtime-only: registry-tracked, removed on Reset, stripped at the save
+        // boundary, and orphan-swept after load via the not-my-building rule.
+
+        // received rosters: addr → (publisher, staff list, sig, appliedSig)
+        private static readonly Dictionary<string, (string pid, List<StaffInfo> staff, string sig)> _rosterByAddr = new();
+        private static readonly Dictionary<string, string> _rosterApplied = new();            // addr → sig actually injected
+        private static readonly Dictionary<string, (string addr, EmployeeInstance inst)> _injectedStaff = new();   // real-id records we injected
+        // Shared-shop slice 3: an owner's BENCH (hired, unassigned) arrives as real-id records with no business —
+        // addr "" in _injectedStaff. Their owner is remembered here (roster records resolve theirs via _rosterByAddr).
+        private static readonly Dictionary<string, string> _injectedOwner = new();            // employeeId → owner pid (bench records)
+        private static readonly Dictionary<string, HashSet<string>> _poolByOwner = new();     // owner pid → bench ids last applied
+        private static readonly Dictionary<string, float> _benchGrace = new();                // employeeId → when the bench stopped listing it (the roster may be about to claim it)
+        private static readonly HashSet<string> _localCollisionLogged = new();                 // CROSS-HR-2b: local-id collisions already said (once per id per process)
+        private const float BenchGraceSeconds = 12f;
+        private static readonly HashSet<string> _rosterNotSentLogged = new();   // CROSSHR-ROSTER-1: one line per address per session
+        private static readonly Dictionary<string, string> _rosterSigSent = new();            // owner side: addr → last published sig
+        private static readonly Dictionary<string, string> _rosterLogSig  = new();            // round-189: addr → last LOGGED membership (log speaks on hire/fire/rename only)
+        private static float _nextRosterPublishAt, _nextRosterApplyAt;
+
+        /// <summary>Does this machine hold a synced staff roster for the address? (Gate-override consumer.)</summary>
+        public static bool HasRosterFor(string addressKey)
+            => !string.IsNullOrEmpty(addressKey) && _rosterByAddr.ContainsKey(addressKey);
+
+        /// <summary>Is this employee id one WE injected from another player's roster? (Payroll-skip consumer:
+        /// the payroll skip is keyed on THIS — which is why injected records can carry the REAL wage for
+        /// display, slice 5 — and the fire route decides replica-vs-native on it.)</summary>
+        public static bool IsInjectedStaff(string employeeId)
+            => !string.IsNullOrEmpty(employeeId) && _injectedStaff.ContainsKey(employeeId);
+
+        /// <summary>Round-100: is this a synthetic duty stand-in ("On-Duty Staff", BAMP_DUTY_ ids)?
+        /// Synthetics are NEVER anyone's real staff — display/goal filters strip them
+        /// unconditionally (no merged-partner exemption; S7 field report: ten "On-Duty Staff"
+        /// rows in a business-less client's MyEmployees, one per staffed host shop).</summary>
+        public static bool IsSyntheticDuty(string employeeId)
+            => !string.IsNullOrEmpty(employeeId) && employeeId.StartsWith(SyntheticDutyEmployeeIdPrefix, StringComparison.Ordinal);   // Ordinal (review 2026-09-10): a per-employee 2 s-tick compare
+
+        /// <summary>World-health consumer (2026-07-09): how many partner-staff records are injected.</summary>
+        public static int InjectedCount => _injectedStaff.Count;
+
+        /// <summary>Slice 5: the shop an injected record belongs to ("" if not injected).</summary>
+        public static string InjectedAddrOf(string employeeId)
+            => !string.IsNullOrEmpty(employeeId) && _injectedStaff.TryGetValue(employeeId, out var v) ? v.addr : "";
+
+        /// <summary>Is this injected record a MERGED partner's employee? Injected records exist to
+        /// staff stations in OTHER players' shops — they are NOT the local player's employees, and
+        /// MyEmployees must not list them (RED ROC report, 2026-07-09: "many of my friend's customer
+        /// service employees are showing"). Under a merger they ARE ours by contract (slice 5) —
+        /// resolve the bench owner (M2 2026-09-12) or, failing that, the shop's roster publisher, and ask the
+        /// merger.</summary>
+        public static bool IsInjectedFromMergedPartner(string employeeId)
+        {
+            try
+            {
+                if (!_injectedStaff.TryGetValue(employeeId ?? "", out var v)) return false;
+                // M2 2026-09-12: the BENCH memory first. An unassigned copy has an EMPTY addr, so the roster
+                // lookup below answered false and the MyEmployees filters dropped a co-member's bench people.
+                // _injectedOwner is written by ApplySharedPool (:2145 update, :2168 new) and DemoteToBench (:2245).
+                if (_injectedOwner.TryGetValue(employeeId ?? "", out var benchOwner)
+                    && !string.IsNullOrEmpty(benchOwner) && MergerSync.IsMemberPid(benchOwner)) return true;
+                lock (_rosterByAddr)
+                    if (_rosterByAddr.TryGetValue(v.addr, out var r))
+                        return MergerSync.IsMemberPid(r.pid);
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>Slice 5: optimistic local removal of an injected record (routed fire) — the owner's
+        /// roster republish is the durable confirmation (or restores it if the op was lost).</summary>
+        public static void DropInjectedStaff(string employeeId) => RemoveInjectedStaff(employeeId);
+
+        /// <summary>Owner-side nudge after a routed employee op (merger fire, permission assign/unassign) — republish
+        /// this shop's roster NOW instead of waiting out the 30s heartbeat, INCLUDING when it has just become EMPTY.
+        /// Until 2026-08-22 this removed the sent-signature key, and the publish tick's "never had staff — nothing to
+        /// say" guard then suppressed an empty roster — right for a shop that never had staff, wrong for one whose
+        /// last employee was just fired or moved to the bench (every other machine kept a stale copy). A sentinel
+        /// signature keeps the key (the guard passes) while never matching a real signature (the publish is forced).</summary>
+        public static void ForceRosterRepublish(string addressKey)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return;
+                _rosterSigSent[addressKey] = "!force-republish!";   // can never equal a real RosterSig (ids|names|…;)
+                _nextRosterPublishAt = 0f;
+            }
+            catch { }
+        }
+
+        private static string RosterSig(List<StaffInfo> staff)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var s in staff)
+                sb.Append(s.Id).Append('|').Append(s.Name).Append('|').Append(s.Gender).Append('|').Append(s.Available)
+                  .Append('|').Append(s.Wage.ToString("F1", System.Globalization.CultureInfo.InvariantCulture))
+                  .Append('|').Append(s.Satisfaction.ToString("F0", System.Globalization.CultureInfo.InvariantCulture))
+                  .Append('|').Append(s.Skills != null ? string.Join(",", s.Skills) : "")
+                  // H-MERGERTRAIN-1: a training session that starts or ends changes nothing else on the record
+                  // (the skill only moves at the FINISH), so without these two the copies would never be told.
+                  .Append('|').Append(s.TrainingSkill).Append('|').Append(s.TrainingStartDay)
+                  // H-ROSTERTOOLTIP-1: a re-schedule moves only the hours, and a demand change moves nothing else either.
+                  .Append('|').Append(s.AssignedWeeklyHours).Append('|').Append(s.Demands != null ? string.Join(",", s.Demands) : "~")
+                  // fold: a re-schedule can move the days without moving the hours total.
+                  .Append('|').Append(s.AssignedWeeklyDays != null ? string.Join(",", s.AssignedWeeklyDays) : "~")
+                  .Append(';');
+            return sb.ToString();
+        }
+
+        // OWNER: publish each owned business's roster when it changes (and once at session start — the sig
+        // cache starts empty). An emptied roster (everyone fired) publishes too: empty sig ≠ old sig.
+        private static void TickRosterPublish()
+        {
+            if (Time.unscaledTime < _nextRosterPublishAt) return;
+            _nextRosterPublishAt = Time.unscaledTime + 30f;
+            if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null || gi.EmployeeInstances == null) return;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    bool mine; try { mine = MergerFlip.TrulyMine(reg); } catch { continue; }   // TrulyMine: never publish a partner shop roster
+                    if (!mine) continue;
+                    string addr = GameStateReader.AddressKey(reg);
+                    var staff = new List<StaffInfo>();
+                    foreach (var e in gi.EmployeeInstances)
+                    {
+                        if (e == null || string.IsNullOrEmpty(e.id)) continue;
+                        if (e.id.StartsWith(SyntheticDutyEmployeeIdPrefix, StringComparison.Ordinal)) continue;   // stand-ins aren't staff
+                        if (_injectedStaff.ContainsKey(e.id)) continue;                                            // never republish others' staff
+                        bool here = false;
+                        try { here = e.assignedAddress != null && e.assignedAddress.streetName == reg.StreetName && e.assignedAddress.streetNumber == reg.StreetNumber; } catch { }
+                        if (!here) continue;
+                        bool avail = true; try { avail = e.IsEmployeeAvailable(); } catch { }
+                        int gender = -1;   try { gender = (int)e.characterData.gender; } catch { }
+                        string nm = "";    try { nm = e.characterData?.name ?? ""; } catch { }
+                        var si = new StaffInfo { Id = e.id, Name = nm, Gender = gender, Available = avail };
+                        // Slice 5 display fidelity — a member's MyEmployees shows the partner's staff
+                        // with real numbers (their payroll skip is id-keyed; a real wage can't double-bill).
+                        try { si.Wage = e.hourlyWage; } catch { }
+                        try { si.Satisfaction = e.satisfaction; } catch { }
+                        try { si.AgeDays = e.characterData?.ageInDays ?? 0; } catch { }
+                        try { if (e.trainingSession != null) { si.TrainingSkill = e.trainingSession.skill ?? ""; si.TrainingStartDay = e.trainingSession.startDay; } } catch { }   // H-MERGERTRAIN-1
+                        FillTooltipFields(si, e);   // H-ROSTERTOOLTIP-1
+                        try
+                        {
+                            // characterData.skills is THE skill list (HasSkill/GetPrimarySkill read it;
+                            // EmployeeInstance.skills is a decoy — decompile-verified :211/:226).
+                            var skills = e.characterData?.skills;
+                            if (skills != null)
+                                foreach (var sk in skills)
+                                    if (sk != null && !string.IsNullOrEmpty(sk.name))
+                                        si.Skills.Add(sk.name + "=" + sk.value.ToString("F1", System.Globalization.CultureInfo.InvariantCulture));
+                        }
+                        catch { }
+                        staff.Add(si);
+                    }
+                    staff.Sort((a, b) => string.CompareOrdinal(a.Id, b.Id));
+                    string sig = RosterSig(staff);
+                    if (_rosterSigSent.TryGetValue(addr, out var prev) && prev == sig) continue;
+                    if (staff.Count == 0 && !_rosterSigSent.ContainsKey(addr)) continue;   // never had staff — nothing to say
+                    var p = new PlayerStaffRosterPayload { PlayerId = MPConfig.PlayerId, AddressKey = addr, Staff = staff };
+                    var env = MessageEnvelope.Create(MessageType.PlayerStaffRoster, MPConfig.PlayerId, p);
+                    bool sent = true;
+                    if (MPServer.IsRunning) MPServer.BroadcastAny(env); else sent = MPClient.SendEnvelope(env);
+                    if (!sent)
+                    {
+                        // CROSSHR-ROSTER-1 (2026-09-16): the mark used to be set BEFORE the send, so a roster the
+                        // client could not send yet (link not up) counted as sent for ever - a latch only a staff
+                        // change could clear. Unmarked, the next TickRosterPublish pass carries it.
+                        if (_rosterNotSentLogged.Add(addr))
+                            Plugin.Logger.LogInfo($"[StaffRoster] '{addr}' not sent yet - the link is not up; the next publish pass carries it.");
+                        continue;
+                    }
+                    _rosterSigSent[addr] = sig;
+                    // Round-189 (user call): the publish sig deliberately includes DRIFTING fields
+                    // (satisfaction, availability) so remote staff panels stay current — but that
+                    // made this line fire on every morale tick (1,407 'published' lines in one
+                    // field log).  The LOG speaks only when membership changes (hire/fire/rename);
+                    // the broadcast above is unchanged.
+                    var logSigSb = new System.Text.StringBuilder();
+                    foreach (var s in staff) logSigSb.Append(s.Id).Append('|').Append(s.Name).Append(';');
+                    string logSig = logSigSb.ToString();
+                    if (!_rosterLogSig.TryGetValue(addr, out var prevLog) || prevLog != logSig)
+                    {
+                        _rosterLogSig[addr] = logSig;
+                        Plugin.Logger.LogInfo($"[StaffRoster] published '{addr}': {staff.Count} staff (membership changed).");
+                    }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] publish: {ex.Message}"); }
+        }
+
+        /// <summary>Receiver: store an incoming roster (any thread) — injection happens on the main-thread
+        /// apply tick, which also retries addresses whose registration hasn't synced yet.</summary>
+        public static void ApplyRoster(PlayerStaffRosterPayload? p)
+        {
+            if (p == null || string.IsNullOrEmpty(p.AddressKey) || string.IsNullOrEmpty(p.PlayerId)) return;
+            if (p.PlayerId == MPConfig.PlayerId) return;   // own echo
+            var staff = p.Staff ?? new List<StaffInfo>();
+            staff.Sort((a, b) => string.CompareOrdinal(a.Id, b.Id));
+            lock (_rosterByAddr) { _rosterByAddr[p.AddressKey] = (p.PlayerId, staff, RosterSig(staff)); }
+            _nextRosterApplyAt = 0f;   // apply promptly
+        }
+
+        /// <summary>All rosters this machine knows (host: for the join replay).</summary>
+        public static List<PlayerStaffRosterPayload> SnapshotRosters()
+        {
+            var list = new List<PlayerStaffRosterPayload>();
+            try
+            {
+                lock (_rosterByAddr)
+                    foreach (var kv in _rosterByAddr)
+                        list.Add(new PlayerStaffRosterPayload { PlayerId = kv.Value.pid, AddressKey = kv.Key, Staff = kv.Value.staff });
+                // The host's OWN rosters aren't in _rosterByAddr — force a fresh publish sweep instead
+                // (cheap; the joiner gets them within the next 30s heartbeat, or instantly via this nudge).
+                // Re-seed rather than clear (2026-08-22): clearing dropped the keys the publish tick's
+                // "never had staff" guard tests, so every shop that was EMPTY at a join stopped publishing
+                // until it regained staff — and it could wipe a pending forced republish (the permission
+                // feature's ForceRosterRepublish sentinel) in the one frame before the tick consumed it.
+                foreach (var k in new List<string>(_rosterSigSent.Keys)) _rosterSigSent[k] = "!force-republish!";
+                _nextRosterPublishAt = 0f;
+            }
+            catch { }
+            return list;
+        }
+
+        /// <summary>S3 (review of 56f2a72, rig T-HIREDUP-20260927-221100): a record with this id is already in this save's
+        /// employee list. The lookup table alone can miss it (it may have named a company-candidate copy that has since
+        /// been dropped), and the inject below would then delete that record. MAIN THREAD.</summary>
+        private static bool ListedLocally(string id)
+        {
+            try
+            {
+                var l = SaveGameManager.Current?.EmployeeInstances;
+                if (l == null || string.IsNullOrEmpty(id)) return false;
+                foreach (var e in l) if (e != null && e.id == id) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>H-HIREDUP-1: the owner's roster names an id this save already holds and no adopt is pending.
+        /// A leftover company-candidate copy (ForgetCopyForAdopt) or an untagged candidate (the game's own
+        /// DiscardCandidate, which also ends a negotiation the local player has open, as declined) makes way:
+        /// true = removed, the caller injects the owner's record. A HIRED local record is kept (false; said once
+        /// per id). MAIN THREAD (TickRosterApply).</summary>
+        private static bool ResolveLocalCollision(GameInstance gi, string pid, StaffInfo s, string addr)
+        {
+            try
+            {
+                EmployeeInstance? le = null;
+                try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.TryGetValue(s.Id, out le); } catch { }
+                if (le == null) try { if (gi.EmployeeInstances != null) foreach (var e0 in gi.EmployeeInstances) if (e0 != null && e0.id == s.Id) { le = e0; break; } } catch { }   // re-check F3: judge the listed record when the lookup entry is gone
+                bool tagged = CompanyCandidates.IsInjectedCandidate(s.Id);
+                bool isCand = false; try { isCand = le != null && le.IsCandidate; } catch { }
+                bool inCand = false, inEmp = false;
+                try { if (gi.CandidateEmployeeInstances != null) foreach (var c in gi.CandidateEmployeeInstances) if (c != null && c.id == s.Id) { inCand = true; break; } } catch { }
+                try { if (gi.EmployeeInstances != null) foreach (var e in gi.EmployeeInstances) if (e != null && e.id == s.Id) { inEmp = true; break; } } catch { }
+                string localAddr = ""; try { if (le?.assignedAddress != null) localAddr = GameStateReader.AddressKey(le.assignedAddress) ?? ""; } catch { }
+                int dayHired = 0; try { dayHired = le?.dayHired ?? 0; } catch { }
+                string copyOwner = tagged ? CompanyCandidates.OwnerOfCandidate(s.Id) : CompanyCandidates.CopyOriginOwner(s.Id);
+                string origin = CompanyCandidates.CopyOriginOf(s.Id);
+                string kind = tagged ? "copy" : isCand ? "candidate" : "hired";
+                string head = $"[StaffRoster] '{pid}' employs '{s.Id}' ('{s.Name}') at '{addr}'; this save held a leftover {kind} (tagged={tagged} copyOwner='{copyOwner}' inCandList={inCand} inEmpList={inEmp} localAddr='{localAddr}' dayHired={dayHired} origin={origin})";
+                // S3 (review of 56f2a72): the lookup entry and the tag are not the whole story - gi.EmployeeInstances can hold a
+                // HIRED record with this id while the entry is a candidate / the id is tagged, and the caller's removal loop takes
+                // EVERY employee-list entry with the id. Such a record is kept unless it is a partner's display copy.
+                bool hiredListed = false;
+                if (inEmp && !IsInjectedStaff(s.Id))
+                    try
+                    {
+                        var hel = gi.EmployeeInstances;
+                        if (hel != null)
+                        foreach (var e in hel)
+                        {
+                            if (e == null || e.id != s.Id) continue;
+                            bool ec = true; try { ec = e.IsCandidate; } catch { }
+                            if (!ec) { hiredListed = true; break; }
+                        }
+                    }
+                    catch { }
+                if (hiredListed)
+                {
+                    if (_localCollisionLogged.Add(s.Id))
+                        Plugin.Logger.LogWarning(head + " - kept: this save's employee list holds a hired local record with that id (never deleted).");
+                    return false;
+                }
+                if (!tagged && !isCand)
+                {
+                    if (_localCollisionLogged.Add(s.Id))
+                        Plugin.Logger.LogWarning(head + " - kept: a hired local record is never shadowed.");
+                    return false;
+                }
+                if (tagged) CompanyCandidates.ForgetCopyForAdopt(s.Id);
+                else if (le != null)
+                {
+                    try { Helpers.EmployeeHelper.DiscardCandidate(le); }
+                    catch (Exception dx)
+                    {
+                        Plugin.Logger.LogWarning($"[StaffRoster] discard of the leftover candidate '{s.Id}' threw {dx.GetType().Name}: {dx.Message} - removed by hand.");
+                        try { gi.CandidateEmployeeInstances?.Remove(le); } catch { }
+                        try { if (Helpers.EmployeeHelper.EmployeeInstancesDictionary.TryGetValue(s.Id, out var dd) && ReferenceEquals(dd, le)) Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(s.Id); } catch { }
+                        CompanyCandidates.CloseNegotiations(s.Id, le);   // S5 (review of 56f2a72): the hand removal also closes its negotiation, as declined
+                    }
+                }
+                Plugin.Logger.LogWarning(head + " - owner's record wins, leftover discarded.");
+                return true;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] local collision on '{s?.Id}': {ex.GetType().Name}: {ex.Message} - left alone."); return false; }
+        }
+
+        // Receiver main-thread apply: inject/update/remove records so gi matches the synced rosters.
+        private static void TickRosterApply()
+        {
+            if (Time.unscaledTime < _nextRosterApplyAt) return;
+            _nextRosterApplyAt = Time.unscaledTime + 10f;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.EmployeeInstances == null || gi.BuildingRegistrations == null) return;
+                List<(string addr, (string pid, List<StaffInfo> staff, string sig) v)> pending = new();
+                lock (_rosterByAddr)
+                    foreach (var kv in _rosterByAddr)
+                        if (!_rosterApplied.TryGetValue(kv.Key, out var applied) || applied != kv.Value.sig)
+                            pending.Add((kv.Key, kv.Value));
+                foreach (var (addr, v) in pending)
+                {
+                    // P3-B (B3c): a shop THIS machine simulates for an absent owner holds REAL records
+                    // now (promoted out of the injected registry). A roster publish for it must not
+                    // re-inject display copies beside them — nobody but us is running that shop.
+                    if (MergerAbsence.SimulatesHere(addr)) continue;
+                    BuildingRegistration? reg = null;
+                    foreach (var r in gi.BuildingRegistrations)
+                        if (r != null && GameStateReader.AddressKey(r) == addr) { reg = r; break; }
+                    if (reg == null) continue;   // building not synced yet — retried next tick
+
+                    var want = new Dictionary<string, StaffInfo>();
+                    foreach (var s in v.staff) if (s != null && !string.IsNullOrEmpty(s.Id)) want[s.Id] = s;
+
+                    // Remove injected records for this address that left the roster (fired/moved). Shifts are
+                    // NOT touched — they're the synced schedule; a dangling id there just reads as missing.
+                    var gone = new List<string>();
+                    foreach (var kv in _injectedStaff)
+                        if (kv.Value.addr == addr && !want.ContainsKey(kv.Key)) gone.Add(kv.Key);
+                    foreach (var id in gone)
+                    {
+                        // Shared-shop slice 3: an owner's employee UNASSIGNED from this shop goes back to their bench
+                        // instead of vanishing (the bench republish, arriving right after, drops them if they really left).
+                        if (DemoteToBench(id, v.pid)) continue;
+                        RemoveInjectedStaff(id);
+                    }
+
+                    int added = 0, updated = 0;
+                    foreach (var s in want.Values)
+                    {
+                        if (_injectedStaff.TryGetValue(s.Id, out var have))
+                        {
+                            try
+                            {
+                                if (!string.IsNullOrEmpty(s.Name)) have.inst.characterData.name = s.Name;
+                                have.inst.isAbsent = !s.Available; have.inst.isReplaced = false;
+                                ApplyStaffFidelity(have.inst, s);   // slice 5: wage/skills/satisfaction stay current
+                                ApplyTooltipFields(have.inst, s);   // H-ROSTERTOOLTIP-1
+                                if (have.addr != addr)
+                                {
+                                    // Shared-shop slice 3: a bench record (or one from another shop) now works HERE —
+                                    // move the copy instead of leaving a stale "unassigned" record behind.
+                                    have.inst.assignedAddress = new Address(reg.StreetName, reg.StreetNumber);
+                                    _injectedStaff[s.Id] = (addr, have.inst);
+                                    _injectedOwner[s.Id] = v.pid;
+                                }
+                            }
+                            catch { }
+                            updated++;
+                            continue;
+                        }
+                        bool existsLocally = false;
+                        try { existsLocally = Helpers.EmployeeHelper.EmployeeInstancesDictionary.ContainsKey(s.Id) || ListedLocally(s.Id); } catch { }   // S3: the lookup table can miss a listed record
+                        if (existsLocally)
+                        {
+                            // Slice 5 adopt-confirm: the owner's roster carrying an id we have PENDING-ADOPT
+                            // means the record now lives in THEIR save — release our local original and fall
+                            // through to inject the display copy. Any other local-id collision keeps the
+                            // defensive skip (never shadow a genuinely local record).
+                            if (!MergerEmployeeSync.ConfirmAdopt(s.Id))
+                            {
+                                // H-HIREDUP-1 (user-approved 2026-09-27): split by what the local record IS. A leftover
+                                // company-candidate copy or an untagged candidate yields - the owner EMPLOYS this person
+                                // now - and the inject below runs; a HIRED local record keeps the CROSS-HR-2b skip (a
+                                // genuine local record is never shadowed).
+                                if (!ResolveLocalCollision(gi, v.pid, s, addr)) continue;
+                            }
+                            try
+                            {
+                                for (int i = gi.EmployeeInstances.Count - 1; i >= 0; i--)
+                                    if (gi.EmployeeInstances[i]?.id == s.Id) gi.EmployeeInstances.RemoveAt(i);
+                                Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(s.Id);
+                            }
+                            catch { }
+                        }
+                        var inst = Helpers.EmployeeHelper.CreateAIEmployeeInstance("ba:skill_customerservice");
+                        if (inst == null) continue;
+                        inst.id = s.Id;                       // REAL id — the synced shifts match it natively
+                        inst.hourlyWage = 0f;                 // overwritten by fidelity below when the wire carries it
+                        inst.satisfaction = 100f;
+                        inst.assignedAddress = new Address(reg.StreetName, reg.StreetNumber);
+                        inst.characterData.name = string.IsNullOrEmpty(s.Name) ? "Staff" : s.Name;
+                        inst.characterData.ageInDays = Helpers.RecruitmentHelper.GetRandomEmployeeAgeInDays();
+                        try { if (s.Gender >= 0) inst.characterData.gender = (BigAmbitions.Characters.Gender)s.Gender; } catch { }
+                        inst.isAbsent = !s.Available; inst.isReplaced = false;
+                        ApplyStaffFidelity(inst, s);          // slice 5: real wage/skills/satisfaction/age for display
+                        ApplyTooltipFields(inst, s);          // H-ROSTERTOOLTIP-1
+                        for (int i = gi.EmployeeInstances.Count - 1; i >= 0; i--)
+                            if (gi.EmployeeInstances[i]?.id == inst.id) gi.EmployeeInstances.RemoveAt(i);
+                        gi.EmployeeInstances.Add(inst);
+                        try { Helpers.EmployeeHelper.EmployeeInstancesDictionary[inst.id] = inst; } catch { }
+                        _injectedStaff[inst.id] = (addr, inst);
+                        added++;
+                    }
+                    _rosterApplied[addr] = v.sig;
+                    if (added + updated + gone.Count > 0)
+                        Plugin.Logger.LogInfo($"[StaffRoster] applied '{addr}': +{added} ~{updated} -{gone.Count} (total injected {_injectedStaff.Count}).");
+                    if (added > 0) StripOrphanNegotiations("roster-apply '" + addr + "'");   // NEGO-ORPHAN: a partner's copies just landed - their leaked negotiations go
+
+                    // If the local player is INSIDE this shop, prod every station to re-evaluate now
+                    // (otherwise the native hourly re-evaluation picks the changes up).
+                    try
+                    {
+                        if (CurrentShopAddress == addr)
+                        {
+                            var arr = GetStationsCached();   // round-186: registry, never a scene walk
+                            if (arr != null)
+                                foreach (var o in arr)
+                                    (o as EmployeeStationController)?.UpdateEmployee(false);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] apply: {ex.Message}"); }
+            RetireRedundantStandIns();   // H-STAFFBODY-1 (+ folds F3-F5): the per-station/hour stand-in pass; own try/catch; after the apply so fresh copies count
+        }
+
+        // ── Shared-shop slice 3 (the Business PERMISSION feature): an owner's BENCH on a helper's machine ──
+
+        /// <summary>Who published this injected record: the bench's owner, or the roster publisher of its shop. "" if unknown.</summary>
+        public static string OwnerOfInjected(string employeeId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(employeeId)) return "";
+                if (_injectedOwner.TryGetValue(employeeId, out var o) && !string.IsNullOrEmpty(o)) return o;
+                if (_injectedStaff.TryGetValue(employeeId, out var v) && v.addr.Length > 0)
+                    lock (_rosterByAddr) if (_rosterByAddr.TryGetValue(v.addr, out var r)) return r.pid ?? "";
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>An injected record sitting on its owner's bench (no business).</summary>
+        public static bool IsInjectedUnassigned(string employeeId)
+            => !string.IsNullOrEmpty(employeeId) && _injectedStaff.TryGetValue(employeeId, out var v) && v.addr.Length == 0;
+
+        /// <summary>The roster's wire row for one of MY employees (same fields the roster publish sends).</summary>
+        public static StaffInfo StaffInfoOf(EmployeeInstance e)
+        {
+            var si = new StaffInfo { Id = e.id };
+            try { si.Name = e.characterData?.name ?? ""; } catch { }
+            try { si.Gender = (int)e.characterData.gender; } catch { }
+            try { si.Available = e.IsEmployeeAvailable(); } catch { }
+            try { si.Wage = e.hourlyWage; } catch { }
+            try { si.Satisfaction = e.satisfaction; } catch { }
+            try { si.AgeDays = e.characterData?.ageInDays ?? 0; } catch { }
+            try { if (e.trainingSession != null) { si.TrainingSkill = e.trainingSession.skill ?? ""; si.TrainingStartDay = e.trainingSession.startDay; } } catch { }   // H-MERGERTRAIN-1
+            FillTooltipFields(si, e);   // H-ROSTERTOOLTIP-1
+            try
+            {
+                var skills = e.characterData?.skills;
+                if (skills != null)
+                    foreach (var sk in skills)
+                        if (sk != null && !string.IsNullOrEmpty(sk.name))
+                            si.Skills.Add(sk.name + "=" + sk.value.ToString("F1", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            catch { }
+            return si;
+        }
+
+        /// <summary>MAIN THREAD. Apply an owner's bench: inject/update real-id records with NO business. A bench record
+        /// the owner no longer lists is NOT dropped at once — the roster naming its new shop may be a moment behind
+        /// (the owner's own dropdown: bench republish first, roster sweep next) — it enters a short grace period and
+        /// SweepBenchGrace drops it if nothing claimed it. Records the roster already placed are left to the roster.
+        /// Returns true when anything changed.</summary>
+        public static bool ApplySharedPool(string ownerPid, List<StaffInfo> staff)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.EmployeeInstances == null || string.IsNullOrEmpty(ownerPid)) return false;
+                var want = new HashSet<string>();
+                foreach (var s in staff) if (s != null && !string.IsNullOrEmpty(s.Id)) want.Add(s.Id);
+                _poolByOwner.TryGetValue(ownerPid, out var prev); prev ??= new HashSet<string>();
+                int graced = 0, added = 0, updated = 0;
+                foreach (var id in prev)
+                {
+                    if (want.Contains(id)) { _benchGrace.Remove(id); continue; }
+                    if (!_injectedStaff.TryGetValue(id, out var v) || v.addr.Length > 0) continue;   // roster has it now
+                    if (!_benchGrace.ContainsKey(id)) { _benchGrace[id] = Time.unscaledTime; graced++; }
+                }
+                foreach (var s in staff)
+                {
+                    if (s == null || string.IsNullOrEmpty(s.Id)) continue;
+                    _benchGrace.Remove(s.Id);
+                    if (_injectedStaff.TryGetValue(s.Id, out var have))
+                    {
+                        if (have.addr.Length > 0) continue;   // the roster says they work somewhere — it wins
+                        try
+                        {
+                            if (!string.IsNullOrEmpty(s.Name)) have.inst.characterData.name = s.Name;
+                            have.inst.isAbsent = !s.Available; have.inst.isReplaced = false;
+                            ApplyStaffFidelity(have.inst, s);
+                            ApplyTooltipFields(have.inst, s);   // H-ROSTERTOOLTIP-1 (bench copy)
+                        }
+                        catch { }
+                        _injectedOwner[s.Id] = ownerPid;
+                        updated++;
+                        continue;
+                    }
+                    bool existsLocally = false;
+                    try { existsLocally = Helpers.EmployeeHelper.EmployeeInstancesDictionary.ContainsKey(s.Id) || ListedLocally(s.Id); } catch { }   // S3: the lookup table can miss a listed record
+                    if (existsLocally) continue;   // never shadow a real local record
+                    var inst = Helpers.EmployeeHelper.CreateAIEmployeeInstance("ba:skill_customerservice");
+                    if (inst == null) continue;
+                    inst.id = s.Id;
+                    inst.hourlyWage = 0f;
+                    inst.satisfaction = 100f;
+                    inst.assignedAddress = null;   // the bench
+                    inst.characterData.name = string.IsNullOrEmpty(s.Name) ? "Staff" : s.Name;
+                    inst.characterData.ageInDays = Helpers.RecruitmentHelper.GetRandomEmployeeAgeInDays();
+                    try { if (s.Gender >= 0) inst.characterData.gender = (BigAmbitions.Characters.Gender)s.Gender; } catch { }
+                    inst.isAbsent = !s.Available; inst.isReplaced = false;
+                    ApplyStaffFidelity(inst, s);
+                    ApplyTooltipFields(inst, s);   // H-ROSTERTOOLTIP-1 (bench copy)
+                    for (int i = gi.EmployeeInstances.Count - 1; i >= 0; i--)   // same de-dup as the roster path: never two list entries for one id
+                        if (gi.EmployeeInstances[i]?.id == inst.id) gi.EmployeeInstances.RemoveAt(i);
+                    gi.EmployeeInstances.Add(inst);
+                    try { Helpers.EmployeeHelper.EmployeeInstancesDictionary[inst.id] = inst; } catch { }
+                    _injectedStaff[inst.id] = ("", inst);
+                    _injectedOwner[inst.id] = ownerPid;
+                    added++;
+                }
+                _poolByOwner[ownerPid] = want;
+                if (added + updated + graced > 0)
+                    Plugin.Logger.LogInfo($"[SharedShop] bench of '{ownerPid}' applied: +{added} ~{updated} (no longer listed: {graced}) — they can be placed in that owner's shared shops.");
+                if (added > 0) StripOrphanNegotiations("bench-apply '" + ownerPid + "'");   // NEGO-ORPHAN: bench copies landed - their leaked negotiations go
+                return added + updated > 0;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SharedShop] ApplySharedPool: {ex.Message}"); return false; }
+        }
+
+        /// <summary>MAIN THREAD (SharedShopStaff's scan): drop bench records the owner stopped listing a while ago that no
+        /// roster claimed meanwhile and that were not assigned here. Returns the number dropped.</summary>
+        public static int SweepBenchGrace()
+        {
+            int dropped = 0;
+            try
+            {
+                if (_benchGrace.Count == 0) return 0;
+                var due = new List<string>();
+                foreach (var kv in _benchGrace) if (Time.unscaledTime - kv.Value >= BenchGraceSeconds) due.Add(kv.Key);
+                foreach (var id in due)
+                {
+                    if (!_injectedStaff.TryGetValue(id, out var v) || v.addr.Length > 0) { _benchGrace.Remove(id); continue; }   // gone, or the roster claimed it
+                    // Assigned here with the routed edit still in flight: keep the grace entry and look again next sweep —
+                    // the owner's answer moves the copy (roster) or lists it (bench); if no answer ever comes, the scan's
+                    // give-up reverts the address and the record is dropped here.
+                    if (v.inst?.assignedAddress != null) continue;
+                    _benchGrace.Remove(id);
+                    string owner = OwnerOfInjected(id);
+                    if (_poolByOwner.TryGetValue(owner, out var pool) && pool.Contains(id)) continue;   // listed again meanwhile
+                    RemoveInjectedStaff(id); dropped++;
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SharedShop] bench sweep: {ex.Message}"); }
+            return dropped;
+        }
+
+        /// <summary>Disconnect: every bench record leaves with the link (roster records keep their own lifecycle).</summary>
+        public static void DropBenchRecords(string why)
+        {
+            try
+            {
+                var ids = new List<string>();
+                foreach (var kv in _injectedStaff) if (kv.Value.addr.Length == 0) ids.Add(kv.Key);
+                foreach (var id in ids) RemoveInjectedStaff(id);
+                _poolByOwner.Clear(); _benchGrace.Clear();
+                if (ids.Count > 0) Plugin.Logger.LogInfo($"[SharedShop] dropped {ids.Count} bench record(s) ({why}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SharedShop] DropBenchRecords: {ex.Message}"); }
+        }
+
+        /// <summary>DISSOLVE (2026-09-12): every owner pid that has an injected copy standing here.</summary>
+        internal static List<string> InjectedOwners()
+        {
+            var owners = new List<string>();
+            try
+            {
+                foreach (var id in _injectedStaff.Keys)
+                {
+                    string o = OwnerOfInjected(id) ?? "";
+                    if (o.Length > 0 && !owners.Contains(o)) owners.Add(o);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SharedShop] InjectedOwners: {ex.Message}"); }
+            return owners;
+        }
+
+        /// <summary>DISSOLVE (2026-09-12, narrowed after rig T-DISSOLVE run 2): drop every BENCH copy (an injected
+        /// record with no address) whose owner is one of <paramref name="owners"/> - an EMPTY set meaning every
+        /// bench copy, whoever owns it - and forget that owner's published bench so a later republish cannot
+        /// bring them back. ROSTER copies (a partner's shop staff, addressed) are NOT touched: they are the
+        /// world's staffing for that player's shops, merger or no merger, and the feed owns their lifecycle.
+        /// The grants that justified a bench are removed at accept and never come back, so an ex-partner's
+        /// bench copy has no reason to stay. Value-based: with nothing benched it counts 0 and writes
+        /// nothing. Returns how many (would) go.</summary>
+        internal static int DropBenchForOwners(HashSet<string> owners, bool apply, string why)
+        {
+            int n = 0;
+            try
+            {
+                if (owners == null) return 0;
+                var kill = new List<string>();
+                foreach (var kv in _injectedStaff)
+                {
+                    if (kv.Value.addr.Length > 0) continue;   // a roster copy staffs a partner's shop: not ours to drop
+                    string o = OwnerOfInjected(kv.Key) ?? "";
+                    if (owners.Count != 0 && !owners.Contains(o)) continue;
+                    // DISSOLVE fold c: with the EMPTY set ("anyone who is not me") a plain GRANTEE's bench is
+                    // legitimate - it stands on a direct Business grant, not on a company - so it stays.
+                    if (owners.Count == 0 && GrantSync.IsGrantedDirect(GrantKind.Business, o, MPConfig.PlayerId)) continue;
+                    kill.Add(kv.Key);
+                }
+                n = kill.Count;
+                if (!apply || n == 0) return n;
+                foreach (var id in kill) { RemoveInjectedStaff(id); _benchGrace.Remove(id); }
+                var pools = new List<string>();
+                foreach (var kv in _poolByOwner)
+                    if (owners.Count == 0 ? !GrantSync.IsGrantedDirect(GrantKind.Business, kv.Key, MPConfig.PlayerId)
+                                          : owners.Contains(kv.Key)) pools.Add(kv.Key);
+                foreach (var o in pools) _poolByOwner.Remove(o);
+                Plugin.Logger.LogInfo($"[SharedShop] dropped {n} bench {(n == 1 ? "copy" : "copies")} of {(owners.Count == 0 ? "every partner" : owners.Count + " ex-partner(s)")} ({why}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[SharedShop] DropBenchForOwners: {ex.Message}"); }
+            return n;
+        }
+
+        private static BuildingRegistration? RegOfKey(string addressKey)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return null;
+                var regs = SaveGameManager.Current?.BuildingRegistrations;
+                if (regs == null) return null;
+                foreach (var r in regs) if (r != null && GameStateReader.AddressKey(r) == addressKey) return r;
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>Roster apply: an owner's employee left a shop. If that owner directly shares shops with me, the copy
+        /// goes back to the bench (no business) instead of being destroyed — the bench republish that follows keeps or
+        /// drops it (via the grace sweep), and an open detail panel keeps a live object. True = handled.</summary>
+        private static bool DemoteToBench(string id, string ownerPid)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(ownerPid) || !GrantSync.IsGranted(GrantKind.Business, ownerPid, MPConfig.PlayerId)) return false;   // M2 2026-09-12: the union — a co-member's person goes to the bench too
+                if (!_injectedStaff.TryGetValue(id, out var have) || have.inst == null) return false;
+                try { var fillReg = RegOfKey(have.addr); if (fillReg != null) UI.Smartphone.Apps.BizMan.Schedule.BizManSchedule.AbortAutoFillForBusiness(fillReg); } catch { }
+                have.inst.assignedAddress = null;
+                _injectedStaff[id] = ("", have.inst);
+                _injectedOwner[id] = ownerPid;
+                if (!(_poolByOwner.TryGetValue(ownerPid, out var pool) && pool.Contains(id))) _benchGrace[id] = Time.unscaledTime;   // not (yet) on the published bench — grace, then sweep
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Shared-shop slice 3: the owner's bench changed — publish the roster sweep in the same frame too, so a
+        /// copy never sits "unlisted" on a helper's machine for the sweep's 30 s.</summary>
+        public static void NudgeRosterPublish() { _nextRosterPublishAt = 0f; }
+
+        /// <summary>Slice 5: apply the wire's display-fidelity fields to an injected record. Wage is
+        /// safe to be real — the payroll skip keys on the injected-id registry, not on wage 0. Skills
+        /// replace the placeholder so MyEmployees/BizMan show the partner staff's true role/levels.</summary>
+        /// <summary>H-ROSTERTOOLTIP-1, OWNER side: the tooltip's demands and weekly hours, read exactly as the transfer
+        /// record reads them (MergerEmployeeSync.RecordOf: e.demands, e.assignedWeeklyHours).</summary>
+        internal static void FillTooltipFields(StaffInfo si, EmployeeInstance e)
+        {
+            try { si.Demands = e.demands != null ? new List<string>(e.demands) : new List<string>(); } catch { }
+            try { si.AssignedWeeklyHours = e.assignedWeeklyHours; } catch { }
+            // fold: the weekly days (as MergerEmployeeSync.RecordOf reads them) - the demand ticks need them.
+            try { var wd = new List<int>(); if (e.assignedWeeklyDays != null) foreach (var d in e.assignedWeeklyDays) wd.Add((int)d); si.AssignedWeeklyDays = wd; } catch { }
+        }
+
+        /// <summary>H-ROSTERTOOLTIP-1, PARTNER side: put the owner's demands and weekly hours on a DISPLAY copy, as the
+        /// transfer apply does (MergerEmployeeSync :1092 demands clear+add when sent, :1140 assignedWeeklyHours). Not sent
+        /// (null / -1, an older sender) = the copy is left as it was. The display-copy sites call this, and since H-SALESTAFF-1 (2026-09-26)
+        /// the sale path's fresh real records (EnsureRealStaff) do too, so bought staff keep the owner's demands/hours/days.</summary>
+        private static void ApplyTooltipFields(EmployeeInstance inst, StaffInfo s)
+        {
+            try { if (s.Demands != null) { inst.demands.Clear(); inst.demands.AddRange(s.Demands); } } catch { }
+            try { if (s.AssignedWeeklyHours >= 0) inst.assignedWeeklyHours = s.AssignedWeeklyHours; } catch { }
+            try
+            {   // fold: the weekly days, through IList exactly as the transfer apply does (MergerEmployeeSync :1156) so the
+                // element type comes from the live list. Null (not sent) = the copy's list is left as it was.
+                var days = inst.assignedWeeklyDays as System.Collections.IList;
+                var et   = days?.GetType().GetGenericArguments();
+                if (s.AssignedWeeklyDays != null && days != null && et != null && et.Length == 1)
+                {
+                    days.Clear();
+                    foreach (var d in s.AssignedWeeklyDays) days.Add(System.Enum.ToObject(et[0], d));
+                }
+            }
+            catch { }
+        }
+
+        private static void ApplyStaffFidelity(EmployeeInstance inst, StaffInfo s)
+        {
+            try
+            {
+                if (s.Wage > 0f) inst.hourlyWage = s.Wage;
+                if (s.Satisfaction > 0f) inst.satisfaction = s.Satisfaction;
+                // H-MERGERTRAIN-1: the OWNER's training session, mirrored onto the copy exactly as the absence
+                // hand-over mirrors it onto a lifted record (MergerEmployeeSync :1228-1237). The copy only ever
+                // READS this: it is stripped from the hourly pass (MPPatches Patch_EmployeeHelper_RunHourly_
+                // SkipModRecords), so it can never run FinishTraining - the owner's republish is what ends it.
+                if (string.IsNullOrEmpty(s.TrainingSkill)) inst.trainingSession = null;
+                else inst.trainingSession = new EmployeeInstance.TrainingInstance { skill = s.TrainingSkill, startDay = s.TrainingStartDay };
+                if (s.AgeDays > 0) inst.characterData.ageInDays = s.AgeDays;
+                if (s.Skills != null && s.Skills.Count > 0)
+                {
+                    // characterData.skills is THE list — HasSkill/GetPrimarySkill/every display reads it
+                    // (EmployeeInstance.skills is a decoy; decompile-verified EmployeeInstance :211/:226).
+                    var skills = inst.characterData.skills;
+                    skills.Clear();
+                    foreach (var pair in s.Skills)
+                    {
+                        int eq = pair.IndexOf('=');
+                        if (eq <= 0) continue;
+                        float.TryParse(pair.Substring(eq + 1), System.Globalization.NumberStyles.Float,
+                                       System.Globalization.CultureInfo.InvariantCulture, out var val);
+                        skills.Add(new BigAmbitions.Characters.Skills.Skill { name = pair.Substring(0, eq), value = val });
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>H-ADOPT-2 (2026-09-10): the merger's adopt found a record with the member's employee id already here - the
+        /// INJECTED COPY the member's roster publish created (injected records keep the real id). That copy is not a completed
+        /// adoption: forget it (registry, owner memory, bench grace, game list) so the adopt can reconstruct the real record.
+        /// Returns false when the id is not an injected copy.</summary>
+        internal static bool ForgetInjectedForAdopt(string id)
+        {
+            if (string.IsNullOrEmpty(id) || !_injectedStaff.ContainsKey(id)) return false;
+            RemoveInjectedStaff(id);
+            return true;
+        }
+
+        private static void RemoveInjectedStaff(string id)
+        {
+            try
+            {
+                if (!_injectedStaff.TryGetValue(id, out var have)) return;
+                _injectedStaff.Remove(id);
+                _injectedOwner.Remove(id);   // shared-shop slice 3: the owner memory goes with the record (a stale entry would keep guards lit)
+                _benchGrace.Remove(id);
+                // Same auto-fill hazard as RemoveSynthetic: an in-flight background fill holding
+                // this record would write shifts for an id that is about to lose its record.
+                try
+                {
+                    // The registry's address, not the copy's field — the helper's dropdown may already have changed that locally.
+                    var fillReg = RegOfKey(have.addr) ?? Helpers.BuildingHelper.GetBuildingRegistration(have.inst?.assignedAddress);
+                    if (fillReg != null) UI.Smartphone.Apps.BizMan.Schedule.BizManSchedule.AbortAutoFillForBusiness(fillReg);
+                }
+                catch { }
+                var gi = SaveGameManager.Current;
+                if (gi?.EmployeeInstances != null) gi.EmployeeInstances.Remove(have.inst);
+                try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(id); } catch { }
+                try { var ev = MergerEmployeeSync.CountShiftsNaming(gi, id); MergerEmployeeSync.LogStaffRemoval("roster-drop", id, MergerEmployeeSync.StaffNameOf(have.inst), ev.shifts, ev.regs); } catch { }   // STAFF-EVIDENCE-1
+                Plugin.Logger.LogInfo($"[StaffRoster] removed injected staff '{id}' ({have.addr}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] remove '{id}': {ex.Message}"); }
+        }
+
+        // ── Round-196: business-sale staff migration (user ruling: workers transfer) ──
+
+        /// <summary>HOST: the sold shop's roster — the stored copy from the seller's
+        /// heartbeat publishes, or built fresh from local records when the seller is
+        /// this machine. A copy, safe to ship in the Finalize payload.</summary>
+        internal static List<StaffInfo> RosterCopyFor(string addr, string sellerPid)
+        {
+            try
+            {
+                if (sellerPid != MPConfig.PlayerId)
+                {
+                    lock (_rosterByAddr)
+                        if (_rosterByAddr.TryGetValue(addr, out var v) && v.pid == sellerPid)
+                            return new List<StaffInfo>(v.staff);
+                    return new List<StaffInfo>();
+                }
+                return BuildLocalRoster(addr);
+            }
+            catch { return new List<StaffInfo>(); }
+        }
+
+        private static List<StaffInfo> BuildLocalRoster(string addr)
+        {
+            var staff = new List<StaffInfo>();
+            try
+            {
+                var gi = SaveGameManager.Current;
+                var reg = GameStatePatcher.FindRegistration(addr);
+                if (gi?.EmployeeInstances == null || reg == null) return staff;
+                foreach (var e in gi.EmployeeInstances)
+                {
+                    if (e == null || string.IsNullOrEmpty(e.id)) continue;
+                    if (e.id.StartsWith(SyntheticDutyEmployeeIdPrefix, StringComparison.Ordinal)) continue;
+                    if (_injectedStaff.ContainsKey(e.id)) continue;
+                    bool here = false;
+                    try { here = e.assignedAddress != null && e.assignedAddress.streetName == reg.StreetName && e.assignedAddress.streetNumber == reg.StreetNumber; } catch { }
+                    if (!here) continue;
+                    bool avail = true; try { avail = e.IsEmployeeAvailable(); } catch { }
+                    int gender = -1;   try { gender = (int)e.characterData.gender; } catch { }
+                    string nm = "";    try { nm = e.characterData?.name ?? ""; } catch { }
+                    var si = new StaffInfo { Id = e.id, Name = nm, Gender = gender, Available = avail };
+                    try { si.Wage = e.hourlyWage; } catch { }
+                    try { si.Satisfaction = e.satisfaction; } catch { }
+                    try { si.AgeDays = e.characterData?.ageInDays ?? 0; } catch { }
+                    try { if (e.trainingSession != null) { si.TrainingSkill = e.trainingSession.skill ?? ""; si.TrainingStartDay = e.trainingSession.startDay; } } catch { }   // H-MERGERTRAIN-1
+                    FillTooltipFields(si, e);   // H-ROSTERTOOLTIP-1
+                    try
+                    {
+                        var skills = e.characterData?.skills;
+                        if (skills != null)
+                            foreach (var sk in skills)
+                                if (sk != null && !string.IsNullOrEmpty(sk.name))
+                                    si.Skills.Add(sk.name + "=" + sk.value.ToString("F1", System.Globalization.CultureInfo.InvariantCulture));
+                    }
+                    catch { }
+                    staff.Add(si);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] local roster '{addr}': {ex.Message}"); }
+            return staff;
+        }
+
+        /// <summary>BUYER: the injected mirrors at a purchased shop become OUR real
+        /// employees — same records, same real ids (the synced shifts keep matching),
+        /// just no longer tracked as injected (so payroll, HR, and publishes treat
+        /// them as ours). Roster tracking for the address is cleared so no stale
+        /// partner roster ever re-processes them.</summary>
+        internal static int PromoteInjectedForTransfer(string addr)
+        {
+            int n = 0;
+            try
+            {
+                var promote = new List<string>();
+                foreach (var kv in _injectedStaff)
+                    if (kv.Value.addr == addr) promote.Add(kv.Key);
+                int stamped = 0;
+                foreach (var id in promote)
+                {
+                    // H-EMP-2 (review r1 #3, verified 2026-09-04): the game's own hire step (EmployeeHelper.HireCandidate) stamps dayHired and
+                    // rolls the first sick day; the factory leaves both at 0, and `nextSickDay <= Day` made the WHOLE inherited staff absent
+                    // on the first daily pass after a purchase. Stamp at the moment a record becomes this player's real staff.
+                    if (_injectedStaff.TryGetValue(id, out var rec) && rec.inst != null)
+                    {
+                        try { rec.inst.dayHired = SaveGameManager.Current.Day; rec.inst.nextSickDay = Helpers.EmployeeHelper.GetNextSickDay(rec.inst); rec.inst.complaintData?.ResetHoursUntilNextComplaint(); stamped++; }   // review r8 #1: + the complaint grace
+                        catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] H-EMP-2 stamp failed for '{id}': {ex.Message}"); }   // review r7 #6: a silent failure here IS the defect this fixes
+                    }
+                    _injectedStaff.Remove(id); n++;
+                }
+                lock (_rosterByAddr) { _rosterByAddr.Remove(addr); }
+                _rosterApplied.Remove(addr);
+                if (n > 0) Plugin.Logger.LogInfo($"[StaffRoster] PROMOTED {n} injected record(s) at '{addr}' to real staff (business purchased — round-196); stamped hire day + sick-day roll on {stamped} (H-EMP-2).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] promote '{addr}': {ex.Message}"); }
+            return n;
+        }
+
+        /// <summary>BUYER: create real records for wire staff not present locally
+        /// (a buyer who never received the seller's roster — e.g. fresh joiner).
+        /// Appearance regenerates locally (not in the wire format — disclosed gap).</summary>
+        internal static int EnsureRealStaff(string addr, List<StaffInfo>? staff)
+        {
+            int created = 0;
+            try
+            {
+                if (staff == null || staff.Count == 0) return 0;
+                var gi = SaveGameManager.Current;
+                var reg = GameStatePatcher.FindRegistration(addr);
+                if (gi?.EmployeeInstances == null || reg == null) return 0;
+                foreach (var s in staff)
+                {
+                    if (s == null || string.IsNullOrEmpty(s.Id)) continue;
+                    bool exists = false;
+                    try { exists = Helpers.EmployeeHelper.EmployeeInstancesDictionary.ContainsKey(s.Id); } catch { }
+                    if (!exists)
+                        foreach (var e in gi.EmployeeInstances)
+                            if (e?.id == s.Id) { exists = true; break; }
+                    if (exists) continue;
+                    var inst = Helpers.EmployeeHelper.CreateAIEmployeeInstance("ba:skill_customerservice");
+                    if (inst == null) continue;
+                    inst.id = s.Id;
+                    inst.assignedAddress = new Address(reg.StreetName, reg.StreetNumber);
+                    inst.characterData.name = string.IsNullOrEmpty(s.Name) ? "Staff" : s.Name;
+                    inst.characterData.ageInDays = Helpers.RecruitmentHelper.GetRandomEmployeeAgeInDays();
+                    try { if (s.Gender >= 0) inst.characterData.gender = (BigAmbitions.Characters.Gender)s.Gender; } catch { }
+                    inst.isAbsent = !s.Available; inst.isReplaced = false;
+                    ApplyStaffFidelity(inst, s);
+                    // H-SALESTAFF-1 (user-approved 2026-09-26): the OWNER's demands from the sale's staff list, through the
+                    // display-copy helper - the same clear+add the transfer apply makes (MergerEmployeeSync :1092). A fresh
+                    // record otherwise starts with an EMPTY demand list, and the game's daily EmployeeHelper.RunDaily ->
+                    // EmployeeInstance.UpdateDemands tops it up with random demands, each with a 'new demand' message. The
+                    // same helper also sets the owner's weekly hours/days: the sale's schedule restore (MPOffers) writes
+                    // workShifts directly and the game never recounts them for this record (UpdateWeeklyHoursAndDays runs
+                    // only on schedule edits / auto-fill / old-save fixes), so without them the owner's hours-per-week
+                    // demand would be judged against 0 hours. Not sent (older sender) = left as the factory made it.
+                    ApplyTooltipFields(inst, s);
+                    try
+                    {
+                        Plugin.Logger.LogInfo($"[StaffRoster] sale staff '{s.Id}' at '{addr}': owner demands=[{string.Join(",", inst.demands ?? new List<string>())}] "
+                                            + $"(wire {(s.Demands == null ? "none" : s.Demands.Count.ToString())}), weekly hours={inst.assignedWeeklyHours} days={inst.assignedWeeklyDays?.Count ?? 0}.");
+                    }
+                    catch { }
+                    try { inst.dayHired = SaveGameManager.Current.Day; inst.nextSickDay = Helpers.EmployeeHelper.GetNextSickDay(inst); inst.complaintData?.ResetHoursUntilNextComplaint(); }   // H-EMP-2: the game's hire-time stamp (after fidelity — the roll reads satisfaction) + the complaint grace (review r8 #1)
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] H-EMP-2 stamp failed for '{s.Id}' — record kept with an unrolled sick day (absent once at the next daily pass, then re-rolled by the game): {ex.Message}"); }   // review r9 #4: a throw here must not lose this record or the rest of the wire staff
+                    gi.EmployeeInstances.Add(inst);
+                    try { Helpers.EmployeeHelper.EmployeeInstancesDictionary[inst.id] = inst; } catch { }
+                    created++;
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] ensure-real '{addr}': {ex.Message}"); }
+            return created;
+        }
+
+        /// <summary>SELLER: real staff records at a sold shop leave this save —
+        /// they live in the buyer's save now (never touches injected/synthetic).</summary>
+        internal static int DropRealStaffAt(string addr)
+        {
+            int n = 0;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                var reg = GameStatePatcher.FindRegistration(addr);
+                if (gi?.EmployeeInstances == null || reg == null) return 0;
+                try { UI.Smartphone.Apps.BizMan.Schedule.BizManSchedule.AbortAutoFillForBusiness(reg); } catch { }
+                for (int i = gi.EmployeeInstances.Count - 1; i >= 0; i--)
+                {
+                    var e = gi.EmployeeInstances[i];
+                    if (e == null || string.IsNullOrEmpty(e.id)) continue;
+                    if (e.id.StartsWith(SyntheticDutyEmployeeIdPrefix, StringComparison.Ordinal)) continue;
+                    if (_injectedStaff.ContainsKey(e.id)) continue;
+                    bool here = false;
+                    try { here = e.assignedAddress != null && e.assignedAddress.streetName == reg.StreetName && e.assignedAddress.streetNumber == reg.StreetNumber; } catch { }
+                    if (!here) continue;
+                    string eid = e.id, enm = MergerEmployeeSync.StaffNameOf(e);
+                    gi.EmployeeInstances.RemoveAt(i);
+                    try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(eid); } catch { }
+                    n++;
+                    try { var ev = MergerEmployeeSync.CountShiftsNaming(gi, eid); MergerEmployeeSync.LogStaffRemoval("business-sale", eid, enm, ev.shifts, ev.regs); } catch { }   // STAFF-EVIDENCE-1
+                }
+                _rosterSigSent.Remove(addr);   // this address is no longer ours to publish
+                if (n > 0) Plugin.Logger.LogInfo($"[StaffRoster] transferred out {n} real staff record(s) at '{addr}' (business sold — round-196).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] drop-real '{addr}': {ex.Message}"); }
+            return n;
+        }
+
+        /// <summary>Round-197: the CURRENT register-duty state, sent to one player —
+        /// duty toggles are one-shot events a joiner's quiesce window may have
+        /// dropped (the shop then looks unstaffed until the next toggle).</summary>
+        internal static int SendDutyStateTo(string pid)
+        {
+            int n = 0;
+            try
+            {
+                foreach (var kv in _cashiers)
+                {
+                    var (playerId, pos, employee, address, stationId) = kv.Value;
+                    if (playerId == pid) continue;   // their own duty state died with their session
+                    var p = new RegisterCashierPayload
+                    {
+                        PlayerId = playerId, X = pos.x, Y = pos.y, Z = pos.z,
+                        On = true, Address = address, StationId = stationId, Employee = employee,
+                    };
+                    MPServer.SendToPlayer(pid, MessageEnvelope.Create(MessageType.RegisterCashier, "host", p));
+                    n++;
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Register] duty re-send: {ex.Message}"); }
+            return n;
+        }
+
+        /// <summary>World-ready reconciliation (round-196): a REAL (non-injected,
+        /// non-synthetic) employee assigned to a business this machine does not own
+        /// is residue of an interrupted transfer (e.g. seller crashed after the buyer
+        /// claimed) — the record's home is the owner's save. Remove it, loudly.
+        /// Unknown stays untouched: no registration ⇒ no verdict.</summary>
+        public static int DemoteForeignAssignedStaff(string when)
+        {
+            int n = 0;
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return 0;
+                var gi = SaveGameManager.Current;
+                if (gi?.EmployeeInstances == null || gi.BuildingRegistrations == null) return 0;
+                for (int i = gi.EmployeeInstances.Count - 1; i >= 0; i--)
+                {
+                    var e = gi.EmployeeInstances[i];
+                    if (e == null || string.IsNullOrEmpty(e.id) || e.assignedAddress == null) continue;
+                    if (e.id.StartsWith(SyntheticDutyEmployeeIdPrefix, StringComparison.Ordinal)) continue;
+                    if (_injectedStaff.ContainsKey(e.id)) continue;
+                    BuildingRegistration? reg = null;
+                    foreach (var r in gi.BuildingRegistrations)
+                    {
+                        bool match = false;
+                        try { match = r != null && e.assignedAddress.streetName == r.StreetName && e.assignedAddress.streetNumber == r.StreetNumber; } catch { }
+                        if (match) { reg = r; break; }
+                    }
+                    if (reg == null) continue;   // unknown ≠ foreign — never delete on missing data
+                    bool mine; try { mine = MergerFlip.TrulyMine(reg); } catch { continue; }
+                    if (mine || reg.RentedByPlayer) continue;
+                    string eid = e.id, nm = ""; try { nm = e.characterData?.name ?? ""; } catch { }
+                    gi.EmployeeInstances.RemoveAt(i);
+                    try { Helpers.EmployeeHelper.EmployeeInstancesDictionary.Remove(eid); } catch { }
+                    n++;
+                    try { var ev = MergerEmployeeSync.CountShiftsNaming(gi, eid); MergerEmployeeSync.LogStaffRemoval("foreign-reconcile", eid, nm, ev.shifts, ev.regs); } catch { }   // STAFF-EVIDENCE-1
+                    Plugin.Logger.LogWarning($"[StaffRoster] RECONCILED ({when}): real employee '{nm}' ({eid}) was assigned to '{GameStateReader.AddressKey(reg)}' which this machine does not own — record removed (interrupted-transfer residue, round-196).");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[StaffRoster] reconcile: {ex.Message}"); }
+            return n;
+        }
+
+        /// <summary>Invoke the game's staffing evaluator (UpdateEmployee — the
+        /// disasm-mapped spawner) on unstaffed synthetic stations every 5s;
+        /// nothing calls it for rival-translated shops natively.</summary>
+        // Round-166 - LIVE STATION REGISTRY: even one cached FindObjectsOfType refresh cost ~60ms
+        // per 30s on the 826-building save (StaffEval bucket).  Stations announce themselves at
+        // Start (Harmony postfix below) and destroyed ones prune lazily on read (Unity's overloaded
+        // null), so the evaluator never scans the scene at all.
+        private static readonly List<EmployeeStationController> _stationRegistry = new();
+        private static UnityEngine.Object[] _stationSnapshot = System.Array.Empty<UnityEngine.Object>();
+        private static bool _stationRegistryDirty = true;
+
+        internal static void RegisterStation(EmployeeStationController st)
+        {
+            try { if (st != null && !_stationRegistry.Contains(st)) { _stationRegistry.Add(st); _stationRegistryDirty = true; } } catch { }
+        }
+
+        /// <summary>The live stations, pruned of destroyed entries - no scene walk, ever.</summary>
+        private static UnityEngine.Object[] GetStationsCached()
+        {
+            bool pruned = _stationRegistry.RemoveAll(st => st == null) > 0;   // Unity null = destroyed
+            if (pruned || _stationRegistryDirty)
+            {
+                _stationSnapshot = _stationRegistry.ToArray();
+                _stationRegistryDirty = false;
+            }
+            return _stationSnapshot;
+        }
+
+        /// <summary>Round-166: every station announces itself when its Start runs (interior load,
+        /// item placement, guest-edit apply alike) - the registry's single producer.</summary>
+        [HarmonyLib.HarmonyPatch(typeof(EmployeeStationController), "Start")]
+        public static class Patch_EmployeeStation_Start_Registry
+        {
+            static void Postfix(EmployeeStationController __instance) => RegisterStation(__instance);
+        }
+
+
+        private static void TickStaffEvaluator()
+        {
+            if (_synthetics.Count == 0) return;
+            if (Time.unscaledTime < _nextEvalAt) return;
+            _nextEvalAt = Time.unscaledTime + 5f;
+            // Round-98 (field "lag spike every ~6s", JP report + S7 repro): this pass used to run
+            // FindObjectsOfType — a FULL-SCENE walk — once PER synthetic station, every 5s, even
+            // with no interior loaded (the null-station check came after the scan): ~630ms/pass
+            // on a client in a built-up world. Stations only exist inside the ONE interior loaded
+            // around the local player, so skip the pass unless a synthetic is plausibly near us,
+            // then scan the scene ONCE for all synthetics.
+            Vector3 me;
+            try { me = Helpers.PlayerHelper.GetPosition(); } catch { return; }
+            const float NearRadius2 = 150f * 150f;   // interiors sit on distant coordinate islands — generous
+            bool anyNear = false;
+            foreach (var kv in _synthetics)
+                if ((kv.Value.pos - me).sqrMagnitude <= NearRadius2) { anyNear = true; break; }
+            if (!anyNear) return;   // street/other-island: no synthetic till can be loaded here
+            // Round-165: FindObjectsOfType here WAS the hitch — StaffEval worst=62ms, convicted by the
+            // named perf buckets (a full-scene walk on an 826-building save, every 5s pass).  Stations
+            // exist only in the loaded interior, which changes when the local player crosses a door —
+            // cache per shop address with a 30s TTL (one refresh hitch per 30s worst case, at the door
+            // it rides the interior-load hitch that exists anyway).
+            var stations = GetStationsCached();
+            foreach (var kv in _synthetics)
+            {
+                try
+                {
+                    if ((kv.Value.pos - me).sqrMagnitude > NearRadius2) continue;   // its interior can't be the loaded one
+                    // Round-30 (WS2): any EmployeeStationController counts — the old CashRegisterController-
+                    // only search was the visitor-side twin of the owner-side checkout whitelist.
+                    // Field 150521: resolve by IDENTITY, not distance — the old NearestStationIn(pos, 2m)
+                    // here drove ANOTHER building's registers whenever a same-coordinate interior was loaded.
+                    var st = FindStationByRegKey(stations, kv.Key, kv.Value.pos, kv.Value.addressKey);
+                    if (st == null)
+                    {
+                        // Review F3 (ship-probes-with-fixes): the OLD positional bind logged an
+                        // "invoking" line even when it drove the WRONG building — after the
+                        // identity fix, silence here would make "fix works" and "resolver finds
+                        // nothing" identical in a field log. Near-only (radius gate above), 60s/record.
+                        float nowR = Time.unscaledTime;
+                        if (!_resolveMissNextAt.TryGetValue(kv.Key, out var tR) || nowR >= tR)
+                        {
+                            _resolveMissNextAt[kv.Key] = nowR + 60f;
+                            Plugin.Logger.LogInfo($"[SynthStaff] record '{kv.Key}' (home '{kv.Value.addressKey}') resolved NO live station this pass — interior not loaded here, or the loaded station lacks its instance id.");
+                        }
+                        continue;
+                    }
+                    if (st.employeeInstance != null) continue;   // already staffed
+                    Plugin.Logger.LogInfo($"[SynthStaff] invoking UpdateEmployee(false) on station at '{kv.Key}'.");
+                    st.UpdateEmployee(false);
+                    // PROBE-START: P-SEAT-DECLINE (field 20260830-150521: the invoke above returns
+                    // silently while the till stays unstaffed — every 5s for minutes. WHICH native
+                    // gate refuses? Candidates, in the native decline order (EmployeeStationController
+                    // .UpdateEmployee :330-345): building availability (BuildingManager.isOpen /
+                    // temporarilyClosed / work-critical requirements), missing item requirements, the
+                    // shift lookup (shifts match on workShift.itemInstanceId == the loaded station's
+                    // ItemInstance.id — host↔client id drift orphans every shift), employee record
+                    // missing, employee unavailable. Log-only; 30s throttle per station; fires ONLY
+                    // when the seat attempt failed; self-clears when a seat succeeds.)
+                    try
+                    {
+                        if (st.employeeInstance == null)
+                        {
+                            float nowP = Time.unscaledTime;
+                            if (!_seatDeclineNextAt.TryGetValue(kv.Key, out var tP) || nowP >= tP)
+                            {
+                                _seatDeclineNextAt[kv.Key] = nowP + 30f;
+                                var regP = st.BuildingContext?.Registration;
+                                bool isOpenP = false; try { isOpenP = InstanceBehavior<BuildingManager>.Instance.isOpen; } catch { }
+                                bool tmpClosedP = false; try { tmpClosedP = regP != null && regP.temporarilyClosed; } catch { }
+                                bool workCritP = false; try { workCritP = regP != null && Helpers.BusinessHelper.AreWorkCriticalRequirementsMet(regP); } catch { }
+                                bool missingReqP = true; try { missingReqP = ItemHelper.HasAnyMissingRequirements(st.ItemInstance); } catch { }
+                                string stationIdP = ""; try { stationIdP = st.ItemInstance?.id ?? ""; } catch { }
+                                int shiftsTodayP = 0, forThisStationP = 0, coveringNowP = 0; string dayIdsP = "";
+                                try
+                                {
+                                    int hourP = TimeHelper.CurrentHour;
+                                    // Mirror the native day selection EXACTLY (GetEmployeeWorkShift :378 does
+                                    // day→index→cast, not a direct compare — measure the layer native reads).
+                                    var wantDayP = (BigAmbitions.DayNightCycle.DayOfWeekOrdered)TimeHelper.GetDayOfWeekIndex(TimeHelper.GetDayOfWeek());
+                                    var dayRowP = regP?.scheduleDays?.Find(x => x != null && x.day == wantDayP);
+                                    if (dayRowP?.workShifts != null)
+                                    {
+                                        shiftsTodayP = dayRowP.workShifts.Count;
+                                        var idsP = new HashSet<string>();
+                                        foreach (var wsP in dayRowP.workShifts)
+                                        {
+                                            if (wsP == null) continue;
+                                            idsP.Add(ShortIdP(wsP.itemInstanceId));
+                                            if (wsP.itemInstanceId == stationIdP)
+                                            {
+                                                forThisStationP++;
+                                                if (wsP.startingHour <= hourP && wsP.endingHour > hourP && !string.IsNullOrEmpty(wsP.employeeId)) coveringNowP++;
+                                            }
+                                        }
+                                        int nP = 0;
+                                        foreach (var sP in idsP) { if (nP++ >= 4) { dayIdsP += ",…"; break; } dayIdsP += (nP > 1 ? "," : "") + sP; }
+                                    }
+                                }
+                                catch { }
+                                Plugin.Logger.LogWarning($"[PROBE] SeatDecline '{kv.Key}': isOpen={isOpenP} tmpClosed={tmpClosedP} workCritOK={workCritP} missingItemReq={missingReqP} | stationItem='{ShortIdP(stationIdP)}' shiftsToday={shiftsTodayP} forThisStation={forThisStationP} coveringThisHour={coveringNowP} dayShiftItemIds=[{dayIdsP}] | seat still empty after invoke.");
+                            }
+                        }
+                        else _seatDeclineNextAt.Remove(kv.Key);
+                    }
+                    catch (Exception pex) { Plugin.Logger.LogWarning($"[PROBE] SeatDecline: {pex.Message}"); }
+                    // PROBE-END: P-SEAT-DECLINE
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[SynthStaff] evaluator: {ex.Message}"); }
+            }
+        }
+
+        // Review F3 fix-diagnostic (permanent, not a probe): throttle for the sweep's
+        // resolution-miss line above.
+        private static readonly Dictionary<string, float> _resolveMissNextAt = new();
+
+        // PROBE-START: P-SEAT-DECLINE (state: per-station throttle + id shortener)
+        private static readonly Dictionary<string, float> _seatDeclineNextAt = new();
+        private static string ShortIdP(string? s) => string.IsNullOrEmpty(s) ? "<none>" : (s!.Length > 12 ? s.Substring(0, 12) : s!);
+        // PROBE-END: P-SEAT-DECLINE (state)
+
+        private static EmployeeStationController? NearestStationIn(UnityEngine.Object[]? stations, Vector3 from, float maxDist)
+        {
+            EmployeeStationController? best = null;
+            float bestD2 = maxDist * maxDist;
+            if (stations != null)
+                foreach (var o in stations)
+                {
+                    var c = o as EmployeeStationController;
+                    if (c == null || !IsLiveStation(c)) continue;   // review F11: never resolve to a pooled-inactive station
+                    float d2 = (c.transform.position - from).sqrMagnitude;
+                    if (d2 < bestD2) { bestD2 = d2; best = c; }
+                }
+            return best;
+        }
+
+        /// <summary>Dump the shop's SET price table (the only price source that
+        /// matters at checkout per user — cargo pricePerUnit is NOT it).</summary>
+        internal static void LogShopPrices(BuildingRegistration reg, string tag)
+        {
+            try
+            {
+                var prices = reg.retailPrices;
+                if (prices == null || prices.Count == 0)
+                {
+                    Plugin.Logger.LogInfo($"{tag} '{GameStateReader.AddressKey(reg)}' retailPrices EMPTY (defaults not materialized).");
+                    return;
+                }
+                var sb = new System.Text.StringBuilder($"{tag} '{GameStateReader.AddressKey(reg)}' retailPrices: ");
+                for (int i = 0; i < prices.Count && i < 8; i++)
+                {
+                    var rp = prices[i];
+                    if (rp != null) sb.Append($"{rp.itemName}=${rp.price:F2} ");
+                }
+                Plugin.Logger.LogInfo(sb.ToString());
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"{tag} read: {ex.Message}"); }
+        }
+
+    }
+}

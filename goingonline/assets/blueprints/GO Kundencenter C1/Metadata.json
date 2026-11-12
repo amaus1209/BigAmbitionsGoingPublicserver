@@ -1,0 +1,32 @@
+{
+    "blueprintType": 1,
+    "blueprintVersion": 2,
+    "buildNumber": 3674,
+    "itemId": 0,
+    "price": 51220.0,
+    "buildingType": "ba:buildingtype_retail",
+    "buildingSizeInfo": {
+        "buildingSize": "ba:buildingsize_c",
+        "buildingVersion": 1
+    },
+    "requiredModIds": [],
+    "otherData": [
+        {
+            "dataElement": 8,
+            "value": "goingonline:businesstype_cablecenter"
+        },
+        {
+            "dataElement": 3,
+            "value": "100"
+        },
+        {
+            "dataElement": 4,
+            "value": "5"
+        },
+        {
+            "dataElement": 5,
+            "value": "3"
+        }
+    ],
+    "isWorkshopReviewPending": false
+}

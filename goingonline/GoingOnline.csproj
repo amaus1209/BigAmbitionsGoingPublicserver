@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Going Online as a mod of its own (single player). The provider itself lives in core\, which Going Public
+       Server compiles in as well (its module "ModuleGoingOnline"). Harmony (in Dependencies\ of the package) puts the
+       provider into the game's own pages, core\GamePatches.cs + src\Patcher.cs (GO-PATCHES-1, since 0.8.1).
+       Build: dotnet build -c Release -p:GameDir=<Big Ambitions folder> ; package: tools/package.sh -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>GoingOnline</AssemblyName>
+    <RootNamespace>GoingOnline</RootNamespace>
+    <Version>0.8.3</Version>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GameDir>C:\Program Files (x86)\Steam\steamapps\common\Big Ambitions\</GameDir>
+    <ManagedDir>$([MSBuild]::EnsureTrailingSlash('$(GameDir)'))Big Ambitions_Data\Managed\</ManagedDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="src\**\*.cs" />
+    <Compile Include="core\**\*.cs" />
+  </ItemGroup>
+
+  <!-- GO-PATCHES-1: Harmony, shipped in the package's Dependencies\ folder (MIT, THIRD-PARTY-NOTICES.txt) - the same
+       version Going Public Server uses -->
+  <ItemGroup>
+    <PackageReference Include="Lib.Harmony" Version="2.4.2" />
+  </ItemGroup>
+
+  <!-- Game + Unity assemblies (never shipped, the game has them) -->
+  <ItemGroup>
+    <Reference Include="BigAmbitions"><HintPath>$(ManagedDir)BigAmbitions.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.Items"><HintPath>$(ManagedDir)BigAmbitions.Items.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.PlacementSystem"><HintPath>$(ManagedDir)BigAmbitions.PlacementSystem.dll</HintPath><Private>false</Private></Reference>   <!-- GO-DESK-LINK-1: SetToParentPlaceableItem -->
+    <Reference Include="BigAmbitions.InputSystem"><HintPath>$(ManagedDir)BigAmbitions.InputSystem.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Unity.InputSystem"><HintPath>$(ManagedDir)Unity.InputSystem.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.Characters"><HintPath>$(ManagedDir)BigAmbitions.Characters.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="DayNightCycle"><HintPath>$(ManagedDir)DayNightCycle.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.ModAPI"><HintPath>$(ManagedDir)BigAmbitions.ModAPI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BigAmbitions.Neighborhoods"><HintPath>$(ManagedDir)BigAmbitions.Neighborhoods.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="HGPlugins"><HintPath>$(ManagedDir)HGPlugins.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="HGExtensions"><HintPath>$(ManagedDir)HGExtensions.dll</HintPath><Private>false</Private></Reference>
+    <!-- GO-PATCHES-1: BizMan's tables are EnhancedScroller cells -->
+    <Reference Include="ExternalPlugins"><HintPath>$(ManagedDir)ExternalPlugins.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>$(ManagedDir)Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine"><HintPath>$(ManagedDir)UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(ManagedDir)UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.ImageConversionModule"><HintPath>$(ManagedDir)UnityEngine.ImageConversionModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(ManagedDir)UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(ManagedDir)UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(ManagedDir)UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(ManagedDir)UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UIModule"><HintPath>$(ManagedDir)UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.UI"><HintPath>$(ManagedDir)UnityEngine.UI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Unity.TextMeshPro"><HintPath>$(ManagedDir)Unity.TextMeshPro.dll</HintPath><Private>false</Private></Reference>
+    <!-- GO-LOBBY-1: the customer center's visitors walk on the navmesh and are the game's customer figures (behaviour tree off) -->
+    <Reference Include="UnityEngine.AIModule"><HintPath>$(ManagedDir)UnityEngine.AIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AnimationModule"><HintPath>$(ManagedDir)UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BehaviorDesigner.Runtime"><HintPath>$(ManagedDir)BehaviorDesigner.Runtime.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>

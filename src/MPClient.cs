@@ -1,0 +1,3382 @@
+using LiteNetLib;
+using LiteNetLib.Utils;
+using UI.Load;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Runs on non-host players. Connects to the host, sends requests,
+    /// and applies world state updates received from the host.
+    /// </summary>
+    public static class MPClient
+    {
+        // Transport seam (Steam-connect slice 1): the client reaches the host
+        // through IClientTransport — LiteNetLib UDP today, Steam relay later.
+        // Events fire on the transport's poll thread, exactly as before.
+        private static IClientTransport? _transport;
+        private static volatile bool _connected;   // set on Connected, cleared on Disconnected/Disconnect
+
+        /// <summary>Player list last received from the host's lobby update.
+        /// CONCURRENT: replaced wholesale on the poll thread (lobby update / connect /
+        /// disconnect), read on the main thread (lobby UI, roster).  Published as an
+        /// immutable snapshot — single writer thread + volatile = safe without a lock.</summary>
+        public static IReadOnlyList<string> LobbyPlayers => _lobbyPlayers;
+        private static volatile List<string> _lobbyPlayers = new();
+
+        /// <summary>LOBBY-DEDICATED-1: the host's last lobby update said it is a dedicated server (its own character is
+        /// not in <see cref="LobbyPlayers"/>).</summary>
+        public static volatile bool LobbyHostDedicated;
+
+        /// <summary>True while in the pre-game lobby; false once the host starts the game.</summary>
+        public static bool IsInLobby { get; private set; } = true;
+
+        /// <summary>True if the host enforces one starting cash for everyone (from LobbyUpdate).</summary>
+        public static bool EnforceStartingCash { get; private set; } = true;
+
+        /// <summary>This client's chosen starting cash (used only when EnforceStartingCash is false).</summary>
+        public static int ChosenStartingCash = 4200;
+
+        /// <summary>This client's self-chosen starting age (lobby).  Reported to the
+        /// host (LobbyPref); the host bakes it into this client's start settings.</summary>
+        public static int ChosenStartingAge = 18;
+
+        /// <summary>Per-player starting ages from the host (LobbyUpdate), for lobby display.
+        /// CONCURRENT: cleared/repopulated on the poll thread (HandleLobbyUpdate),
+        /// read per-frame on the main thread (lobby UI).</summary>
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> LobbyAges = new();
+
+        /// <summary>True if the host is resuming a saved game (from LobbyUpdate) — the
+        /// client hides the new-game settings (age) since they come from the save.</summary>
+        public static bool   HostLoadMode;
+        public static string HostLoadSession = "";
+
+        /// <summary>Round-283 (from LobbyUpdate.HostExpress): true when the host's build drops stale
+        /// PhaseReports by Seq, i.e. when it is safe for us to put phase reports on the express lane.
+        /// Written on the poll thread, read wherever a phase report is sent.  Volatile: a plain bool
+        /// written on the poll thread and read on the main thread can be cached in a register on
+        /// either side, and the whole point of the flag is that its value is respected the instant
+        /// it changes.  Defaults FALSE and is re-set false on every connect — an unknown host is
+        /// treated as incapable, which is exactly today's ordered send.
+        /// Consumed by SendPhaseReport (round-284) together with ServedLoadGen — see the lane
+        /// decision there for why BOTH are required.</summary>
+        public static volatile bool HostExpressLane;
+
+        /// <summary>Round-284 "load ticket": the LoadGen of the load this client was last SERVED
+        /// (StartGameNew/StartGameLoad/LoadData), echoed in every phase report so the host can key
+        /// the join-baseline fire to the exact load a Settled/Running report describes.  0 until
+        /// served — and stays 0 toward pre-284 hosts, which never stamp.  Reset with the
+        /// connection: a ticket is only meaningful to the host that minted it.</summary>
+        internal static volatile int ServedLoadGen;
+
+        public static bool IsConnected  => _connected && _transport is { IsRunning: true };
+        public static bool IsConnecting => _transport is { IsRunning: true } && !_connected;
+
+        /// <summary>Why the last connection ended ("ConnectionFailed", "Timeout", …).
+        /// Set in OnDisconnected, cleared on Connect — the lobby UI shows it so a
+        /// failed join doesn't sit silently behind an alive-looking lobby window.</summary>
+        public static string LastDisconnectReason = "";
+        /// <summary>Review item 2 (lobby): true when LastDisconnectReason is one of the mod's own sentences (a host tag:
+        /// rejected / kicked / banned / host left / identity / build / version), false for a raw transport reason.</summary>
+        public static bool LastDisconnectReasonIsOwn;
+        /// <summary>CONNECT-MSG (bundle 20260906-110216): what the last join attempt was, for the lobby text and the log —
+        /// "ip" or "steam"; the address CLASS only (loopback / private network / public / hostname / steam relay), never the
+        /// address itself, so the redacted bug bundle still says what kind of target it was.</summary>
+        public static string LastConnectPath = "";
+        public static string LastConnectTargetClass = "";
+        public static int LastConnectPort;
+        private static readonly System.Diagnostics.Stopwatch _connectClock = new();
+        // JOIN-WAIT-1 (C3): when this connection's Hello went out, and the throttle/cap for the waiting line.
+        private static readonly System.Diagnostics.Stopwatch _helloClock = new();
+        private static string _helloSentAtText = "";
+        private static float  _joinWaitNextAt;
+        private static int    _joinWaitLines;
+
+        /// <summary>JOIN-WAIT-1 (C2): status token from the host's LobbyUpdate ("awaiting-approval" while our
+        /// mid-game join request is parked for the host to approve, "" once the real roster arrives). The
+        /// lobby window turns the token into its own wording; nothing from the wire is ever shown verbatim.</summary>
+        public static volatile string JoinStatus = "";
+        /// <summary>Set by OnDisconnected for the no-answer case; the lobby shows it in place of the raw reason. Null otherwise.</summary>
+        public static string? FriendlyDisconnectReason;
+        private static string AddressClass(string host)
+        {
+            try
+            {
+                if (System.Net.IPAddress.TryParse(host, out var ip))
+                {
+                    if (System.Net.IPAddress.IsLoopback(ip)) return "loopback";
+                    var b = ip.GetAddressBytes();
+                    if (b.Length == 4 && (b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254))) return "private network";
+                    return "public";
+                }
+                return "hostname";
+            }
+            catch { return "unknown"; }
+        }
+        /// <summary>CONNECT-MSG: the transport's connect-retry policy, for the connect log line.</summary>
+        private static string DescribeConnectPolicy()
+            => (_transport as LnlClientTransport)?.DescribePolicy() ?? "library defaults";
+
+        /// <summary>True after the connection to the host dropped WHILE IN-GAME
+        /// (host quit/crash/network).  Freezes the game and shows a "session
+        /// ended" notice; dismissing it (click/Enter in TickStartupScreen) clears
+        /// the flag and lets the player continue OFFLINE as a single-player fork
+        /// — allowed by design, since the host's save copies are canonical and
+        /// overwrite this world on the next rejoin.  Cleared on dismissal /
+        /// exit-to-menu / next Connect.</summary>
+        public static volatile bool SessionEnded;
+
+        /// <summary>DEDICATED-EXIT-1: the host said (WorldSnapshotPayload.HostDedicated) it is an unattended dedicated server.
+        /// Losing such a host returns this player to the main menu with a notice. Cleared by the next Connect.</summary>
+        public static volatile bool HostIsDedicated;
+        /// <summary>STEAM-FRIEND-JOIN-1: joining this server needs its key (WorldSnapshotPayload.JoinKeyRequired) - a Steam
+        /// "Join Game" from this player then carries the key he joined with.</summary>
+        public static volatile bool HostNeedsKey;
+        /// <summary>DEDICATED-NPC-1: the dedicated server's own character id ("" = none) - drawn without a name label.</summary>
+        public static volatile string DedicatedHostPlayerId = "";
+
+        /// <summary>STICKY "the local player is in an MP game world" flag — the single source of truth for
+        /// native-time / skip SUPPRESSION (it replaces the live <see cref="IsConnected"/> at those gates).
+        /// Latched true every frame we're in the game scene and hosting or connected (MPCanvasUI.LateUpdate),
+        /// so it SURVIVES a transient drop+reconnect where IsConnected briefly reads false — that blip used to
+        /// switch off ALL native-skip suppression and let the vanilla skip UI run (reconnect bug, 2026-06-19).
+        /// Cleared ONLY on full exit-to-menu (scene unload) and the offline-fork dismiss, so a genuine solo
+        /// fork (host gone for good) still gets native time. NOT cleared on a mere disconnect.</summary>
+        public static volatile bool InMpGame;
+        /// <summary>H-BIZ-1 r3 (review r4 #1): TRUE while this loaded world is the OFFLINE FORK of an MP world (host lost, the player
+        /// chose to continue). InMpGame is deliberately false there (native time allowed), but the world still carries player stamps
+        /// and hollow mirrors, so the MP-only shields that make such registrations safe must keep running. Set at the dismissal,
+        /// cleared with InMpGame at scene exit.</summary>
+        public static volatile bool OfflineFork;
+
+        /// <summary>Round-56 — the "reconnect-window suppression lapse" fix (the Westi poach case,
+        /// generalized): TRUE while this machine is a CLIENT with an MP world loaded, INCLUDING the
+        /// disconnected reconnect window (InMpGame is sticky through drops; hosts excluded via
+        /// !IsRunning). Suppressions of native world-mutating passes, shields over mod-created
+        /// state, and replica protections must gate on THIS instead of IsConnected — a dropped
+        /// link must never hand the loaded MP world back to the native single-player simulation.
+        /// Pure network sends keep gating on IsConnected (nothing to send without a link).</summary>
+        public static bool IsClientInWorld => IsConnected || (InMpGame && !MPServer.IsRunning);
+        // Set by Disconnect() so a deliberate leave (Leave button, exit-to-menu
+        // teardown, reconnect guard) never triggers the session-over lock.
+        private static bool _voluntaryDisconnect;
+
+        /// <summary>Round-253f: the host's mod-diff verdict for THIS connection ("" = none).
+        /// A LIVE-READ display source (events over timers, user ruling): the lobby strip
+        /// shows it exactly while connected; Connect/Disconnect reset it — no timer.</summary>
+        public static string ModMismatchVsHost = "";
+
+        public static void Connect(string hostIp, int port)
+        {
+            JoinStatus = "";   // JOIN-WAIT-1 (review L3): a fresh connect never inherits a stale parked token
+            LastDisconnectReason = ""; FriendlyDisconnectReason = null; LastDisconnectReasonIsOwn = false;   // lobby review item 5: before any early return
+            PlayerColours.ResetSession();   // colours r2 (MINOR-5): a new connection starts with an empty slot map
+            ShopRadio.ResetSession();       // RADIO-SHOP-1: the loudspeaker streams are the host's word, per session
+            VanLiveries.ResetSession();     // GO-LIVERY-1: the other players' van liveries, per session
+            HostNeedsKey = false;           // STEAM-FRIEND-JOIN-1: learned from the world snapshot
+            MPNeedsTuning.SetPowerNapAllowed(true, "new connection");   // POWERNAP r2 (review r1 MINOR-4): the host's gate is re-learned from the DTO/heartbeat; never carry a previous host's OFF
+            ModMismatchVsHost = "";   // fresh connection, fresh verdict (round-253f)
+            // Round-229: unreliable hooks — refuse to join (see MPServer.Start).
+            if (ModEntry.MpDisabledByPatchFailure)
+            {
+                Plugin.Logger.LogError($"[Client] Join refused: {ModEntry.PatchFailureNotice}");
+                try { UI.Notification.Notifications.Show(UI.Notification.NotificationType.Error, ModEntry.PatchFailureNotice); } catch { }
+                return;
+            }
+            JsonWarmup.Ensure();   // JSON-WARMUP-1: the message types' JSON contracts on the main thread, before the network thread runs
+            // A previous session/attempt may still be live (exited to the menu
+            // without disconnecting, or an autopilot retry).  Tear it down so we
+            // never run two transports/poll threads at once.
+            if (_transport != null) Disconnect();
+            LastDisconnectReason = "";
+            FriendlyDisconnectReason = null; LastConnectPath = "ip"; LastConnectTargetClass = AddressClass(hostIp); LastConnectPort = port; _connectClock.Restart();
+            SessionEnded = false;
+            HostIsDedicated = false;
+            DedicatedHostPlayerId = "";
+            ServerRules.Apply(null);   // SERVER-RULES-1: the new server sends its own
+            _voluntaryDisconnect = false;
+            _connected = false;
+            _deferredDisconnectFrame = -1;   // R2: a new connection never inherits a held close
+            SteamOwnership.RequestTicket();  // STEAM-OWNER-1: a fresh Steam ticket for the Hello (after the old session's teardown)
+
+            var t = new LnlClientTransport();
+            t.Connected    += OnConnected;
+            t.Disconnected += (r, x) => OnDisconnectedFrom(t, r, x);   // review M3: tagged with its sender
+            t.Received     += OnReceive;
+            _transport = t;
+            if (!t.Connect(hostIp, port))
+            { Plugin.Logger.LogError($"[Client] transport failed to start toward {MPConfig.AddressTag(hostIp)}:{port}."); _transport = null; return; }
+
+            // IP-IN-LOGS-1: logs reach bug reports - the host's address is logged as a non-reversible tag (streamer rule).
+            Plugin.Logger.LogInfo($"[Client] Connecting to {MPConfig.AddressTag(hostIp)}:{port} ({LastConnectTargetClass} address, direct IP; connect attempts/delay: {DescribeConnectPolicy()})...");
+        }
+
+        /// <summary>Connect over Valve's relay network by the host's SteamId
+        /// (slice 2) — no port forwarding, no IP.  Same session flow as the IP
+        /// path from the Hello onward; the seam hides the transport.</summary>
+        public static bool ConnectSteam(ulong hostSteamId)
+        {
+            JoinStatus = "";   // JOIN-WAIT-1 (re-check R5): the Steam entry starts clean too, like Connect()
+            LastDisconnectReason = ""; FriendlyDisconnectReason = null; LastDisconnectReasonIsOwn = false;   // lobby review item 5: before any early return
+            PlayerColours.ResetSession();   // colours r2 (MINOR-5): a new connection starts with an empty slot map
+            ShopRadio.ResetSession();       // RADIO-SHOP-1: the loudspeaker streams are the host's word, per session
+            VanLiveries.ResetSession();     // GO-LIVERY-1: the other players' van liveries, per session
+            HostNeedsKey = false;           // STEAM-FRIEND-JOIN-1: learned from the world snapshot
+            MPNeedsTuning.SetPowerNapAllowed(true, "new connection");   // POWERNAP r2 (review r1 MINOR-4): the host's gate is re-learned from the DTO/heartbeat; never carry a previous host's OFF
+            // Round-229: unreliable hooks — refuse to join (see MPServer.Start).
+            if (ModEntry.MpDisabledByPatchFailure)
+            {
+                Plugin.Logger.LogError($"[Client] Steam join refused: {ModEntry.PatchFailureNotice}");
+                try { UI.Notification.Notifications.Show(UI.Notification.NotificationType.Error, ModEntry.PatchFailureNotice); } catch { }
+                return false;
+            }
+            if (_transport != null) Disconnect();
+            LastDisconnectReason = "";
+            FriendlyDisconnectReason = null; LastConnectPath = "steam"; LastConnectTargetClass = "steam relay"; LastConnectPort = 0; _connectClock.Restart();
+            SessionEnded = false;
+            HostIsDedicated = false;
+            DedicatedHostPlayerId = "";
+            ServerRules.Apply(null);   // SERVER-RULES-1: the new server sends its own
+            _voluntaryDisconnect = false;
+            _connected = false;
+            _deferredDisconnectFrame = -1;   // R2: a new connection never inherits a held close
+            SteamOwnership.RequestTicket();  // STEAM-OWNER-1: a fresh Steam ticket for the Hello (after the old session's teardown)
+
+            var t = new SteamClientTransport();
+            t.Connected    += OnConnected;
+            t.Disconnected += (r, x) => OnDisconnectedFrom(t, r, x);   // review M3: tagged with its sender
+            t.Received     += OnReceive;
+            _transport = t;
+            if (!t.Connect(hostSteamId))
+            { Plugin.Logger.LogError($"[Client] Steam relay connect toward {hostSteamId} failed to start."); _transport = null; return false; }
+
+            Plugin.Logger.LogInfo($"[Client] Connecting via Steam relay to {hostSteamId}...");
+            return true;
+        }
+
+        public static void Disconnect()
+        {
+            // Initiator forensics (see MPServer.Stop note).
+            if (_transport is { IsRunning: true })
+                Plugin.Logger.LogWarning($"[Client] DISCONNECT called from: {Environment.StackTrace}");
+            _voluntaryDisconnect = true;   // deliberate — never the session-over lock
+            PlayerColours.ResetSession();   // 2026-09-05 colours: the slot map is per session
+            ShopRadio.ResetSession();       // RADIO-SHOP-1: and the host's loudspeaker streams
+            VanLiveries.ResetSession();     // GO-LIVERY-1: and the other players' van liveries
+            SteamOwnership.Cancel();        // STEAM-OWNER-1: the ticket is spent
+            ModMismatchVsHost = "";        // round-253f: the verdict dies with the connection
+            _transport?.Disconnect();
+            _transport = null;
+            _connected = false;
+            ClearNotSentLog();   // CROSSHR-ROSTER-1 fold b: the once-per-type set is per connection, not per process
+            IsInLobby = true;
+            _lobbyPlayers = new List<string>();
+        }
+
+        // R2 (H-STANDINTILL-1 remnant, 2026-09-28): the mod's Disconnect button is a deliberate leave. The last
+        // paperwork publish is sent first; a bare socket close discards queued reliable data (SteamClientTransport
+        // .Disconnect -> ConnectionManager.Close without linger), so when a bundle went out the close waits one frame.
+        private static int _deferredDisconnectFrame = -1;
+        // H5 (review of 480184b, 2026-09-28): the held close waits for the event "the host acknowledged receiving the leave
+        // bundle" (PaperworkSync.LeaveReceiptIn - the host's receipt), bounded by this ceiling in real seconds. The transport's
+        // PendingReliable is no proof: LiteNetLib's GetPacketsCountInReliableQueue counts only packets not yet SENT, so it
+        // can read 0 before the host has the bundle; it is logged at the ceiling only.
+        private static float _deferredDisconnectSince;
+        private const float DeferredCloseCeilingS = 2f;
+
+        /// <summary>R2: a deliberate leave through the mod (the Disconnect button, the DEV leavegame lever): publish the
+        /// books once (PaperworkSync.LeaveFlush), then disconnect - one frame later when a bundle was just sent.
+        /// Main thread.</summary>
+        public static void DisconnectAfterLeavePublish(string anchor)
+        {
+            // D2: a second Disconnect click while the held close is pending changes nothing.
+            if (_deferredDisconnectFrame >= 0)
+            {
+                Plugin.Logger.LogInfo($"[Client] disconnect ({anchor}): a close is already pending - ignored.");
+                return;
+            }
+            bool published = false;
+            try { published = PaperworkSync.LeaveFlush(anchor); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Client] leave publish ({anchor}): {ex.Message}"); }
+            if (!published) { Disconnect(); return; }
+            try
+            {
+                _deferredDisconnectFrame = UnityEngine.Time.frameCount;
+                _deferredDisconnectSince = UnityEngine.Time.unscaledTime;
+                Plugin.Logger.LogInfo($"[Client] disconnect ({anchor}) held (frame {_deferredDisconnectFrame}) until the host acknowledges receiving the leave publish (at most {DeferredCloseCeilingS:0} s).");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[Client] deferred disconnect ({anchor}): {ex.Message} - disconnecting now");
+                _deferredDisconnectFrame = -1;
+                Disconnect();
+            }
+        }
+
+        /// <summary>R2: the held close, run from the per-frame TickWorldReadyGate on the first later frame.</summary>
+        private static void TickDeferredDisconnect()
+        {
+            if (_deferredDisconnectFrame < 0) return;
+            try
+            {
+                int now = UnityEngine.Time.frameCount;
+                if (now <= _deferredDisconnectFrame) return;
+                bool acked = false;
+                try { acked = PaperworkSync.LeaveReceiptIn; } catch { acked = false; }
+                float waited = UnityEngine.Time.unscaledTime - _deferredDisconnectSince;
+                if (!acked && waited < DeferredCloseCeilingS) return;   // the event: the host's receipt (or the ceiling)
+                _deferredDisconnectFrame = -1;
+                if (acked)
+                    Plugin.Logger.LogInfo($"[Client] deferred disconnect: closing now (frame {now}, {waited * 1000f:0} ms) - the host acknowledged receiving the leave publish (acked); the close lingers.");
+                else
+                {
+                    int pend = -1;
+                    try { pend = _transport?.PendingReliable ?? -1; } catch { pend = -1; }
+                    Plugin.Logger.LogInfo($"[Client] deferred disconnect: closing now (frame {now}, {waited * 1000f:0} ms) at the {DeferredCloseCeilingS:0} s ceiling without the host's receipt ({pend} reliable unit(s) not yet sent by the transport, -1 = unknown) - the close lingers (ceiling).");
+                }
+                Disconnect();
+            }
+            catch (Exception ex) { _deferredDisconnectFrame = -1; Plugin.Logger.LogWarning($"[Client] deferred disconnect: {ex.Message}"); }
+        }
+
+        /// <summary>LEAVE-SERVER-1: reliable data the transport has not sent yet (-1 = unknown).</summary>
+        internal static int PendingReliableNow { get { try { return _transport?.PendingReliable ?? -1; } catch { return -1; } } }
+
+        /// <summary>LEAVE-SERVER-1: the pause menu's "Leave server" - back to the main menu through the game's own city exit
+        /// (the path an in-game ban and a lost dedicated server take). Main thread.</summary>
+        internal static void ExitToMainMenu(string what)
+        {
+            _exitWhat = what;
+            _banExitPending = true; _banExitWaitLogged = false; _banExitUiLogged = false; _banExitWaitWhy = -1;
+            TickBanExit();
+        }
+
+        /// <summary>H6 (review of 480184b, 2026-09-28): the application is quitting while the held close still waits for the
+        /// host's receipt - close now through Disconnect() (the Steam close lingers) instead of leaving the socket to the
+        /// shutdown, which drops what is queued. MPCanvasUI.OnApplicationQuit, main thread.</summary>
+        internal static void CloseHeldOnQuit()
+        {
+            if (_deferredDisconnectFrame < 0) return;
+            try
+            {
+                _deferredDisconnectFrame = -1;
+                Plugin.Logger.LogInfo("[Client] application quit with the held close pending - closing now (the close lingers).");
+                Disconnect();
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Client] held close on quit: {ex.Message}"); }
+        }
+
+        // ── Events ────────────────────────────────────────────────────────────
+
+        private static void OnConnected()
+        {
+            Plugin.Logger.LogInfo("[Client] Connected to host.");
+            _connected = true;
+            AutoRejoin.Connected();   // RECONNECT-1
+            try { PaperworkSync.ClearLeaveLatch(); } catch { }   // R2: this connection may publish its own leave once
+            // Round-283: freshness state is PER SESSION.  The host's Seq counter starts at 1 in a
+            // fresh host process, so a last-seen carried over from a previous connection would drop
+            // every heartbeat of this one.  Host capability is re-learned from the next LobbyUpdate;
+            // until it arrives we assume the conservative answer (no express).
+            ResetClockSyncFreshness();
+            HostExpressLane = false;
+            ServedLoadGen   = 0;   // round-284: a load ticket is only meaningful to the host that minted it
+            OfflineFork     = false;   // review r5 #6: an in-place reconnect ends the offline fork
+
+            // RECONNECT: the host's vote tally + any in-flight skip are gone on its side — clear our stale
+            // copy so a leftover SkipActive or phantom vote rows don't wedge the rest dock / world-clock
+            // detector after we rejoin (skip state used to reset only on scene LOAD, never on a same-scene
+            // reconnect → 2026-06-19 bug). Local seating is preserved. Harmless on the first connect
+            // (state already empty). Marshalled — it mutates lists the main thread reads.
+            GameStatePatcher.EnqueueOnMainThread(() => { try { MPRestSync.ClearVotesOnReconnect(); } catch { } });
+            GameStatePatcher.EnqueueOnMainThread(ResetWorldSettings);   // SAVED-SETTINGS-1: the applied rev is per connection
+
+            IsInLobby = true;
+            _lobbyPlayers = new List<string>();
+            // EFFORT BATCH 29 (R2): the rival id feed is PER SESSION - a new connection never inherits the
+            // previous session's "ready/injected" latches (marshalled: the queue is main-thread state).
+            try { GameStatePatcher.EnqueueOnMainThread(() => GameStatePatcher.ResetClientRivalFeed("new connection")); } catch { }
+
+            // Send Hello
+            string steamTicket = SteamOwnership.TicketHex(out string steamTicketFor);   // STEAM-OWNER-1 (waits up to 3 s for Steam)
+            var hello = new HelloPayload
+            {
+                PlayerId = MPConfig.PlayerId,
+                Version  = MyPluginInfo.PLUGIN_VERSION,
+                JoinKey  = MPConfig.JoinKey,   // DEDICATED-KEY-1
+                SteamTicket = steamTicket,
+                SteamTicketIdentity = steamTicketFor,
+                SteamCheck = true,   // STEAM-OWNER-1: a fact about this assembly, like CargoDelta below
+                StableId = MPConfig.StableId,
+                Protocol = ProtocolInfo.Version,
+                Game     = MPSaveManager.GameVersionNameCached(),
+                // CACHED read only — OnConnected runs on the LiteNetLib network thread and
+                // computing this touches Unity asset loading (crash 2026-07-27).
+                Content  = MPContentFingerprint.Cached,
+                Mods     = MPContentFingerprint.CachedMods,  // round-253: host diffs + informs on mismatch
+                GameBuild = MPContentFingerprint.GameBuildId,   // MACBUILD-1: "b<number>" — host refuses a mismatch. CACHED read (main-thread computed)
+                GameModule = MPContentFingerprint.GameModuleId,  // MACBUILD-1: diagnostic only — per-platform, so never gated
+                // Round-281: "I have the InteriorCargoSync handler."  A literal true is the whole
+                // point — the flag's meaning is "this build contains the receiver", which is a
+                // compile-time fact about the assembly being sent, not a runtime setting.
+                CargoDelta = true,
+                // Round-283: "I drop stale GameTimeSync by Seq."  Also a literal true — the flag
+                // states a compile-time fact about this assembly (the guard is in
+                // HandleGameTimeSync below), not a runtime setting.  The host expresses clock
+                // sends only to peers that raise it.
+                ExpressLane = true
+            };
+            // Phase 3: offer any pending disconnect save (un-uploaded progress from our last leave). The
+            // host decides whether to request it; it never auto-overrides a host save.
+            try
+            {
+                var dc = MPSaveCoordinator.ReadClientDisconnectMarker();
+                if (dc != null && !string.IsNullOrEmpty(dc.SessionBase))
+                {
+                    hello.HasDisconnectSave     = true;
+                    hello.DisconnectSessionBase = dc.SessionBase;
+                    hello.DisconnectDay         = dc.Day;
+                    hello.DisconnectSavedAtUnix = dc.SavedAtUnix;
+                    hello.DisconnectPlaythroughId = dc.PlaythroughId ?? "";   // handoff slice 3: lineage tag
+                }
+            }
+            catch { }
+            Send(MessageEnvelope.Create(MessageType.Hello, MPConfig.PlayerId, hello));
+            // JOIN-WAIT-1 (C3): a mid-game join can now sit here for as long as the host takes to click accept.
+            _helloClock.Restart(); _helloSentAtText = System.DateTime.Now.ToString("HH:mm:ss");
+            _joinWaitNextAt = 0f; _joinWaitLines = 0;
+        }
+
+        /// <summary>H-REFUSALMUTE-1 review M3: handlers are never unsubscribed, so an OLD transport's late report
+        /// (its reader thread stuck past Disconnect's 1 s join while the player reconnected) must not end the NEW
+        /// session - OnDisconnected would stop the new reader. A report from a transport that is not the current
+        /// one is ignored while a newer one is live; with no transport at all it goes through, as before.</summary>
+        private static void OnDisconnectedFrom(IClientTransport sender, string reason, byte[] extra)
+        {
+            var cur = _transport;
+            if (cur != null && !ReferenceEquals(cur, sender))
+            {
+                Plugin.Logger.LogInfo($"[Client] late disconnect report ({reason}) from a previous connection ignored - a newer connection is live.");
+                return;
+            }
+            OnDisconnected(reason, extra, sender);
+        }
+
+        private static void OnDisconnected(string reason, byte[] extra, IClientTransport? sender = null)
+        {
+            try { PaperworkSync.Reset(); } catch { }   // P3-A r3 (re-review r2 MINOR-1): per-world publisher state dies with the connection
+            // P3-B r4 C1 (CRASH CLASS): OnDisconnected runs on the NETWORK POLL thread (LiteNetLib's poll thread;
+            // for Steam the client transport's pump thread since H-REFUSALMUTE-1), and Reset() is
+            // an UNDO - it mutates gi.DeliveryContracts, the four plan lists, movingServiceContracts,
+            // the licensing lists, itemsOrderedThisWeekByImporter, gi.EmployeeInstances and the employee
+            // dictionary. Off the main thread that is exactly the 0xc0000005 class MPSaveCoordinator
+            // warns about at its save choke point, so it is MARSHALLED - the same thing the host's own
+            // peer-disconnect cleanup does for its main-thread-owned maps. Ordering: the offline-fork
+            // save is a Harmony prefix on SaveGameManager.Save and therefore main-thread too, and that
+            // prefix ALREADY takes the installed items and the promoted staff out for the write and puts
+            // them back after, so a fork save that beats this drain still cannot write an absent owner's
+            // paperwork into the player's own .hsg.
+            try { GameStatePatcher.EnqueueOnMainThread(MergerAbsence.Reset); } catch { }
+            // PHASE 4b R10 (r2 re-check): OnDisconnected does NOT clear MergerSync._groupByPid here (only a
+            // MergerState receive writes it), so IAmMember stays true at this point and the feed's
+            // membership tick never fires its clear - a partner's rows would keep showing on a machine
+            // that is no longer connected to anyone. Marshalled to the main thread exactly as the
+            // absence reset above is; it touches tracking only, never any game state.
+            // D25 (2026-09-12): the merged-company VIEW itself now goes too, but only after a short
+            // GRACE armed below (MergerSync.ArmDropGrace) - a blip that reconnects keeps the company.
+            try { GameStatePatcher.EnqueueOnMainThread(() => CompanyFeed.ClearAll("the connection dropped")); } catch { }
+            try { GameStatePatcher.EnqueueOnMainThread(() => CompanyLists.ClearAll("the connection dropped")); } catch { }   // wave 4: no partner display copies without a session
+            try { GameStatePatcher.EnqueueOnMainThread(() => CompanyCandidates.ClearAll("the connection dropped")); } catch { }   // phase 4b (people): same rule for the shared candidate copies
+            try { GameStatePatcher.EnqueueOnMainThread(() => CompanyMessages.ClearAll("the connection dropped")); } catch { }     // phase 4b (people) P4: and for the relayed message copies
+            // FOLD r1 R3 (D1): the host drops every subscription this peer held when the link goes
+            // (InteriorSync.HandlePeerDisconnected), and a reconnect into the SAME scene is a real path
+            // (see the reconnect notes at :249-256), so the local ambient set must not outlive the link.
+            // Marshalled — it mutates sets the main-thread Hamptons patches own.
+            try { GameStatePatcher.EnqueueOnMainThread(HamptonsAccess.OnHostLinkLost); } catch { }
+            PlayerColours.ResetSession();   // colours r2 (MINOR-5): an involuntary drop ends the session too - Disconnect() only covers the voluntary path
+            ShopRadio.ResetSession();       // RADIO-SHOP-1: and the host's loudspeaker streams
+            VanLiveries.ResetSession();     // GO-LIVERY-1: and the other players' van liveries
+            SteamOwnership.Cancel();        // STEAM-OWNER-1: the ticket is spent
+            JoinStatus = "";   // JOIN-WAIT-1: the wait ends with the connection
+            _helloClock.Reset();
+            bool wasConnected = _connected;
+            // RECONNECT-1/2: a try ends with the link - failed, unless the server refused the join (a tagged close)
+            string rejoinTag = "";
+            try { if (extra != null && extra.Length > 0) rejoinTag = System.Text.Encoding.UTF8.GetString(extra); } catch { }
+            bool rejoinRefused = rejoinTag.Length > 0 && rejoinTag != "BAMP:hostquit";
+            GameStatePatcher.EnqueueOnMainThread(() => AutoRejoin.LinkEnded(wasConnected, rejoinRefused));
+            double secs = _connectClock.IsRunning ? _connectClock.Elapsed.TotalSeconds : -1;
+            Plugin.Logger.LogWarning($"[Client] Disconnected from host: {reason} after {secs:0.0}s via {LastConnectPath} ({LastConnectTargetClass}); session was {(wasConnected ? "ESTABLISHED" : _voluntaryDisconnect ? "closed by this player's own Disconnect" : "never established")}.");
+            // Host can attach a HUMAN reason (kick/reject/ban) as disconnect
+            // data — "RemoteConnectionClose" told the user nothing (2026-06-11).
+            string why = reason;
+            bool bannedInGame = false;   // BAN-PLAYERS-1 build C1 (owner decision 67 a)
+            ServerModDownload.Reset();   // a mods offer belongs to the refusal that made it
+            try
+            {
+                if (extra != null && extra.Length > 0)
+                {
+                    // RAW bytes (server sends UTF8 directly) — the transport hands
+                    // them over verbatim (LiteNetLib's length-prefixed GetString
+                    // threw and ate the kick/reject reason, 2026-06-11).
+                    string tag = System.Text.Encoding.UTF8.GetString(extra);
+                    if (tag == "BAMP:rejected") why = Loc.T("gps_reason_rejected", "Join REJECTED by host");
+                    // Round-282b: the host's quit path now closes links deliberately
+                    // (flush + tag) instead of letting the socket teardown drop them, so
+                    // name it — an orderly host exit used to reach the player as a bare
+                    // transport reason, indistinguishable from a crash or a network drop.
+                    // This changes the WORDING only: a host quit is still an involuntary
+                    // drop for us, so the session-ended notice and the disconnect save
+                    // below run exactly as before.
+                    else if (tag == "BAMP:hostquit") why = Loc.T("gps_reason_hostquit", "The host saved and left the session");
+                    else if (tag == "BAMP:kicked") why = Loc.T("gps_reason_kicked", "KICKED by host");
+                    else if (tag.StartsWith("BAMP:kicked:", StringComparison.Ordinal))   // ADMIN-1: the server's admin gave a reason
+                        why = Loc.T("gps_reason_kicked_why", "Kicked by the server: {0}", MPServer.TagText(tag.Substring(12)));
+                    else if (tag == "BAMP:full") why = Loc.T("gps_reason_full", "Join refused — the server is full. Try again later.");
+                    else if (tag == "BAMP:joinkeywait") why = Loc.T("gps_reason_joinkeywait", "Join refused — too many wrong server keys from your address. Try again in 10 minutes.");
+                    else if (tag == "BAMP:joinkey") why = Loc.T("gps_reason_joinkey", "Join refused — this server needs its key. Enter it in the Server key field of Join a Game.");
+                    // STEAM-OWNER-1: the server lets in only players whose Steam account owns the game
+                    else if (tag == "BAMP:steamticket") why = Loc.T("gps_reason_steamticket", "Join refused — this server checks with Steam that you own Big Ambitions. Start the game through Steam.");
+                    else if (tag == "BAMP:steamowner") why = Loc.T("gps_reason_steamowner", "Join refused — Steam did not confirm that your Steam account owns Big Ambitions.");
+                    else if (tag == "BAMP:steamwait") why = Loc.T("gps_reason_steamwait", "Join refused — the server is checking many Steam accounts right now. Try again in a moment.");
+                    else if (tag == "BAMP:banned") why = Loc.T("gps_reason_banned", "You're banned from this host's games.");   // BAN-PLAYERS-1 (A6, owner-approved text 2026-10-01): refused at join
+                    else if (tag == "BAMP:bannedgame") { why = Loc.T("gps_reason_bannedgame", "You were banned by the host."); bannedInGame = true; }
+                    else if (tag.StartsWith("BAMP:bannedgame:", StringComparison.Ordinal))   // ADMIN-1: with the admin's reason
+                    { why = Loc.T("gps_reason_bannedgame_why", "You were banned by the host: {0}", MPServer.TagText(tag.Substring(16))); bannedInGame = true; }
+                    else if (tag.StartsWith("BAMP:banned:", StringComparison.Ordinal))
+                        why = Loc.T("gps_reason_banned_why", "You're banned from this server: {0}", MPServer.TagText(tag.Substring(12)));   // BAN-PLAYERS-1 (A6): removed in game by a ban
+                    else if (tag == "BAMP:identity") why = Loc.T("gps_reason_identity", "Join refused — player identity invalid or already connected");
+                    else if (tag.StartsWith("BAMP:mods"))   // MODS-GATE-1: the host's 'Different mods: Refuse'
+                    {
+                        why = ModsRefusalFromTag(tag);
+                        // DEDICATED-HOST-1: the tag may name the host's Workshop mods; with the player's opt-in they are downloaded.
+                        try { why += ModAutoDownload.OnRefusalTag(tag); } catch { }
+                        // SERVER-MODS-1: a dedicated server offers its own mods for download (tag "dl=1")
+                        try { why += ServerModDownload.OnRefusalTag(tag, MPConfig.HostIP ?? "", MPConfig.JoinKey); } catch { }
+                    }
+                    else if (tag.StartsWith("BAMP:build"))
+                    {
+                        // 2026-09-01 (user-approved wording): same game version folder, different game build.
+                        why = Loc.T("gps_reason_build", "Join refused — game build mismatch. The host's game and yours are different builds. Update Big Ambitions on both machines, then rejoin.");
+                        // MACBUILD-1: the tag carries the host's "build|module", so this log names BOTH sides' values.
+                        // Equal builds with differing modules would mean the gate is comparing the wrong thing again.
+                        string bRest = tag.StartsWith("BAMP:build:") ? tag.Substring("BAMP:build:".Length) : "";
+                        var bParts = bRest.Split('|');
+                        string hostBuild  = bParts.Length > 0 && bParts[0].Length > 0 ? bParts[0] : "?";
+                        string hostModule = bParts.Length > 1 && bParts[1].Length > 0 ? bParts[1] : "?";
+                        Plugin.Logger.LogInfo($"[Client] game build mismatch: host {hostBuild} (module {hostModule}) vs mine {MPContentFingerprint.GameBuildId} (module {MPContentFingerprint.GameModuleId}).");
+                    }
+                    else if (tag.StartsWith("BAMP:version"))
+                    {
+                        // Tag carries the host's "mod|game" versions so we can name both sides.
+                        string rest = tag.StartsWith("BAMP:version:") ? tag.Substring("BAMP:version:".Length) : "";
+                        var parts = rest.Split('|');
+                        string hostMod  = parts.Length > 0 && parts[0].Length > 0 ? parts[0] : "?";
+                        string hostGame = parts.Length > 1 && parts[1].Length > 0 ? parts[1] : "?";
+                        why = Loc.T("gps_reason_version",
+                            "Join refused — version mismatch. Host: {0} {1} / {2}; you: {3} / {4}. Both players need the same mod and game version.",
+                            MyPluginInfo.SHORT_NAME, hostMod, hostGame, MyPluginInfo.PLUGIN_VERSION, MPSaveManager.GameVersionNameCached());
+                    }
+                    Plugin.Logger.LogInfo($"[Client] disconnect reason tag: '{tag}' → \"{why}\"");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Client] disconnect-tag read: {ex.Message}"); }
+            LastDisconnectReason = why;
+            LastDisconnectReasonIsOwn = !string.Equals(why, reason, StringComparison.Ordinal);   // a host tag was translated into our own sentence
+            // CONNECT-MSG: a direct-IP join that nobody answered gets a sentence a player can act on (approved wording 2026-09-06).
+            FriendlyDisconnectReason = (!wasConnected && LastConnectPath == "ip" && reason == "ConnectionFailed")
+                ? Loc.T("gps_reason_noanswer", "No host answered at that address. If your friend is on Steam, right-click their name and choose Join Game. Direct IP needs the host's public address and port {0} opened on their router.", LastConnectPort)
+                : null;
+            _connected = false;
+            // The connection is gone either way — stop the poll loop so
+            // IsConnecting goes false (the UI was stuck showing "Connecting…"
+            // forever after a ConnectionFailed).  StopPolling only (we're ON the
+            // poll thread - both transports report from it; SteamClientTransport's
+            // Disconnect() would not join its own thread either); the transport itself is torn down by the next
+            // Connect()'s guard, exactly as the pre-seam NetManager was.
+            // Re-check (M3 follow-up): stop the REPORTING transport, not whatever _transport holds by now -
+            // a Join clicked while this report was in flight must not have its new reader stopped.
+            (sender ?? _transport)?.StopPolling();
+            bool voluntary = _voluntaryDisconnect;
+            // Clean up all remote-player capsules on the main thread, and release
+            // the startup hold — we must not stay frozen after losing the host.
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                RemotePlayerManager.RemoveAll();
+                try { TrafficSync.RefeedAnchors("host lost"); } catch { }   // H-SVC-116: the avatars just died — never leave Gley holding them
+                TimeSync.EndStartupHold();
+                // Shared-shop management (permission feature): the link is gone, so no shop is shared with this
+                // player any more — an open page on one rebuilds itself (ruling 5). A reconnect re-pushes the set.
+                try { GrantSync.SetSharedManage(null); } catch { }
+                try { MPRegisterSync.DropBenchRecords("link lost"); } catch { }   // the owners' benches leave with the link
+                // D25 THE BLIP RULE (user 2026-09-12): a NON-voluntary drop starts the merged-company
+                // grace. A voluntary leave/quit is not armed - it ends at the scene boundary, which
+                // resets the runtime state outright (MergerSync.ResetSceneState).
+                // BAN-PLAYERS-1 build C1 (owner decision 67 a, 2026-10-02): a player banned in game just goes back to the main
+                // menu - no merged-company grace, no disconnect save or rejoin marker, no 'continue offline' single-player copy.
+                if (!voluntary && !bannedInGame) { try { MergerSync.ArmDropGrace(why); } catch { } }
+                // Involuntary drop while IN-GAME → the MP session is over for this
+                // client.  Freeze + notice; the player can dismiss it and keep
+                // playing offline as an SP fork.  (IL2CPP in-game check must run
+                // here on the main thread.)
+                try
+                {
+                    if (bannedInGame)
+                    {
+                        // D67: the reason line ("You were banned by the host.") is the menu's existing disconnect notice
+                        // (LastDisconnectReason, kept through the scene change - nothing clears it until the next join); build
+                        // C2 shows it over the main menu as the 'REMOVED FROM GAME' box (MPCanvasUI.NoteBannedInGame).
+                        // In the city, or on the way into it (anywhere but the main menu itself, including the first part of a
+                        // join load while the menu scene is still up - K2): a lobby ban stays on the menu.
+                        if (BanExitApplies())
+                        {
+                            Plugin.Logger.LogWarning("[Client] Banned by the host in game - back to the main menu (no disconnect save, no rejoin marker, no merged-company grace, no offline copy).");
+                            _exitWhat = "banned";
+                            _banExitPending = true; _banExitWaitLogged = false; _banExitUiLogged = false;
+                            MPCanvasUI.NoteBannedInGame();
+                            TickBanExit();   // now, unless a load is in flight (C1 re-check c2)
+                        }
+                    }
+                    else if (!voluntary && HostIsDedicated && BanExitApplies())
+                    {
+                        // DEDICATED-EXIT-1: a dedicated server crashed, stopped or became unreachable. Its world is the shared
+                        // one - an offline single-player fork of it makes no sense - so: keep the minutes the server never
+                        // received in the disconnect save (a rejoin restores them, as before), then the game's own city
+                        // exit (the ban path) and a notice over the main menu.
+                        bool inCity = SaveGameManager.Current != null && Helpers.PlayerHelper.PlayerController != null;
+                        Plugin.Logger.LogWarning($"[Client] Dedicated server lost ({why}) - back to the main menu{(inCity ? " after the disconnect save" : "")}.");
+                        MPLog.Dump("client: dedicated server lost");
+                        if (inCity) { try { MPSaveCoordinator.WriteClientDisconnectSave(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[Client] disconnect save: {ex.Message}"); } }
+                        string text = reason == "Timeout" || reason == "ConnectionFailed" || why == reason
+                            ? Loc.T("gps_notice_server_lost_timeout", "The server stopped responding - it crashed, restarted or the network dropped. Your progress was saved; join again when the server is back.")
+                            : Loc.T("gps_notice_server_lost_reason", "{0}. Your progress was saved; join again when the server is back.", why);
+                        MPCanvasUI.NoteMenuNotice(Loc.T("gps_notice_server_lost_title", "SERVER CONNECTION LOST"), text);
+                        // RECONNECT-1: the network or a server restart - the main menu joins again by itself. Never after a kick,
+                        // a ban or any other refusal: those carry their own tag (only "the server left" may carry one)
+                        string rtag = "";
+                        try { if (extra != null && extra.Length > 0) rtag = System.Text.Encoding.UTF8.GetString(extra); } catch { }
+                        if (rtag == "BAMP:hostquit"
+                            || (rtag.Length == 0 && (reason == "Timeout" || reason == "ConnectionFailed" || reason == "RemoteConnectionClose" || reason == "HostUnreachable")))
+                            AutoRejoin.Arm(why);
+                        _exitWhat = "server lost";
+                        _banExitPending = true; _banExitWaitLogged = false; _banExitUiLogged = false;
+                        TickBanExit();
+                    }
+                    else if (!voluntary && SaveGameManager.Current != null
+                                   && Helpers.PlayerHelper.PlayerController != null)
+                    {
+                        SessionEnded = true;
+                        GameStateReader.SetNativePause(true);   // true pause (red border) under the notice
+                        Plugin.Logger.LogWarning("[Client] Host connection lost in-game — session ended; notice shown (dismiss to continue offline as a single-player fork).");
+                        MPLog.Dump("client: host connection lost in-game");
+                        // Phase 2: snapshot our CURRENT state into the disconnect save (+marker) at the drop
+                        // moment, so a rejoin can restore the minutes the host never received. (Main thread.)
+                        MPSaveCoordinator.WriteClientDisconnectSave();
+                    }
+                }
+                catch { }
+            });
+        }
+
+        // ── BAN-PLAYERS-1 C1 re-check c2/c3: the in-game ban's exit to the main menu ──
+        private static bool _banExitPending, _banExitWaitLogged, _banExitUiLogged;
+        private static string _exitWhat = "banned";   // DEDICATED-EXIT-1: what armed the exit (log wording only)
+        private static int _banExitWaitWhy = -1;   // the last logged reason the exit is waiting (logged on change only)
+        internal static bool BanExitPending => _banExitPending;
+
+        /// <summary>K2 (C2 review fold): a ban in game - or on the way into the city - arms the exit to the main menu. The main
+        /// menu's object stays alive for the first part of a join load (the loading screen fades in and the game's own mod
+        /// scope unloads before the menu scene goes - LoadingScreen.cs:90-104), so the menu being there is not enough to call
+        /// it a lobby ban: a load in flight (the game's loading flag, or its loading screen up) arms the exit too, and
+        /// TickBanExit decides when it can run. A lobby ban (the menu up, no load) stays on the menu.</summary>
+        internal static bool BanExitApplies()
+        {
+            bool inCity = SaveGameManager.Current != null && Helpers.PlayerHelper.PlayerController != null;
+            if (inCity || InstanceBehavior<MainMenuController>.Instance == null) return true;
+            return LoadScene.isLoading || MPCanvasUI.IsLoadingOverlayUp();
+        }
+
+#if BAMP_DEV
+        /// <summary>DEV (t-ban K2 probe): true in the first part of a join load - the game's loading flag set, the main menu's
+        /// object still alive, the city not live yet.</summary>
+        internal static bool DevInJoinLoadWindow(out string state)
+        {
+            bool menu = InstanceBehavior<MainMenuController>.Instance != null;
+            bool inCity = SaveGameManager.Current != null && Helpers.PlayerHelper.PlayerController != null;
+            bool loading = LoadScene.isLoading;
+            state = $"main menu up {menu}, loading flag {loading}, loading screen up {MPCanvasUI.IsLoadingOverlayUp()}, city live {inCity}";
+            return menu && loading && !inCity;
+        }
+#endif
+
+        /// <summary>MAIN THREAD, every frame (MPCanvasUI.Update) while an in-game ban's exit is pending. c2: a ban that lands
+        /// while the game's loading screen is up waits for the load to finish - the city live and the loading screen gone
+        /// (starting the city exit during a load left the city stuck 'unloading' with no notice). c3: the exit is the game's own pause-menu path (MiniMenu.OpenMainMenu,
+        /// decompile MiniMenu.cs:139): OverlayManager.HideOverlays first, then LoadMainMenuFromCity - NEVER the direct
+        /// LoadMainMenu (it skipped the city-unload flag and flooded the menu with errors, rig run T-BAN-20261002-020755);
+        /// with no live UI host to run the coroutine it waits for one. At the main menu already (the load went there) = done.</summary>
+        internal static void TickBanExit()
+        {
+            if (!_banExitPending) return;
+            try
+            {
+                // The load is finished when the city is live (save + player), the game's loading screen is gone
+                // (MPCanvasUI.IsLoadingOverlayUp - the LoadingScreen object and its fade) AND the game has cleared its own
+                // loading flag (LoadingScreen.cs:118, before its fade-out): the game's LoadScenes ignores any load while that
+                // flag is set (LoadScene.cs:58), so the exit waits for it - the mod never clears it (K3, C2 review fold: the
+                // flag is the game's; T-BAN-20261002-041718 shows the game clearing it itself after a ban during a join load).
+                bool inCity = SaveGameManager.Current != null && Helpers.PlayerHelper.PlayerController != null;
+                bool overlay = MPCanvasUI.IsLoadingOverlayUp();
+                bool loading = LoadScene.isLoading;
+                if (!inCity && InstanceBehavior<MainMenuController>.Instance != null && !overlay && !loading)
+                {
+                    _banExitPending = false;
+                    Plugin.Logger.LogInfo($"[Client] {_exitWhat}: already at the main menu - no city exit needed.");
+                    return;
+                }
+                int why = !inCity ? 1 : overlay ? 2 : loading ? 3 : 0;
+                if (why != 0)
+                {
+                    if (!_banExitWaitLogged) { _banExitWaitLogged = true; Plugin.Logger.LogInfo($"[Client] {_exitWhat} while the game is loading - the exit to the main menu waits for the load to finish."); }
+                    if (why != _banExitWaitWhy)
+                    {
+                        _banExitWaitWhy = why;
+                        string w = why == 1 ? "the city is not live yet" : why == 2 ? "the loading screen is still up"
+                                 : "the game's loading flag is still set with the city live and no loading screen up - waiting for the game to clear it";
+                        Plugin.Logger.LogInfo($"[Client] {_exitWhat}: exit waiting - {w} (loading flag {loading}).");
+                    }
+                    return;
+                }
+                var ui = MPCanvasUI.Instance;
+                if (ui == null || !ui.isActiveAndEnabled)
+                {
+                    if (!_banExitUiLogged) { _banExitUiLogged = true; Plugin.Logger.LogWarning($"[Client] {_exitWhat}: no live UI host to run the game's city exit yet - waiting (never the direct LoadMainMenu)."); }
+                    return;
+                }
+                _banExitPending = false; _banExitWaitWhy = -1;
+                try { InstanceBehavior<Player.HUD.ItemInfoOverlays.OverlayManager>.Instance?.HideOverlays(); }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Client] {_exitWhat}: HideOverlays: {ex.Message}"); }
+                // The game's own city exit (pause-menu Main Menu / funeral path): it joins the save threads WITHOUT saving and
+                // flags the city unload before LoadMainMenu.
+                ui.StartCoroutine(LoadScene.LoadMainMenuFromCity());
+                Plugin.Logger.LogInfo($"[Client] {_exitWhat}: leaving the city for the main menu (the game's own exit: HideOverlays, then LoadMainMenuFromCity).");
+            }
+            catch (Exception ex) { _banExitPending = false; Plugin.Logger.LogWarning($"[Client] {_exitWhat}: city exit: {ex.Message}"); }
+        }
+
+        // ── Join quiesce: while a mid-join load is in flight, the HOST's live
+        // stream must not touch our half-loaded world — a remote player
+        // spawned and the clock hard-snapped MID-LOAD, leaving GameManager
+        // permanently broken (NRE every frame, 2026-06-11).  The lobby flow is
+        // protected by the startup hold; this is the mid-join equivalent.
+        private static volatile bool _joinQuiesce;
+        public static void BeginJoinQuiesce() { _joinQuiesce = true;  Plugin.Logger.LogInfo("[Client] join quiesce ON — world stream deferred until loaded."); }
+        public static void EndJoinQuiesce()
+        {
+            if (!_joinQuiesce) return;
+            _joinQuiesce = false;
+            Plugin.Logger.LogInfo("[Client] join quiesce OFF — world stream live.");
+            // WS1 (round-30): the world is live — publish every interior this machine owns so other
+            // players never depend on this owner ENTERING each building first.
+            try { InteriorSync.PublishAllOwnedInteriors("world live"); } catch { }
+        }
+
+        /// <summary>Round-170: the join-quiesce drops Interior*/Market*/Parked* traffic during load —
+        /// contested-tenancy must not START until it lifts, or the arbitration's direct snapshot to a
+        /// just-joined loser dies in this very filter (field: three runs of silent non-delivery).</summary>
+        internal static bool IsJoinQuiescing => _joinQuiesce;
+
+        // D1 (2026-09-18): the size of the frame being dispatched RIGHT NOW, exactly as it arrived on
+        // the wire (deflated where the envelope deflates, reassembled by LiteNetLib). OnReceive parses
+        // and dispatches in the SAME call, so a handler reading this reads its own frame. Diagnostics
+        // only — nothing routes on it.
+        private static int _frameBytes;
+
+        private static void OnReceive(byte[] bytes)
+        {
+            MPNetStats.NoteIn(MPNetStats.PeekType(bytes), bytes.Length);   // T0 (review M8: torn frames count in bucket 0)
+            _frameBytes = bytes.Length;
+            var env = MessageEnvelope.Deserialize(bytes);
+            if (env == null) return;
+
+            // Streaming world traffic is DROPPED during a join load (snapshots
+            // re-arrive via the world-ready flow; streams resume on their own).
+            if (_joinQuiesce)
+                switch (env.Type)
+                {
+                    case MessageType.PlayerMove:
+                    case MessageType.GameTimeSync:
+                    case MessageType.VehicleSync:
+                    case MessageType.PlayerAnimTrigger:
+                    case MessageType.AppearanceSync:
+                    case MessageType.RestSkipState:
+                        return;
+                    default:
+                        // Round-188: the name filter covered 4 families; these types also WRITE
+                        // world/save state during the load window.  Round-197 CORRECTION: the
+                        // original claim "everything dropped is recurrence-covered" was FALSE for
+                        // the event-driven one-shots in this list (RivalsSnapshot, PlayerStaffRoster,
+                        // BusinessChange deltas, RegisterCashier toggles, Rent/Vacate ownership
+                        // events) — each is now re-sent by the host at this client's WorldReady
+                        // (MPServer.ResendJoinerState), the first moment provably after this window.
+                        // Rent/Buy DENIES stay drop-safe (they answer actions a loading client
+                        // cannot have pending).  Deliberately NOT dropped: Welcome/LoadData
+                        // (join handshake), BusinessSnapshot (part of the initial world seed),
+                        // ReleaseClaim (a ONE-SHOT arbitration instruction — its handler defers
+                        // internally instead; dropping it would violate the retry contract).
+                        switch (env.Type)
+                        {
+                            case MessageType.BusinessChange:
+                            case MessageType.BusinessChangeBatch:
+                            case MessageType.RivalsSnapshot:
+                            case MessageType.RivalsStatsSnapshot:
+                            case MessageType.RegisterCashier:
+                            case MessageType.PlayerStaffRoster:
+                            case MessageType.RentConfirm:
+                            case MessageType.RentDeny:
+                            case MessageType.BuyDeny:
+                            case MessageType.VacateNotify:
+                            case MessageType.BuildingsForSale:   // v9: re-covered at WorldReady (ResendJoinerState)
+                                return;
+                        }
+                        if (env.Type.ToString().Contains("Parked") || env.Type.ToString().Contains("Traffic")
+                            || env.Type.ToString().Contains("Market") || env.Type.ToString().Contains("Interior"))
+                            return;
+                        break;
+                }
+
+            switch (env.Type)
+            {
+                case MessageType.LobbyUpdate:
+                    HandleLobbyUpdate(env);
+                    break;
+
+                case MessageType.StartGameNew:
+                    MPLoadProfiler.Mark("CLIENT recv StartGameNew");
+                    HandleStartGame(env, isNew: true);
+                    break;
+
+                case MessageType.StartGameLoad:
+                    MPLoadProfiler.Mark("CLIENT recv StartGameLoad");
+                    HandleStartGame(env, isNew: false);
+                    break;
+
+                case MessageType.Welcome:
+                    MPLoadProfiler.Mark("CLIENT recv Welcome (WorldSnapshot)");
+                    HandleWelcome(env);
+                    break;
+
+                case MessageType.StartupRelease:
+                    MPLoadProfiler.Mark("CLIENT recv StartupRelease (go-live)");
+                    HandleStartupRelease();
+                    break;
+
+                case MessageType.StartupStatus:
+                    HandleStartupStatus(env);
+                    break;
+
+                case MessageType.ManualPause:
+                    HandleManualPause(env);
+                    break;
+
+                case MessageType.RentConfirm:
+                    HandleRentConfirm(env);
+                    break;
+
+                case MessageType.PassengerBoardResult:
+                    HandlePassengerBoardResultMsg(env);
+                    break;
+
+                case MessageType.PassengerFollowEnter:
+                    HandlePassengerFollowEnterMsg(env);
+                    break;
+
+                case MessageType.VehicleRadio:   // PASSENGER-RADIO-1
+                    CarRadioSync.Receive(env.GetPayload<VehicleRadioPayload>());
+                    break;
+
+                case MessageType.PassengerFollowExit:
+                    HandlePassengerFollowExitMsg(env);
+                    break;
+
+                case MessageType.PassengerExit:
+                    HandlePassengerExitMsg(env);
+                    break;
+
+                case MessageType.VehicleLockSet:
+                    HandleVehicleLockMsg(env);
+                    break;
+
+                case MessageType.PassengerSnapshot:
+                    HandlePassengerSnapshotMsg(env);
+                    break;
+
+                case MessageType.PermissionSnapshot:
+                    HandlePermissionSnapshotMsg(env);
+                    break;
+
+                case MessageType.ServerNotice:
+                {
+                    // ADMIN-1: the server admin's announcement - on screen (the chat line comes with it as well)
+                    var sn = env.GetPayload<ServerNoticePayload>();
+                    string text = MPServer.TagText(sn?.Text ?? "");
+                    if (text.Length > 0)
+                        GameStatePatcher.EnqueueOnMainThread(() =>
+                        {
+                            try { UI.Notification.Notifications.Show(UI.Notification.NotificationType.Warning, Loc.T("gps_admin_notice", "Server: {0}", text)); } catch { }
+                        });
+                    break;
+                }
+                case MessageType.PlayerLogRequest:
+                {
+                    // PLAYER-REPORTS-1: the server's admin asks for the Player.log - queued; the main thread answers
+                    // (sent only with the player's consent, else "refused")
+                    var lr = env.GetPayload<PlayerLogRequestPayload>();
+                    if (lr != null) PlayerReports.OnLogRequest(lr.RequestId);
+                    break;
+                }
+                case MessageType.ShopRadio:
+                {
+                    // RADIO-SHOP-1: the host's word on a building's loudspeaker stream (a change, or the join replay)
+                    var sr = env.GetPayload<ShopRadioPayload>();
+                    if (sr != null) GameStatePatcher.EnqueueOnMainThread(() => ShopRadio.Receive(sr));
+                    break;
+                }
+                case MessageType.VanLivery:
+                {
+                    // GO-LIVERY-1: another player's service van livery (a change, or the join replay)
+                    var vl = env.GetPayload<VanLiveryPayload>();
+                    if (vl != null) GameStatePatcher.EnqueueOnMainThread(() => VanLiveries.Receive(vl));
+                    break;
+                }
+                case MessageType.MergerDissolveSale:
+                {
+                    // DISSOLVE-SALE-1: every member agreed - sell everything this player owns, then report
+                    var ds = env.GetPayload<MergerDissolveSalePayload>();
+                    if (ds != null) GameStatePatcher.EnqueueOnMainThread(() => MergerDissolveSale.Begin(ds));
+                    break;
+                }
+                case MessageType.MergerState:
+                {
+                    var ms = env.GetPayload<MergerStatePayload>();
+                    // P3-B: the absence table rides the same broadcast (additive) - adopted beside the
+                    // membership so this machine knows who simulates what without a second message.
+                    if (ms != null) GameStatePatcher.EnqueueOnMainThread(() =>
+                    { MergerSync.ApplyState(ms); MergerAbsence.ApplyStateAbsences(ms); });
+                    break;
+                }
+
+                case MessageType.MergerWalletState:
+                {
+                    // Slice 4: the authoritative shared balance (or a targeted leave payout).
+                    var ws = env.GetPayload<MergerWalletStatePayload>();
+                    if (ws != null) GameStatePatcher.EnqueueOnMainThread(() => MergerWallet.ApplyState(ws));
+                    break;
+                }
+
+                case MessageType.BusinessEditRequest:
+                {
+                    // Host-relayed, grant-gated: this machine OWNS the shop — apply natively.
+                    var be = env.GetPayload<BusinessEditPayload>();
+                    if (be != null) GameStatePatcher.EnqueueOnMainThread(() => BusinessSync.ApplyRoutedTemporarilyClose(be));
+                    break;
+                }
+
+                case MessageType.MergerEmployeeEdit:
+                {
+                    // Slice 5, host-relayed: this machine OWNS the shop — apply the fire/schedule natively.
+                    var ee = env.GetPayload<EmployeeEditPayload>();
+                    if (ee != null) GameStatePatcher.EnqueueOnMainThread(() => MergerEmployeeSync.ApplyOnOwner(ee));
+                    break;
+                }
+
+                case MessageType.CompanyBooks:
+                {
+                    // MERGER PHASE 4a (D14): a co-member's daily books. Main thread - the overlay
+                    // mutates the live gi.financialSummaries objects every money surface reads.
+                    var cb = env.GetPayload<CompanyBooksPayload>();
+                    if (cb != null) GameStatePatcher.EnqueueOnMainThread(() => CompanyBooks.Receive(cb));
+                    break;
+                }
+
+                case MessageType.CompanyFeed:
+                {
+                    // MERGER PHASE 4b (D19-5): a co-member's money movements, or the join replay of
+                    // them. Main thread - the apply puts them in the MOD-SIDE REGISTRY only (r3
+                    // restructure); nothing is ever enqueued into gi.Transactions. The two transaction
+                    // screens build their partner rows from that registry when their lists are built.
+                    var cf = env.GetPayload<CompanyFeedPayload>();
+                    if (cf != null) GameStatePatcher.EnqueueOnMainThread(() => CompanyFeed.Receive(cf));
+                    break;
+                }
+
+                case MessageType.CompanyLists:
+                {
+                    // MERGER PHASE 2 WAVE 4 (V1, D18): a partner's delivery contracts and logistics plans as
+                    // DISPLAY COPIES. Host -> member only; the member never sends this type. Main thread -
+                    // it writes the game's own lists (tagged, and stripped at every save).
+                    var cl = env.GetPayload<CompanyListsPayload>();
+                    if (cl != null) GameStatePatcher.EnqueueOnMainThread(() => CompanyLists.Receive(cl));
+                    break;
+                }
+
+                case MessageType.MergerTax:
+                {
+                    // MERGER PHASE 4a / B9: "payown" = a partner paid for the company and this machine
+                    // must settle its own bill natively; "report" = a partner's result, for the payer's
+                    // log only (no on-screen text either way).
+                    var mt = env.GetPayload<MergerTaxPayload>();
+                    if (mt == null) break;
+                    if (mt.Action == "payown")      GameStatePatcher.EnqueueOnMainThread(() => CompanyBooks.PayOwnForCompany(mt.PayerPid));
+                    else if (mt.Action == "report") CompanyBooks.LogReport(mt, mt.PlayerId);
+                    else Plugin.Logger.LogWarning($"[Tax] refused a MergerTax from the host: action '{mt.Action}' is not one this direction carries.");
+                    break;
+                }
+
+                case MessageType.BusinessPaperwork:
+                {
+                    // H5 (review of 480184b, 2026-09-28): the host's RECEIPT for a bundle this client published
+                    // (StableId = PaperworkSync.ReceiptTag, no content) - the held Disconnect close waits for it.
+                    var pwReceipt = env.GetPayload<BusinessPaperworkPayload>();
+                    if (pwReceipt != null && pwReceipt.StableId == PaperworkSync.ReceiptTag)
+                    {
+                        int pwReceiptDay = pwReceipt.Day;
+                        int pwReceiptSeq = pwReceipt.Seq;   // K3 fold: the bundle number it answers (0 = an older host)
+                        GameStatePatcher.EnqueueOnMainThread(() => PaperworkSync.OnHostReceipt(pwReceiptDay, pwReceiptSeq));
+                        break;
+                    }
+                    // Otherwise merger phase 3-A is client -> HOST only: nothing here sends paperwork the other
+                    // way, so an arriving bundle means a future build (or a confused peer). Log and
+                    // drop - never write game state off an unexpected direction.
+                    Plugin.Logger.LogWarning("[Paperwork] a BusinessPaperwork arrived from the host - P3-A publishes client -> host only; ignored.");
+                    break;
+                }
+
+                case MessageType.MergerHandover:
+                {
+                    // MERGER PHASE 3-B: the host designated THIS machine to run an absent member's
+                    // businesses (or told it to stop). Main thread - the apply touches GameInstance.
+                    // P3-C: the SAME type, Return=true, is the RETURN LEG arriving at the OWNER - the
+                    // state of the businesses that were simulated while this machine was away. Also main
+                    // thread (it writes this save's own registrations, lists and staff).
+                    var hv = env.GetPayload<MergerHandoverPayload>();
+                    if (hv == null) break;
+                    if (hv.Return) GameStatePatcher.EnqueueOnMainThread(() => MergerAbsence.ApplyReturn(hv));
+                    else           GameStatePatcher.EnqueueOnMainThread(() => MergerAbsence.ApplyHandover(hv));
+                    break;
+                }
+
+                case MessageType.NotificationRelay:
+                {
+                    // Slice 6, host-relayed: a partner's business pop-up — show the GAME'S own toast here.
+                    var nr = env.GetPayload<NotificationRelayPayload>();
+                    if (nr != null) GameStatePatcher.EnqueueOnMainThread(() => NotificationRelay.ApplyRelayed(nr));
+                    break;
+                }
+
+                // ── Shared-shop management (Business PERMISSION feature) — separate from the merger case above ──
+                case MessageType.SharedScheduleEdit:
+                {
+                    // Host-relayed: this machine OWNS the shop — validate + apply the permitted player's days.
+                    var se = env.GetPayload<SharedScheduleEditPayload>();
+                    if (se != null) GameStatePatcher.EnqueueOnMainThread(() => SharedShopSchedule.ApplyOnOwner(se));
+                    break;
+                }
+                case MessageType.ScheduleSession:
+                {
+                    // Host-relayed: open/close from an editor if I own the shop; a snapshot from the owner if I am editing.
+                    var ss = env.GetPayload<ScheduleSessionPayload>();
+                    if (ss != null) GameStatePatcher.EnqueueOnMainThread(() => SharedShopSchedule.HandleSession(ss));
+                    break;
+                }
+                case MessageType.SharedStaffPool:
+                {
+                    // Host-relayed: an owner's bench (only reaches players that owner directly grants).
+                    var sp = env.GetPayload<SharedStaffPoolPayload>();
+                    if (sp != null) GameStatePatcher.EnqueueOnMainThread(() => SharedShopStaff.ApplyPool(sp));
+                    break;
+                }
+                case MessageType.SharedStaffEdit:
+                {
+                    // Host-relayed: this machine OWNS the employee — perform the native reassignment.
+                    var sf = env.GetPayload<SharedStaffEditPayload>();
+                    if (sf != null) GameStatePatcher.EnqueueOnMainThread(() => SharedShopStaff.ApplyOnOwner(sf));
+                    break;
+                }
+                case MessageType.CompanyCandidates:
+                {
+                    // Merger phase 4b (people) part 1: a co-member's candidate pool, a claim verdict, or
+                    // "somebody hired out of your pool". Main thread - it writes this save's candidate list.
+                    var cc = env.GetPayload<CompanyCandidatesPayload>();
+                    if (cc != null) GameStatePatcher.EnqueueOnMainThread(() => CompanyCandidates.Receive(cc));
+                    break;
+                }
+                case MessageType.CompanyMessages:
+                {
+                    // Merger phase 4b (people) P4: a co-member's relayed MESSAGE, a PRESS the host has
+                    // handed to this machine because it raised that message, or the owner's HANDLED mark.
+                    // Main thread - it writes this save's contacts.
+                    var cm = env.GetPayload<CompanyMessagePayload>();
+                    if (cm != null) GameStatePatcher.EnqueueOnMainThread(() => CompanyMessages.Receive(cm));
+                    break;
+                }
+                case MessageType.CargoTransfer:
+                {
+                    // Merger phase 4c part 2: one leg of a routed cargo transfer the host has handed to this
+                    // machine - a need ask or its answer, a deliver, an ack, or a give-back. Main thread -
+                    // the deliver and return legs move real stock through the game's own methods.
+                    var ct = env.GetPayload<CargoTransferPayload>();
+                    if (ct != null) GameStatePatcher.EnqueueOnMainThread(() => CargoTransfer.Receive(ct));
+                    break;
+                }
+                case MessageType.ImportTransfer:
+                {
+                    // H-MERGERIMPORT-1: one leg of a routed import line the host has handed to this machine
+                    // - a need ask or its answer, a paid deliver, or the warehouse's ack. Main thread - the
+                    // deliver leg places real stock through the game's own DeliverCargoToBuilding and the ack
+                    // leg books and refunds real money.
+                    var itp = env.GetPayload<ImportTransferPayload>();
+                    if (itp != null) GameStatePatcher.EnqueueOnMainThread(() => ImportTransfer.Receive(itp));
+                    break;
+                }
+                case MessageType.SharedPriceEdit:
+                {
+                    // Host-relayed: this machine OWNS the shop — write the price into both native lists.
+                    var pe = env.GetPayload<SharedPriceEditPayload>();
+                    if (pe != null) GameStatePatcher.EnqueueOnMainThread(() => SharedShopPrices.ApplyOnOwner(pe));
+                    break;
+                }
+                case MessageType.SharedSalesHistory:
+                {
+                    // "request" reaches the owner; "snapshot" reaches the one editor that asked.
+                    var sh = env.GetPayload<SharedSalesHistoryPayload>();
+                    if (sh != null) GameStatePatcher.EnqueueOnMainThread(() => SharedShopPrices.HandleSalesHistory(sh));
+                    break;
+                }
+                case MessageType.ShopValuation:
+                {
+                    // H-BIZ-1: "request" reaches the owner; "answer" reaches the one viewer that asked.
+                    var sv = env.GetPayload<ShopValuationPayload>();
+                    if (sv != null) GameStatePatcher.EnqueueOnMainThread(() => ShopValuation.Handle(sv));
+                    break;
+                }
+
+                case MessageType.SharedWorkInfo:
+                {
+                    // "request" reaches the owner; "snapshot" reaches the one helper that asked (slice 6).
+                    var wi = env.GetPayload<SharedWorkInfoPayload>();
+                    if (wi != null) GameStatePatcher.EnqueueOnMainThread(() => SharedShopWorkTabs.HandleWorkInfo(wi));
+                    break;
+                }
+
+                case MessageType.SharedWorkEdit:
+                {
+                    // A helper's routed warehouse/factory edit, arriving at the OWNER (slice 6b/6c).
+                    var we = env.GetPayload<SharedWorkEditPayload>();
+                    if (we != null) GameStatePatcher.EnqueueOnMainThread(() => SharedShopWorkTabs.OwnerApplyEdit(we));
+                    break;
+                }
+
+                case MessageType.MergerRequest:
+                {
+                    // r4: NOTIFICATIONS ONLY. The Accept/Decline row and the "Cancel offer" chip are derived
+                    // from MergerState.Offers in MergerSync.ApplyState, which arrives one round trip behind
+                    // this toast — nothing here writes UI state, and a withdraw is silent (no relay at all).
+                    var mr = env.GetPayload<MergerRequestPayload>();
+                    if (mr == null) break;
+                    GameStatePatcher.EnqueueOnMainThread(() =>
+                    {
+                        if (mr.Action == "proposal")
+                            PassengerHud.Toast($"{mr.FromPid} proposes a company merger — see Permissions.");
+                        else if (mr.Action == "declined")
+                            PassengerHud.Toast("Merger proposal declined.");
+                        else if (mr.Action == "cooldown")
+                            PassengerHud.Toast("Wait a minute before proposing to them again.");
+                        else if (mr.Action == "busy")   // phase 1-A r2: the other side already holds a pending offer (wording approved 2026-09-11)
+                            PassengerHud.Toast("They already have an offer pending.");
+                    });
+                    break;
+                }
+
+                case MessageType.PermissionOwnGrants:
+                    HandlePermissionOwnGrantsMsg(env);
+                    break;
+
+                case MessageType.PermissionBuildingAccess:
+                    HandlePermissionBuildingAccessMsg(env);
+                    break;
+
+                case MessageType.RentDeny:
+                    HandleRentDeny(env);
+                    break;
+
+                case MessageType.VacateNotify:
+                    HandleVacate(env);
+                    break;
+
+                case MessageType.BuyDeny:
+                    HandleBuyDeny(env);
+                    break;
+
+                case MessageType.MarketSnapshot:
+                    HandleMarketSnapshot(env);
+                    break;
+
+                case MessageType.PlayerMove:
+                    HandlePlayerMove(env);
+                    break;
+
+                case MessageType.PlayerAnimTrigger:
+                    HandleAnimTrigger(env);
+                    break;
+
+                case MessageType.VehicleSync:
+                    HandleVehicleSync(env);
+                    break;
+
+                case MessageType.VehicleDrive:
+                    HandleVehicleDriveMsg(env);
+                    break;
+
+                case MessageType.TrafficSnapshot:
+                    HandleTrafficSnapshot(env);
+                    break;
+
+                case MessageType.TrafficLights:
+                    HandleTrafficLights(env);
+                    break;
+
+                case MessageType.TrafficMode:
+                    HandleTrafficMode(env);
+                    break;
+
+                case MessageType.ParkedSnapshot:
+                    HandleParkedSnapshot(env);
+                    break;
+
+                case MessageType.PlayerLeft:
+                    HandlePlayerLeft(env);
+                    break;
+
+                case MessageType.AppearanceSync:
+                    HandleAppearanceSync(env);
+                    break;
+
+                case MessageType.GameTimeSync:
+                    HandleGameTimeSync(env);
+                    break;
+
+                case MessageType.BusinessSnapshot:
+                    MPLoadProfiler.Mark($"CLIENT recv BusinessSnapshot ({env.Data?.Length ?? 0} bytes json)");
+                    HandleBusinessSnapshot(env);
+                    break;
+
+                case MessageType.BusinessChange:
+                    HandleBusinessChange(env);
+                    break;
+
+                case MessageType.BusinessChangeBatch:
+                    HandleBusinessChangeBatch(env);
+                    break;
+
+                case MessageType.BuildingsForSale:
+                    // v9 (T6): the daily buy-marketplace refresh — just the list.
+                    GameStatePatcher.ApplyBuildingsForSaleMsg(env.GetPayload<BuildingsForSalePayload>()?.BuildingsForSale);
+                    break;
+
+                case MessageType.InteriorSnapshot:
+                    HandleInteriorSnapshot(env);
+                    break;
+
+                case MessageType.InteriorCargoSync:
+                    HandleInteriorCargoSync(env);
+                    break;
+
+                case MessageType.InteriorDirtSync:
+                    // v10 (T7/ruling 33): dirt values for the building this client is inside.
+                    GameStatePatcher.ApplyInteriorDirtSync(env.GetPayload<InteriorDirtSyncPayload>());
+                    break;
+
+                case MessageType.InteriorRequest:
+                {
+                    // v10 (T7): host → owner "your cargo sync didn't match my cache — push the
+                    // full interior". Only meaningful for a building this machine owns; the queued
+                    // push is force=true, so it bypasses the tick gates and re-seeds the host cache.
+                    // Review m4: ownership-checked LOCALLY — without it a host could make a guest
+                    // upload its replica of an arbitrary interior (the host rejects it, but the
+                    // ~300 KB upload would still travel).
+                    var irq = env.GetPayload<InteriorRequestPayload>();
+                    if (irq != null && !string.IsNullOrEmpty(irq.AddressKey)
+                        && InteriorSync.OwnsAddressLocally(irq.AddressKey))
+                        // Stage 0: this push ANSWERS the host's re-ask — recovery traffic (SeedOrHeal),
+                        // and RETRIED by the owner tick until one send lands (review BLOCKER-2/MAJOR-6).
+                        InteriorSync.QueueResyncAnswer(irq.AddressKey);
+                    break;
+                }
+
+                case MessageType.RivalsSnapshot:
+                    MPLoadProfiler.Mark("CLIENT recv RivalsSnapshot");
+                    HandleRivalsSnapshot(env);
+                    break;
+
+                case MessageType.RivalsStatsSnapshot:
+                    HandleRivalsStatsSnapshot(env);
+                    break;
+
+                case MessageType.PlayerProfile:
+                    HandlePlayerProfile(env);
+                    break;
+
+                case MessageType.FriendState:   // FRIENDS-1
+                    Friends.ApplyState(env.GetPayload<FriendStatePayload>());
+                    break;
+                case MessageType.PlayerBuildings:   // FRIEND-BUILDINGS-1
+                    Friends.ApplyBuildings(env.GetPayload<PlayerBuildingsPayload>());
+                    break;
+                case MessageType.VehicleRelocate:   // CARS-STAY-1: my cars were moved while I was away
+                {
+                    var rp = env.GetPayload<VehicleRelocatePayload>();
+                    if (rp != null) GameStatePatcher.EnqueueOnMainThread(() => VehicleManager.ApplyRelocation(rp));
+                    break;
+                }
+
+                case MessageType.SaveStored:   // SAVE-NOTICE-1
+                    ServerSaveNotice.Stored(env.GetPayload<SaveStoredPayload>());
+                    break;
+
+                case MessageType.SaveNow:
+                    // Coordinator marshals the actual save onto the main thread.
+                    MPSaveCoordinator.ClientHandleSaveNow(env.GetPayload<SaveNowPayload>());
+                    break;
+
+                case MessageType.LoadData:
+                    // Host shipped us our stored .hsg — write + load it (coordinator
+                    // marshals the load onto the main thread).
+                    MPLoadProfiler.Mark($"CLIENT recv LoadData (own .hsg, {env.Data?.Length ?? 0} bytes json + {env.Attachment?.Length ?? 0} rider)");
+                    {
+                        var ld = env.GetPayload<LoadDataPayload>();
+                        if (ld != null) ld.HsgRaw = env.Attachment;   // v9 rider → payload
+                        MPSaveCoordinator.ClientHandleLoadData(ld);
+                    }
+                    break;
+
+                case MessageType.StoreMirror:
+                    // Handoff slice 1: a piece of the session store (another member's
+                    // .hsg and/or the manifest) — write into our local store so this
+                    // machine holds the complete session and can host it later.
+                    {
+                        var sm = env.GetPayload<StoreMirrorPayload>();
+                        if (sm != null) sm.HsgRaw = env.Attachment;   // v9 rider → payload
+                        MPSaveCoordinator.ClientHandleStoreMirror(sm);
+                    }
+                    break;
+
+                case MessageType.Chat:
+                {
+                    var cp = env.GetPayload<ChatPayload>();
+                    if (cp == null) break;
+                    // Hub events ride the private-chat envelope with sender MPChat.HubSender
+                    // (NotifyParty) — but chat is a PLAYER channel (user 2026-07-20):
+                    // route them to a toast + the Business Hub badge instead of the
+                    // chat log, so the phone never blinks "message" for a loan event.
+                    // HubSender starts with a line break no honest player id can hold, and the host drops chat from a
+                    // (hand-made) connection claiming it - so such a line is always MPHub.NotifyParty's note: it becomes
+                    // the same pop-up notice the host gets (MPChat.AddNotice), never a chat line. A player's own chat
+                    // (public or private, the host's included) can never match it.
+                    if (cp.PlayerId == MPChat.HubSender)
+                    {
+                        string t = cp.Text ?? "";
+                        MPHub.Version++;   // response-required events live on the Hub icon
+                        Plugin.Logger.LogInfo($"[Chat] Hub note -> notice (not a chat line), {t.Length} chars.");
+                        MPChat.AddNotice(t);
+                        break;
+                    }
+                    MPChat.AddMessage(cp.PlayerId, cp.To ?? "", cp.Text, cp.Orig ?? "");   // pure C# — safe on poll thread; Orig: CHAT-TRANSLATE-1
+                    break;
+                }
+
+                case MessageType.RetailPrices:
+                {
+                    var rp = env.GetPayload<RetailPricesPayload>();
+                    if (rp != null) GameStatePatcher.EnqueueOnMainThread(() => MPPriceSync.Apply(rp));
+                    break;
+                }
+
+                case MessageType.RestSkipState:
+                {
+                    var rs = env.GetPayload<RestSkipStatePayload>();
+                    if (rs != null) GameStatePatcher.EnqueueOnMainThread(() => MPRestSync.ApplyState(rs));
+                    break;
+                }
+
+                case MessageType.ShopStockDigest:
+                {
+                    var sd = env.GetPayload<ShopStockDigestPayload>();
+                    if (sd != null) GameStatePatcher.EnqueueOnMainThread(() => MPStockSync.Apply(sd));
+                    break;
+                }
+
+                case MessageType.AuditDrill:
+                {
+                    // Host localized a biz divergence to bucket(s) — send our
+                    // per-registration hashes BACK (round-89) so the host can name the
+                    // diverging address(es) in its own log. Round-291 (user-approved
+                    // 2026-08-21): the ~340-line per-registration dump that used to go
+                    // into THIS log is gone — field reports only ever carry one
+                    // machine's log, so a one-sided dump was never diffable; the host's
+                    // reply diff is the whole answer.
+                    var ad = env.GetPayload<AuditDrillPayload>();
+                    if (ad != null) GameStatePatcher.EnqueueOnMainThread(() =>
+                    {
+                        try
+                        {
+                            var rows = MPAudit.BuildDrillRows(ad.Buckets);
+                            if (rows.Count > 0 && IsConnected)
+                            {
+                                Send(MessageEnvelope.Create(MessageType.AuditDrillReply, MPConfig.PlayerId,
+                                    new AuditDrillReplyPayload { PlayerId = MPConfig.PlayerId, Regs = rows }));
+                                Plugin.Logger.LogInfo($"[Audit] drill reply sent: {rows.Count} reg hash(es) — the host log names the diverging address(es).");
+                            }
+                        }
+                        catch (Exception ex) { Plugin.Logger.LogWarning($"[Audit] drill reply: {ex.Message}"); }
+                    });
+                    break;
+                }
+
+                case MessageType.MarketEvents:
+                {
+                    var me = env.GetPayload<MarketEventsPayload>();
+                    if (me != null && !string.IsNullOrEmpty(me.Json))
+                        GameStatePatcher.EnqueueOnMainThread(() => GameStatePatcher.ApplyMarketEvents(me.Json));
+                    break;
+                }
+
+                case MessageType.LoanOffer:
+                {
+                    var lo = env.GetPayload<LoanOfferPayload>();
+                    if (lo != null) GameStatePatcher.EnqueueOnMainThread(() => MPHub.ReceiveOffer(lo));
+                    break;
+                }
+
+                case MessageType.BizTransferFinalize:   // round-196: I bought it — claim locally
+                {
+                    var bt = env.GetPayload<BizTransferPayload>();
+                    if (bt != null) GameStatePatcher.EnqueueOnMainThread(() => MPOffers.BuyerApplyFinalize(bt));
+                    break;
+                }
+
+                case MessageType.BizTransferRelease:    // round-196: I sold it — release locally
+                {
+                    var bt = env.GetPayload<BizTransferPayload>();
+                    if (bt != null) GameStatePatcher.EnqueueOnMainThread(() => MPOffers.SellerApplyRelease(bt));
+                    break;
+                }
+
+                case MessageType.RadioState:            // round-227: a building's speaker state
+                {
+                    // Stage 3 review MINOR-X/Y: on the main-thread queue like every other state
+                    // apply — inline it both touched Unity audio off-thread AND could be overtaken
+                    // by a QUEUED snapshot's older radio (the two paths now share one FIFO).
+                    var rs = env.GetPayload<RadioStatePayload>();
+                    if (rs != null) GameStatePatcher.EnqueueOnMainThread(() => MPRadioSync.Apply(rs, "from host"));
+                    break;
+                }
+
+                case MessageType.BillboardAds:          // round-290: a partner's billboard campaigns
+                    BillboardAdSync.Apply(env.GetPayload<BillboardAdsPayload>());
+                    break;
+
+                case MessageType.PropertyForfeit:   // BAN-PLAYERS-1 build B: a banned player's property was removed (or the record is replayed at my world-ready)
+                    GameStatePatcher.ReceivePropertyForfeit(env.GetPayload<PropertyForfeitPayload>());
+                    break;
+                case MessageType.WorldSettings:   // SAVED-SETTINGS-1: the host's world settings (my world loaded, the host's own apply, or a re-send)
+                {
+                    var wsp = env.GetPayload<WorldSettingsPayload>();
+                    if (wsp?.Settings != null) GameStatePatcher.EnqueueOnMainThread(() => ReceiveWorldSettings(wsp));
+                    break;
+                }
+
+                case MessageType.ModMismatch:           // round-253: host says our mod list differs from theirs — informational, never a gate
+                {
+                    var mm = env.GetPayload<ModMismatchPayload>();
+                    if (mm != null)
+                    {
+                        Plugin.Logger.LogWarning($"[Content] MOD MISMATCH vs host: {mm.Detail}");
+                        ModMismatchVsHost = mm.Summary ?? "";   // round-253f: live-read strip line, no timer
+                        // H-MODSDIFFER-1 step 1 (2026-09-20): Detail is capped at 6 tokens per side and
+                        // this machine never otherwise learns the host's list, so the host now sends it
+                        // (ModMismatchPayload.HostMods) and we print the same uncapped block it printed.
+                        if (!string.IsNullOrEmpty(mm.HostMods))
+                            MPContentFingerprint.LogFullModBlockOnce("host", MPContentFingerprint.CachedMods, mm.HostMods, "host");
+                    }
+                    break;
+                }
+
+                case MessageType.PeerLogRequest:        // bug-report v2 (task #40): another player is filing a bug bundle — contribute this machine's logs
+                {
+                    var plr = env.GetPayload<PeerLogRequestPayload>();
+                    if (plr != null && !string.IsNullOrEmpty(plr.RequestId))
+                        Task.Run(() => MPBugReport.RespondToPeerLogRequest(plr.RequestId,
+                            p => SendEnvelope(MessageEnvelope.Create(MessageType.PeerLogReply, MPConfig.PlayerId, p))));
+                    break;
+                }
+
+                case MessageType.PeerLogReply:          // the host's log arriving for a bundle THIS machine is assembling
+                    MPBugReport.HandlePeerLogReply(env.GetPayload<PeerLogReplyPayload>());
+                    break;
+
+                case MessageType.GuestCargoGrab:        // round-269: a granted guest grabbed something in THIS machine's shop — apply the removal
+                    GameStatePatcher.ApplyGuestCargoGrab(env.GetPayload<GuestCargoGrabPayload>());
+                    break;
+
+                case MessageType.JoinProgress:          // round-270: another joiner's download percent (host rebroadcast) — overlay display
+                {
+                    var jp = env.GetPayload<JoinProgressPayload>();
+                    if (jp != null && !string.IsNullOrEmpty(jp.Pid)) MPCanvasUI.ReportJoinProgress(jp.Pid, jp.Percent);
+                    break;
+                }
+
+                case MessageType.TakeoverResult:        // round-204b: host's verdict on my AI-business offer
+                {
+                    var tv = env.GetPayload<TakeoverPayload>();
+                    if (tv != null) GameStatePatcher.EnqueueOnMainThread(() => MPTakeover.ClientHandleResult(tv));
+                    break;
+                }
+
+                case MessageType.LoanState:
+                {
+                    var ls = env.GetPayload<LoanStatePayload>();
+                    if (ls != null) GameStatePatcher.EnqueueOnMainThread(() => MPHub.ApplyLoanState(ls));
+                    break;
+                }
+
+                case MessageType.ProviderStreet:
+                {
+                    // GO-STREET-2: a player's cable network in the street (a dictionary swap under a lock - any thread)
+                    GoingOnlineStreet.Apply(env.GetPayload<ProviderStreetPayload>());
+                    break;
+                }
+
+                case MessageType.ProviderOffers:
+                {
+                    // GO-WHOLESALE-2: the line offers of all cable providers (a plain list swap - any thread)
+                    GoingOnlineLines.ApplyOffers(env.GetPayload<ProviderOffersPayload>());
+                    break;
+                }
+
+                case MessageType.LineBill:
+                {
+                    // GO-WHOLESALE-2: a renter's bill for this player's network - booked on the main thread
+                    var lb = env.GetPayload<LineBillPayload>();
+                    if (lb != null) GameStatePatcher.EnqueueOnMainThread(() => GoingOnlineLines.ClientReceive(lb));
+                    break;
+                }
+
+                case MessageType.MoneyAdjust:
+                {
+                    var ma = env.GetPayload<MoneyAdjustPayload>();
+                    if (ma != null) GameStatePatcher.EnqueueOnMainThread(() =>
+                    {
+                        MPHub.ApplyMoneyDelta(ma.Amount, ma.Reason, !ma.Silent);
+                        // Client-as-shop-owner: sale credits arrive as MoneyAdjust
+                        // with a "Sale: ... (sold to X)" reason — show the worker
+                        // feedback (rising +$ over the buyer + own ring-up anim).
+                        if (ma.Reason != null && ma.Reason.StartsWith("Sale: "))
+                        {
+                            string buyer = "";
+                            int k = ma.Reason.LastIndexOf("(sold to ", StringComparison.Ordinal);
+                            if (k >= 0) buyer = ma.Reason.Substring(k + 9).TrimEnd(')');
+                            MPHub.ShowSalePopup(buyer, ma.Amount);
+                        }
+                    });
+                    break;
+                }
+
+                case MessageType.RegisterCashier:
+                {
+                    // Round-188: these two applied on the NETWORK thread — the only world-touching
+                    // handlers without main-thread marshalling; duty state is consumed by scene code.
+                    var rcp = env.GetPayload<RegisterCashierPayload>();
+                    GameStatePatcher.EnqueueOnMainThread(() => MPRegisterSync.Apply(rcp));
+                    break;
+                }
+
+                case MessageType.PlayerStaffRoster:
+                {
+                    var prp = env.GetPayload<PlayerStaffRosterPayload>();
+                    GameStatePatcher.EnqueueOnMainThread(() => MPRegisterSync.ApplyRoster(prp));
+                    break;
+                }
+
+                case MessageType.StorageOp:   // v16: host forwarded an accessor's op — I'm the container owner
+                {
+                    var sq = env.GetPayload<StorageOpPayload>();
+                    if (sq != null) GameStatePatcher.EnqueueOnMainThread(() =>
+                    {
+                        var res = StorageSync.OwnerApply(sq);
+                        MPClient.SendEnvelope(MessageEnvelope.Create(MessageType.StorageRes, MPConfig.PlayerId, res));
+                    });
+                    break;
+                }
+
+                case MessageType.StorageRes:   // the owner's verdict on my op — I'm the accessor
+                {
+                    var sr = env.GetPayload<StorageResPayload>();
+                    if (sr != null) GameStatePatcher.EnqueueOnMainThread(() => StorageSync.OnResult(sr));
+                    break;
+                }
+
+                case MessageType.ServiceCarStop:     // 2026-09-02: host forwarded a rider's stop/resume — I own that service car
+                case MessageType.ServiceCarResume:
+                {
+                    var sp = env.GetPayload<ServiceCarPayload>();
+                    if (sp != null)
+                    {
+                        bool stop = env.Type == MessageType.ServiceCarStop;
+                        GameStatePatcher.EnqueueOnMainThread(() => { if (stop) ServiceCars.OwnerStop(sp); else ServiceCars.OwnerResume(sp); });
+                    }
+                    break;
+                }
+
+                case MessageType.TrunkDetailReq:   // v17: host forwarded a borrower's detail ask — I'm the vehicle owner
+                {
+                    var tq = env.GetPayload<TrunkDetailReqPayload>();
+                    if (tq != null) GameStatePatcher.EnqueueOnMainThread(() =>
+                    {
+                        var res = StorageSync.BuildTrunkDetail(tq);
+                        MPClient.SendEnvelope(MessageEnvelope.Create(MessageType.TrunkDetailRes, MPConfig.PlayerId, res));
+                    });
+                    break;
+                }
+
+                case MessageType.TrunkDetailRes:   // the trunk detail I asked for — I'm the accessor
+                {
+                    var tr = env.GetPayload<TrunkDetailResPayload>();
+                    if (tr != null) GameStatePatcher.EnqueueOnMainThread(() => StorageSync.OnTrunkDetail(tr));
+                    break;
+                }
+                case MessageType.RivalStaffRes:    // AI staff I asked for (poach window open)
+                {
+                    var rs = env.GetPayload<RivalStaffResPayload>();
+                    if (rs != null) GameStatePatcher.EnqueueOnMainThread(() => RivalStaffSync.OnStaffRes(rs));
+                    break;
+                }
+                case MessageType.PoachResult:      // the verdict on my deferred rival hire
+                {
+                    var pr = env.GetPayload<PoachResultPayload>();
+                    if (pr != null) GameStatePatcher.EnqueueOnMainThread(() => RivalStaffSync.OnPoachResult(pr));
+                    break;
+                }
+
+                case MessageType.HelperOrderForward:   // host forwarded a helper-hosted sale — I'm the building owner
+                {
+                    var ho = env.GetPayload<HelperOrderPayload>();
+                    if (ho != null) GameStatePatcher.EnqueueOnMainThread(() => CustomerEntrySync.OwnerAdoptForwardedOrder(ho));
+                    break;
+                }
+
+                case MessageType.CustomerUnsoldLeave:   // H-HANDOFF-1 R1: host forwarded a partner's unsold walk-out - I'm the building owner
+                {
+                    var ul = env.GetPayload<CustomerUnsoldLeavePayload>();
+                    if (ul != null) GameStatePatcher.EnqueueOnMainThread(() => CustomerHandoff.OnUnsoldLeave(ul));
+                    break;
+                }
+
+                case MessageType.CustomerSimAuthority:   // host's per-building simulator election
+                {
+                    var ca = env.GetPayload<CustomerSimAuthorityPayload>();
+                    if (ca != null) GameStatePatcher.EnqueueOnMainThread(() => CustomerPuppets.ApplyAuthority(ca));
+                    break;
+                }
+
+                case MessageType.CustomerPuppetState:    // the simulator's live customer bodies for my room
+                {
+                    var cp = env.GetPayload<CustomerPuppetStatePayload>();
+                    if (cp != null) GameStatePatcher.EnqueueOnMainThread(() => CustomerPuppets.ApplyState(cp));
+                    break;
+                }
+
+                case MessageType.CustomerVisitState:     // H-HANDOFF-1: the simulator's visit rows for my room (Final or stream)
+                {
+                    var vs = env.GetPayload<CustomerVisitStatePayload>();
+                    if (vs != null) GameStatePatcher.EnqueueOnMainThread(() => CustomerHandoff.Apply(vs));
+                    break;
+                }
+
+                case MessageType.ReleaseClaim:           // contested-tenancy arbitration: we lost — release (re-verified locally)
+                    ContestedTenancy.ClientHandleRelease(env.GetPayload<BuildingOwnershipPayload>());
+                    break;
+                case MessageType.RegisterServe:          // a serve beat — perform it if it is my till
+                {
+                    var rs = env.GetPayload<RegisterServePayload>();
+                    if (rs != null) GameStatePatcher.EnqueueOnMainThread(() => CustomerPuppets.ApplyServe(rs));
+                    break;
+                }
+
+                case MessageType.CustomerPuppetEmote:    // a simulated customer's emoji — replay on the puppet
+                {
+                    var ce = env.GetPayload<CustomerPuppetEmotePayload>();
+                    if (ce != null) GameStatePatcher.EnqueueOnMainThread(() => CustomerPuppets.ApplyEmote(ce));
+                    break;
+                }
+
+                case MessageType.CustomerPuppetLook:     // a simulated customer's look — dress the puppet
+                {
+                    var cl = env.GetPayload<CustomerPuppetLookPayload>();
+                    if (cl != null) GameStatePatcher.EnqueueOnMainThread(() => CustomerPuppets.ApplyLook(cl));
+                    break;
+                }
+
+                case MessageType.BuildingDirtEdit:   // host forwarded a helper's cleaning — I'm the owner: adopt it
+                {
+                    var bde = env.GetPayload<DirtEditPayload>();
+                    if (bde != null) GameStatePatcher.EnqueueOnMainThread(() => HelperCleaning.Apply(bde));
+                    break;
+                }
+
+                case MessageType.BuildingInteriorDelta:   // v13 (Stage 1b): an edit as its ops — owner adoption OR subscriber replication
+                {
+                    var bid = env.GetPayload<InteriorEditDeltaPayload>();
+                    if (bid != null) GameStatePatcher.EnqueueOnMainThread(() =>
+                    {
+                        GameStatePatcher.ApplyInteriorEditDelta(bid);
+                        // Owner adoption: stamp the send trackers so the 2 s tick doesn't answer the
+                        // adoption with a full push — the host grafted its cache and conveyed the
+                        // subscribers with this same delta (Q1). No re-publish, by design.
+                        if (InteriorSync.OwnsAddressLocally(bid.AddressKey)) InteriorSync.NoteOwnerDeltaApplied(bid.AddressKey);
+                    });   // UNKEYED deliberately (design trap 1): keyed coalescing would LOSE a superseded delta
+                    break;
+                }
+
+                default:
+                    Plugin.Logger.LogWarning($"[Client] Unknown message type: {env.Type}");
+                    break;
+            }
+        }
+
+        // ── Message handlers ──────────────────────────────────────────────────
+
+        private static void HandleLobbyUpdate(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<LobbyUpdatePayload>();
+            if (payload == null) return;
+            _lobbyPlayers = payload.Players != null ? new List<string>(payload.Players) : new List<string>();
+            LobbyHostDedicated = payload.HostDedicated;   // LOBBY-DEDICATED-1
+            EnforceStartingCash = payload.EnforceStartingCash;
+            LobbyAges.Clear();
+            if (payload.Ages != null) foreach (var kv in payload.Ages) LobbyAges[kv.Key] = kv.Value;
+            HostLoadMode    = payload.LoadMode;
+            HostLoadSession = payload.LoadSessionName ?? "";
+            HostExpressLane = payload.HostExpress;   // round-283 capability (see SendPhaseReport)
+            JoinStatus      = payload.JoinStatus ?? "";   // JOIN-WAIT-1 (C2): set while parked, cleared by the real roster
+            Plugin.Logger.LogInfo($"[Client] Lobby: {string.Join(", ", LobbyPlayers)} " +
+                                  $"(starting cash {(EnforceStartingCash ? "enforced by host" : "per-player")})");
+        }
+
+        /// <summary>The game is starting/loading — the lobby pane must yield
+        /// (the stored-save mid-join path left IsInLobby true and the MP window
+        /// sat on the lobby pane over a fully loaded world, 2026-06-11).</summary>
+        public static void MarkLeftLobby() => IsInLobby = false;
+
+        /// <summary>Set for a fresh-character join: at WorldReady the player is
+        /// warped to the DESIGNATED new-player start.  The native placement
+        /// reads gi.LastPlayerPosition (default 215,0,0 = the designated spot),
+        /// but the game continuously overwrites that field from the live
+        /// transform — during our long fenced load it gets stomped with the
+        /// player prefab's parking position, so placement no-ops and fresh
+        /// joiners woke up in the wrong part of town (user, 2026-06-12).</summary>
+        public static volatile bool PendingFreshSpawn;
+
+        /// <summary>Mid-join fresh start: no save for this player anywhere —
+       /// new character with the host''s settings (null → Normal preset).</summary>
+        public static void StartFreshFromHost(GameVariablesDto? settings)
+        {
+            IsInLobby = false;
+            PendingFreshSpawn = true;
+            SendPhaseReport("Loading", "intent: fresh-start (fence)");   // round-276b: intents name themselves
+            BeginJoinQuiesce();
+            var s = settings ?? MPServer.Preset("Normal");
+            Plugin.Logger.LogInfo($"[Client] Mid-join fresh start; cash={s.StartingMoney}.");
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                try
+                {
+                    // The intro may not load over a RUNNING world (GameManager
+                    // NRE storm) — detour via the main menu first.
+                    if (Helpers.PlayerHelper.PlayerController != null)
+                    {
+                        Plugin.Logger.LogInfo("[Client] Fresh start while IN-GAME — detouring via main menu.");
+                        MPSaveCoordinator.DeferFreshStart(settings);
+                        LoadScene.LoadMainMenu(BAModAPI.ModActivationScope.City);
+                        return;
+                    }
+                    GameStatePatcher.ResetClientRivalFeed("mid-join fresh start");   // EFFORT BATCH 29 (R2): same per-world reset
+                    SaveGameManager.New(MPServer.BuildGameVariables(s));
+                    LoadScene.LoadIntro(false);
+                }
+                catch (Exception ex) { Plugin.Logger.LogError($"[Client] StartFreshFromHost: {ex}"); }
+            });
+        }
+
+        /// <summary>PROTON-1: the save-version refusal below is logged at most once per process.
+        /// It fires from a start handler, which a wedged host can repeat.</summary>
+        private static bool _versionRefusalLogged;
+
+        private static void HandleStartGame(MessageEnvelope env, bool isNew)
+        {
+            // EFFORT BATCH 29 (R1): a start while one is already in flight (or a world is up) is IGNORED.
+            // IsInLobby is set true on every connect and false by the first start on that connection, so
+            // a second StartGameNew/StartGameLoad on the same connection can only be a duplicate - acting
+            // on it would restart character creation / the load under the first one.
+            if (!IsInLobby)
+            {
+                Plugin.Logger.LogWarning($"[Client] Host start ({(isNew ? "new" : "load")}) ignored - a start is already in flight on this machine.");
+                return;
+            }
+            IsInLobby = false;
+            SendPhaseReport("Loading", "intent: start-game (fence)");   // round-276b: intents name themselves
+            // ABSENT-OWNER-GATES-1 G1 (review fold): a hand-over held in the lobby predates this start - it belongs to a world the
+            // host started before (one whose load failed back to the lobby). Same main-thread queue as the hold, so it runs after it.
+            try { GameStatePatcher.EnqueueOnMainThread(() => MergerAbsence.DiscardHeldHandovers("the host started a world from its lobby after it was sent")); } catch { }
+            var  sp              = env.GetPayload<StartGamePayload>();
+            if (sp != null && sp.LoadGen != 0) ServedLoadGen = sp.LoadGen;   // round-284 load ticket (0 = older host)
+            var  newGameSettings = sp?.Settings ?? MPServer.Preset("Normal");
+            bool enforceCash     = sp?.EnforceStartingCash ?? true;
+            // If the host hasn't enforced a fixed amount, this client uses its
+            // own starting cash; every other setting still comes from the host.
+            if (!enforceCash)
+                newGameSettings.StartingMoney = ChosenStartingCash;
+            Plugin.Logger.LogInfo(
+                $"[Client] Host started game ({(isNew ? "new" : "load")}); " +
+                $"starting cash={newGameSettings.StartingMoney}.");
+
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                try
+                {
+                    // PROTON-1: every MP save path on this machine hangs off the game's save
+                    // version folder.  If it cannot be resolved, the store paths go relative and
+                    // the session corrupts quietly -- refuse instead, and leave the way the Leave
+                    // button does.  Checked HERE, on the main thread: EnsureVersionCached touches
+                    // IL2CPP, and HandleStartGame itself runs on the network poll thread.
+                    MPSaveManager.EnsureVersionCached();
+                    if (string.IsNullOrEmpty(MPSaveManager.CachedVersionFolderOrEmpty))
+                    {
+                        if (!_versionRefusalLogged)
+                        {
+                            _versionRefusalLogged = true;
+                            Plugin.Logger.LogError("[MPSave] REFUSING to start: the game's save version folder cannot be resolved on this machine (PROTON-1)");
+                        }
+                        try { Disconnect(); } catch { }
+                        return;
+                    }
+
+                    // EFFORT BATCH 29 (R2): every world start begins with a clean rival id feed. The host's
+                    // ids for THIS start arrive right after this message (MPServer.TellLobbyPeersNewGame), so
+                    // New() below suppresses GenerateRivals and the snapshot runs it from the host's ids -
+                    // the order the round-256 repair path already handles.  Without this, a second new game
+                    // in the same game session found ClientRivalsInjected still true and got NO rivals.
+                    GameStatePatcher.ResetClientRivalFeed(isNew ? "host started a new game" : "host started a load");
+
+                    if (isNew)
+                    {
+                        Plugin.Logger.LogInfo("[Client] Initialising new game and loading character creation...");
+                        // New() first — mirrors MainMenuController.StartNewGame(difficulty).
+                        // Without it SaveGameManager.Current is null and the intro's
+                        // Start button silently does nothing.
+                        SaveGameManager.New(MPServer.BuildGameVariables(newGameSettings));
+                        LoadScene.LoadIntro(false);
+                        Plugin.Logger.LogInfo("[Client] New game init + intro scene loaded.");
+                    }
+                    else
+                    {
+                        Plugin.Logger.LogInfo("[Client] Loading most recent save...");
+                        var versionPath = SaveGamePathHelper.CurrentVersionFolderPath();
+                        var saves = SaveGamePathHelper.GetAllSaveGamesFromVersion(versionPath);
+
+                        if (saves == null || saves.Count == 0)
+                        {
+                            Plugin.Logger.LogWarning("[Client] No saves found — starting new game instead.");
+                            SaveGameManager.New(MPServer.MakeGameVariables());
+                            LoadScene.LoadIntro(false);
+                            return;
+                        }
+
+                        var save = saves[0];
+                        Plugin.Logger.LogInfo($"[Client] Loading save: {save.alias}");
+                        MPSaveCoordinator.GuardedNativeLoad(save, true, "client latest-save fallback", save.alias);   // round-251
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogError($"[Client] HandleStartGame error: {ex}");
+                }
+            });
+        }
+
+        private static void HandleManualPause(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<ManualPausePayload>();
+            if (payload == null) return;
+            // Round-284 probe: one line per receipt (rare message — a few per session).  A
+            // 2026-08-19 soak showed a host "ManualPause broadcast: False" that produced no
+            // client state change with no trace; this is the paper trail for lost/no-op
+            // pause informs (registered in .modding/04-probes.md).
+            Plugin.Logger.LogInfo($"[Client] ManualPause recv: {payload.Paused} (state was {TimeSync.ManualPaused})");
+            TimeSync.SetManualPause(payload.Paused);
+        }
+
+        private static void HandleStartupRelease()
+        {
+            Plugin.Logger.LogInfo("[Client] StartupRelease received — all players loaded, game resuming.");
+            StartupWaitingFor = new List<string>();
+            GameStatePatcher.EnqueueOnMainThread(() => TimeSync.EndStartupHold());
+        }
+
+        /// <summary>
+        /// Players who have not yet finished loading, per the host's last broadcast.
+        /// Drives the client's "waiting for &lt;player&gt;" startup screen.
+        /// </summary>
+        public static List<string> StartupWaitingFor { get; private set; } = new();
+
+        private static void HandleStartupStatus(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<StartupStatusPayload>();
+            if (payload == null) return;
+            StartupWaitingFor = payload.WaitingFor ?? new List<string>();
+            Plugin.Logger.LogInfo(
+                $"[Client] StartupStatus: waiting for {string.Join(", ", StartupWaitingFor)}");
+        }
+
+        private static void HandleWelcome(MessageEnvelope env)
+        {
+            var snap = env.GetPayload<WorldSnapshotPayload>();
+            if (snap == null) return;
+
+            if (!string.IsNullOrEmpty(snap.SessionId) && MPLog.SessionId != snap.SessionId)
+                MPLog.BeginSession(snap.SessionId, "client");
+            if (snap.HostDedicated != HostIsDedicated)
+                Plugin.Logger.LogInfo($"[Client] host is {(snap.HostDedicated ? "a dedicated server - losing it returns to the main menu" : "a player's game")}.");
+            HostIsDedicated = snap.HostDedicated;
+            DedicatedHostPlayerId = snap.HostDedicated ? (snap.HostPlayerId ?? "") : "";
+            if (DedicatedHostPlayerId.Length > 0) GameStatePatcher.EnqueueOnMainThread(() => RemotePlayerManager.ShowAsNpc(DedicatedHostPlayerId));
+            ServerRules.Apply(snap.Rules);   // SERVER-RULES-1: the admin's module switches and game rules
+            HostNeedsKey = snap.JoinKeyRequired;   // STEAM-FRIEND-JOIN-1
+            SteamOwnership.Cancel();   // STEAM-OWNER-1: in - the ticket has done its job
+            Plugin.Logger.LogInfo($"[Client] Received world snapshot: {snap.BuildingOwners.Count} buildings tracked.");
+            GameStatePatcher.ApplyWorldSnapshot(snap);
+        }
+
+        private static void HandleRentConfirm(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<BuildingOwnershipPayload>();
+            if (payload == null) return;
+
+            Plugin.Logger.LogInfo($"[Client] RentConfirm: {payload.AddressKey} → {payload.OwnerPlayerId}");
+            GameStatePatcher.ApplyBuildingOwnership(payload);
+        }
+
+        private static void HandleRentDeny(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<BuildingOwnershipPayload>();
+            if (payload == null) return;
+
+            // Round-50: the deny path was a log-only TODO — the client kept the optimistic local
+            // rent AND its money, silently. Roll both back and tell the player.
+            string why = string.IsNullOrEmpty(payload.DenyReason) ? "already taken" : payload.DenyReason;
+            Plugin.Logger.LogWarning($"[Client] Rent DENIED for {payload.AddressKey} — {why}; rolling back the optimistic local rent.");
+            GameStatePatcher.RollbackRent(payload.AddressKey, payload.LastDeposit);
+            // Fold R4: the host refused because the building's rival is active for this player (this machine's own gate
+            // was passed on a stale state) - the game's own response here too (BizManPresentation.cs:538-551): the
+            // rival's rent-building monologue and the game's cannot-rent notice. Game texts only.
+            if (why == MPRivalAttention.RentDenyRivalReason)
+            {
+                string addrK = payload.AddressKey ?? "";
+                GameStatePatcher.EnqueueOnMainThread(() =>
+                {
+                    try
+                    {
+                        var reg = GameStatePatcher.FindRegistration(addrK);
+                        var sr = reg == null ? null : BigAmbitions.Rivals.RivalsHelper.GetSpecialRival(reg.buildingOwnerRivalId);
+                        if (sr?.rivalData == null) { Plugin.Logger.LogWarning($"[RivalSync] rent of '{addrK}' refused by the host (active rival) but this machine names no rival for the building - no rival notice."); return; }
+                        BigAmbitions.Rivals.RivalsHelper.SendRentBuildingMessage(sr);
+                        UI.Notification.Notifications.Show(UI.Notification.NotificationType.Error, "notification_cannot_rent_building_owned_by_rival",
+                                                           new Dictionary<string, string> { { "name", sr.rivalData.rivalName } });
+                        Plugin.Logger.LogInfo($"[RivalSync] rent of '{addrK}' refused by the host: the game's own rival response shown - RivalsHelper.SendRentBuildingMessage (rival '{sr.rivalData.id}', key '{sr.rentBuildingMessageKey}') + notification_cannot_rent_building_owned_by_rival.");
+                    }
+                    catch (Exception rx) { Plugin.Logger.LogWarning($"[RivalSync] rent refusal notice for '{addrK}': {rx.Message}"); }
+                });
+            }
+        }
+
+        private static void HandleVacate(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<BuildingOwnershipPayload>();
+            if (payload == null) return;
+
+            Plugin.Logger.LogInfo($"[Client] Building vacated: {payload.AddressKey}");
+            GameStatePatcher.ApplyBuildingVacated(payload.AddressKey);
+        }
+
+        private static void HandleBuyDeny(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<BuildingOwnershipPayload>();
+            if (payload == null) return;
+
+            Plugin.Logger.LogWarning($"[Client] Buy DENIED for {payload.AddressKey} — already owned; rolling back.");
+            GameStatePatcher.RollbackBuy(payload.AddressKey);
+        }
+
+        private static void HandlePlayerMove(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<PlayerPositionPayload>();
+            if (payload == null) return;
+            if (payload.PlayerId == MPConfig.PlayerId) return; // ignore our own echoed position
+
+            GameStatePatcher.EnqueueOnMainThread(() =>
+                RemotePlayerManager.SpawnOrUpdate(payload));
+        }
+
+        private static void HandleAnimTrigger(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<AnimTriggerPayload>();
+            if (payload == null) return;
+            if (payload.PlayerId == MPConfig.PlayerId) return; // our own echoed trigger
+            GameStatePatcher.EnqueueOnMainThread(() =>
+                RemotePlayerManager.ApplyTrigger(payload.PlayerId, payload.ParamIndex));
+        }
+
+        private static void HandleVehicleSync(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<VehicleFleetPayload>();
+            if (payload == null) return;
+            if (payload.OwnerId == MPConfig.PlayerId) return; // our own echoed fleet
+            GameStatePatcher.EnqueueOnMainThread(() => VehicleManager.ApplyVehicleFleet(payload));
+        }
+
+        private static void HandleTrafficSnapshot(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<TrafficSnapshotPayload>();
+            if (payload == null) return;
+            // TRAFFIC-SMOOTH S1: the stream rides the UNRELIABLE lane now, so a packet can arrive late or
+            // twice — drop anything not newer than the last one accepted (Seq 0 = an older host that stamps
+            // none: never dropped). Done HERE, at arrival, so a stale packet cannot win the coalesce below.
+            if (!TrafficSync.AcceptSnapshotSeq(payload.Seq)) return;
+            // TRAFFIC-SMOOTH S2: newest-wins. GameStatePatcher.EnqueueOnMainThread(Action, coalesceKey)
+            // (:93, :95-110) replaces the queued action IN PLACE for the same key — so a burst of snapshots
+            // that lands while the 5 ms/frame drain is busy collapses to the newest one, instead of the
+            // client replaying a backlog of stale poses.
+            GameStatePatcher.EnqueueOnMainThread(() => TrafficSync.ApplySnapshot(payload), "traffic");
+        }
+
+        private static void HandleTrafficLights(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<TrafficLightsPayload>();
+            if (payload == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() => TrafficSync.ApplyTrafficLights(payload));
+        }
+
+        /// <summary>TRAFFIC-APART P4: the host tells this client which traffic to run. NOT coalesced - the host
+        /// re-asserts the current mode every 5 s and TrafficSync treats a repeat as a no-op, so there is nothing
+        /// here that a newer message could usefully replace.</summary>
+        private static void HandleTrafficMode(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<TrafficModePayload>();
+            if (payload == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() => TrafficSync.ApplyTrafficMode(payload));
+        }
+
+        private static void HandleParkedSnapshot(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<ParkedSnapshotPayload>();
+            if (payload == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() => ParkedVehicleSync.ApplySnapshot(payload));
+        }
+
+        private static void HandlePlayerLeft(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<PlayerLeftPayload>();
+            if (payload == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                RemotePlayerManager.Remove(payload.PlayerId, payload.KeepCars);   // CARS-STAY-1: a dedicated server keeps his cars
+                // A departed worker must not leave a phantom "staffed" register
+                // (buyers would be charged with no owner to receive the sale).
+                MPRegisterSync.RemovePlayer(payload.PlayerId);
+            });
+        }
+
+        private static void HandleAppearanceSync(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<AppearanceSyncPayload>();
+            if (payload == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                foreach (var dto in payload.Players)
+                    RemotePlayerManager.SetAppearance(dto);
+            });
+        }
+
+        /// <summary>Sends this player's character appearance to the host.</summary>
+        public static void SendAppearance(PlayerAppearancePayload dto)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.PlayerAppearance, MPConfig.PlayerId, dto));
+            Plugin.Logger.LogInfo($"[Client] Sent appearance: {RemotePlayerManager.Summary(dto)}");
+        }
+
+        private static int _lastLoggedGtsDay = int.MinValue;
+        /// <summary>Round-283: newest GameTimeSync.Seq applied, and the stale-drop tally.  Reset on
+        /// connect (OnConnected) — a different host, or the same host restarted, begins its counter
+        /// at 1 again, and a last-seen carried over from the previous session would swallow the whole
+        /// heartbeat stream.</summary>
+        private static long _lastGtsSeq;
+        private static long _gtsStaleDrops;
+        private static long _gtsStaleLogNextTicks;
+        internal static void ResetClockSyncFreshness() { _lastGtsSeq = 0; _gtsStaleDrops = 0; }
+
+        private static void HandleGameTimeSync(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<GameTimeSyncPayload>();
+            if (payload == null) return;
+
+            // ── Round-283 FRESHNESS GUARD ────────────────────────────────────
+            // The host may now send this packet on the EXPRESS lane, which deliberately
+            // breaks ordering against every bulk message — so a newer heartbeat can overtake
+            // an older one still queued behind a store mirror, and without this guard that
+            // older one would then be applied LAST.
+            //
+            // Why that specifically matters here: ReceiveClockSync derives drift from the
+            // packet's time against our LIVE local clock.  Apply the newer packet and we are
+            // aligned; apply the older one afterwards and its time is now BEHIND our
+            // (correctly advanced) clock, so the drift reads negative, the ahead-branch
+            // latches AheadHeld, and the RunMainGameTick prefix freezes this client's
+            // game-time and economy until the next heartbeat releases it — a visible stall
+            // manufactured entirely out of a stale packet.  So: apply strictly-newer only.
+            // Seq == 0 = an older host that does not stamp → always apply, exactly today's
+            // behaviour.  The whole payload is dropped, not just the clock: RainState,
+            // needs-tuning and Speed on a stale packet are equally stale.
+            if (payload.Seq > 0)
+            {
+                if (payload.Seq <= _lastGtsSeq)
+                {
+                    long n = ++_gtsStaleDrops;
+                    long nowT = DateTime.UtcNow.Ticks;
+                    if (nowT >= _gtsStaleLogNextTicks)
+                    {
+                        _gtsStaleLogNextTicks = nowT + TimeSpan.TicksPerSecond * 60;
+                        Plugin.Logger.LogInfo($"[Client] GameTimeSync: dropped a STALE packet (seq {payload.Seq} "
+                            + $"<= last {_lastGtsSeq}) — {n} stale drop(s) this session.  Expected on the express "
+                            + $"lane when an urgent heartbeat overtakes one stuck behind bulk.");
+                    }
+                    return;
+                }
+                _lastGtsSeq = payload.Seq;
+            }
+            // Log once per in-game DAY, not every ~3s packet (was ~2,100 lines/session). The day
+            // progression is what we actually diagnose with (e.g. the save-storm day range).
+            if (payload.Day != _lastLoggedGtsDay)
+            {
+                _lastLoggedGtsDay = payload.Day;
+                Plugin.Logger.LogInfo($"[Client] GameTimeSync: day={payload.Day} hour={payload.TimeOfDay:F1}");
+            }
+
+            // Applies clock-drift correction toward the host's authoritative clock.
+            GameStatePatcher.ApplyGameTime(payload);
+
+            // Needs/morale tuning rides the heartbeat (loaded-session clients
+            // converge too; -1 = older host, keep current values).
+            MPNeedsTuning.SetFromHeartbeat(payload.TuneDrain, payload.TuneRest, payload.TuneMorale, payload.TunePowerNap);
+            // SAVED-SETTINGS-1 backstop: the host's world-settings rev differs from what this machine applied -> ask again (main thread, throttled).
+            int hostWorldRev = payload.WorldRev;
+            if (hostWorldRev > 0 && hostWorldRev != _worldRevApplied) GameStatePatcher.EnqueueOnMainThread(() => WorldRevCheck(hostWorldRev));
+
+            // Weather (2026-07-14): align local rain with the host's state — main
+            // thread, coalesced (only the newest state matters).  2026-08-18: the
+            // host's intensity rides along and is used when rain STARTS here.
+            if (payload.RainState >= 0)
+            {
+                int rs = payload.RainState; float ri = payload.RainIntensity;
+                GameStatePatcher.EnqueueOnMainThread(() => MPWeatherSync.ApplyRainState(rs, ri), "weather");
+            }
+
+            // Round-284/F2: the host's pause INTENT rides the heartbeat — converge to it
+            // (0 = older host: no convergence, the Seq==0 idiom).  Runs only on accepted-
+            // fresh packets (the Seq guard above already returned on stale ones); echo
+            // suppression for our own in-flight press + the startup-hold skip live in
+            // TimeSync.ConvergePauseFromHeartbeat.  The ManualPause edge messages remain
+            // the fast path; this is the recurrence-covered floor under them.  Early-load
+            // convergence is a non-issue: GameTimeSync is dropped wholesale by the join
+            // quiesce (OnReceive) for the whole load window.
+            if (payload.PauseState != 0)
+                TimeSync.ConvergePauseFromHeartbeat(payload.PauseState);
+        }
+
+        private static void HandleMarketSnapshot(MessageEnvelope env)
+        {
+            StallWatch.Step("market snapshot decode");   // PROBE: P-MIDNIGHT
+            MarketSnapshotPayload? payload = null;
+            try { payload = env.GetPayload<MarketSnapshotPayload>(); }
+            finally { StallWatch.Done(); }               // PROBE: P-MIDNIGHT
+            if (payload == null) return;
+
+            Plugin.Logger.LogInfo("[Client] Received market snapshot.");
+            GameStatePatcher.ApplyMarketSnapshot(payload.MarketEntriesJson);
+        }
+
+        private static void HandleBusinessSnapshot(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<BusinessSnapshotPayload>();
+            if (payload == null) return;
+            Plugin.Logger.LogInfo($"[Client] Received business snapshot: {payload.Businesses.Count} buildings.");
+            GameStatePatcher.ApplyBusinessSnapshot(payload);
+        }
+
+        private static void HandleBusinessChange(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<BusinessChangePayload>();
+            if (payload?.Info == null) return;
+            ApplyBusinessChangeRecord(payload.Info);
+        }
+
+        /// <summary>Burst fix 2026-09-10: many changed businesses in ONE envelope (the host sweep
+        /// and the join/daily delta).  Every record goes through exactly the same apply path as a
+        /// single BusinessChange — shared body, never a copy.</summary>
+        private static void HandleBusinessChangeBatch(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<BusinessChangeBatchPayload>();
+            if (payload?.Infos == null) return;
+            foreach (var info in payload.Infos)
+                if (info != null) ApplyBusinessChangeRecord(info);
+        }
+
+        /// <summary>The ONE place a received business-change record is applied, shared by the
+        /// single and batched forms so their handling cannot drift apart.</summary>
+        private static void ApplyBusinessChangeRecord(BusinessInfo info)
+        {
+            GameStatePatcher.ApplyBusinessChange(info);
+        }
+
+        private static void HandleInteriorSnapshot(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<InteriorSnapshotPayload>();
+            if (payload == null) return;
+            Plugin.Logger.LogInfo($"[Client] Received interior snapshot for '{payload.AddressKey}': {InteriorSync.SnapshotSummary(payload)}.");
+            // D1: if this address is one we hold AMBIENTLY, this is furniture arriving for a house we
+            // are standing OUTSIDE — the one measurement the delivery design's byte estimate needs.
+            // FOLD r1 R4: this handler runs on the NETWORK POLL thread and NoteAmbientSnapshot reads the
+            // ambient sets the main-thread LOD patches mutate, so the three values are captured HERE
+            // (the frame count is only valid during this call) and the read runs on the main thread.
+            string ambAddr = payload.AddressKey;
+            int ambItems = payload.ItemInstances != null ? payload.ItemInstances.Count : 0;
+            int ambBytes = _frameBytes;
+            GameStatePatcher.EnqueueOnMainThread(() => HamptonsAccess.NoteAmbientSnapshot(ambAddr, ambItems, ambBytes));
+            GameStatePatcher.ApplyInteriorSnapshot(payload);
+        }
+
+        /// <summary>Round-281: the cheap cargo-only interior update.  Deliberately quiet at INFO —
+        /// this arrives many times per minute in a busy shop, which is the entire point; the periodic
+        /// stats line (InteriorSync.NoteCargoSyncApply) is where it becomes visible.  The byte count is
+        /// taken from the envelope's own payload string so the reported saving is measured, not
+        /// estimated from field counts.</summary>
+        private static void HandleInteriorCargoSync(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<InteriorCargoSyncPayload>();
+            if (payload == null) return;
+            // Round-281b: Data is a STRING — Length is a char count, not wire bytes; the
+            // host logs real envelope bytes, so report UTF-8 bytes here to stay comparable.
+            int approxBytes = 0;
+            try { approxBytes = env.Data == null ? 0 : System.Text.Encoding.UTF8.GetByteCount(env.Data); } catch { }
+            GameStatePatcher.ApplyInteriorCargoSync(payload, approxBytes);
+        }
+
+        private static void HandleRivalsSnapshot(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<RivalsSnapshotPayload>();
+            if (payload == null) return;
+            Plugin.Logger.LogInfo($"[Client] Received rivals snapshot: {payload.Rivals.Count} rival(s).");
+#if BAMP_DEV
+            // Round-256 forced-race hook: 'rivalrace hold' makes a new-game start
+            // generate rival-less (the real field ordering); 'rivalrace release'
+            // delivers the snapshot late so the repair path can be exercised.
+            if (TestDrive.HoldRivalsSnapshot)
+            {
+                TestDrive.HeldRivalsSnapshot = payload;
+                Plugin.Logger.LogWarning("[TestDrive] rivalrace: RivalsSnapshot HELD (not applied) — 'rivalrace release' to deliver it late.");
+                return;
+            }
+#endif
+            GameStatePatcher.ApplyRivalsSnapshot(payload);
+        }
+
+        private static void HandleRivalsStatsSnapshot(MessageEnvelope env)
+        {
+            var payload = env.GetPayload<RivalsStatsSnapshotPayload>();
+            if (payload == null) return;
+            Plugin.Logger.LogInfo($"[Client] Received rivals stats snapshot: {payload.Stats.Count} stat block(s).");
+            GameStatePatcher.ApplyRivalsStatsSnapshot(payload);
+        }
+
+        private static void HandlePlayerProfile(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PlayerProfilePayload>();
+            if (p == null || string.IsNullOrEmpty(p.PlayerId)) return;
+            string name = string.IsNullOrWhiteSpace(p.CharacterName) ? p.PlayerId : p.CharacterName;
+            GameStatePatcher.ClientRivalNames[p.PlayerId] = name;
+            if (p.AgeInYears > 0) GameStatePatcher.ClientPlayerAges[p.PlayerId] = p.AgeInYears;
+                    if (p.Gender >= 0) GameStatePatcher.ClientPlayerGenders[p.PlayerId] = p.Gender;
+            if (p.ColourSlot > 0) PlayerColours.Learn(p.PlayerId, p.ColourSlot);   // 2026-09-05 colours: the host names each player's permanent slot
+            Friends.NoteProfile(p);   // FRIENDS-1: Steam name + id
+            Plugin.Logger.LogInfo($"[Client] PlayerProfile: '{p.PlayerId}' → '{name}' age={p.AgeInYears} portrait={(string.IsNullOrEmpty(p.PortraitPngBase64) ? "none" : "yes")}.");
+            // Decode the relayed portrait on the main thread (Texture2D create).
+            string portraitB64 = p.PortraitPngBase64;
+            string pid = p.PlayerId;
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                RemotePlayerManager.UpdateLabel(pid);
+                if (!string.IsNullOrEmpty(portraitB64)) GameStatePatcher.ApplyPlayerPortrait(pid, portraitB64);
+            });
+        }
+
+        /// <summary>
+        /// Fire from the RivalLeaderboard.Load Prefix to fetch fresh stats from
+        /// host.  Also includes the client's OWN self-stats so host can render
+        /// this client's row on host's leaderboard.
+        /// </summary>
+        public static void SendRivalsStatsRequest()
+        {
+            if (!IsConnected) return;
+            // Self-stats the NATIVE self-sheet way (round-25 parity: what others see for me = what I see
+            // for myself) — one shared builder with the host's own-stats block. Replaces the RentPerDay×7
+            // "income" (that's rent EXPENSE, not income) and the unfiltered row list (the HOME leaked in
+            // as a business row); also publishes the primary neighborhood for the first time.
+            RivalSelfStats.Build(out int bldgCount, out float weeklyIncome, out string hood, out var rows);
+            var p = new RivalsStatsRequestPayload
+            {
+                PlayerId = MPConfig.PlayerId,
+                SelfOwnedBuildingsCount  = bldgCount,
+                SelfOwnedBusinessesCount = rows.Count,
+                SelfWeeklyIncome         = weeklyIncome,
+                SelfNeighborhood         = hood,
+            };
+            p.Businesses.AddRange(rows);
+            try
+            {
+                var gi = SaveGameManager.Current;
+                // The game's own per-day series → real detail-view graphs on
+                // other machines (last 10 points is plenty; the UI plots 7).
+                if (gi?.playerWeeklyIncomeHistory != null)
+                    foreach (var t in gi.playerWeeklyIncomeHistory)
+                        if (t != null) p.IncomeHistory.Add(new HistoryPointF { Day = t.Item1, Value = t.Item2 });
+                if (p.IncomeHistory.Count > 10) p.IncomeHistory.RemoveRange(0, p.IncomeHistory.Count - 10);
+                if (gi?.playerNumberOfBusinessesHistory != null)
+                    foreach (var t in gi.playerNumberOfBusinessesHistory)
+                        if (t != null) p.BizCountHistory.Add(new HistoryPointI { Day = t.Item1, Value = t.Item2 });
+                if (p.BizCountHistory.Count > 10) p.BizCountHistory.RemoveRange(0, p.BizCountHistory.Count - 10);
+            }
+            catch { }
+            Send(MessageEnvelope.Create(MessageType.RivalsStatsRequest, MPConfig.PlayerId, p));
+            Plugin.Logger.LogInfo($"[Client] Sent RivalsStatsRequest with self-stats: bldgs={bldgCount} biz={rows.Count} income=${weeklyIncome:F0} hood='{hood}' ({p.Businesses.Count} business rows).");
+        }
+
+        // ── Outbound ──────────────────────────────────────────────────────────
+
+        /// <summary>Notify the host we just entered building X — host will subscribe us and reply with
+        /// InteriorSnapshot.  ambient=true (D1) instead says we are NEAR a Hamptons house a session
+        /// player rents (the game's own LOD0 callback): the host adds a second, independent membership
+        /// and our entry subscription elsewhere is untouched.</summary>
+        public static void SendInteriorRequest(string addressKey, bool ambient = false)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(addressKey)) return;
+            var p = new InteriorRequestPayload { PlayerId = MPConfig.PlayerId, AddressKey = addressKey, Ambient = ambient };
+            Send(MessageEnvelope.Create(MessageType.InteriorRequest, MPConfig.PlayerId, p));
+            Plugin.Logger.LogInfo($"[Client] Sent InteriorRequest for '{addressKey}'{(ambient ? " (ambient — near the house, not inside it)" : "")}.");
+        }
+
+        /// <summary>Notify the host we left building X — host will unsubscribe us.  ambient=true (D1)
+        /// retires only the ambient membership for that address (the house left LOD0 range) and runs
+        /// none of the host's 'a player left a building' work.</summary>
+        public static void SendPlayerExitedBuilding(string addressKey, bool ambient = false)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(addressKey)) return;
+            var p = new PlayerExitedBuildingPayload { PlayerId = MPConfig.PlayerId, AddressKey = addressKey, Ambient = ambient };
+            Send(MessageEnvelope.Create(MessageType.PlayerExitedBuilding, MPConfig.PlayerId, p));
+            Plugin.Logger.LogInfo($"[Client] Sent PlayerExitedBuilding for '{addressKey}'{(ambient ? " (ambient)" : "")}.");
+        }
+
+        /// <summary>Client owner → host: authoritative interior for a business this player runs.</summary>
+        public static void SendInteriorOwnerSnapshot(InteriorSnapshotPayload payload)
+        {
+            if (!IsConnected || payload == null || string.IsNullOrEmpty(payload.AddressKey)) return;
+            payload.OwnerPlayerId = MPConfig.PlayerId;
+            payload.ItemInstancesAuthoritative = true;
+            payload.Authoritative = true;   // owner's own push — authoritative for the whole interior
+            Send(MessageEnvelope.Create(MessageType.InteriorOwnerSnapshot, MPConfig.PlayerId, payload));
+        }
+
+        /// <summary>v10 (T7): owner → host, cargo-only interior update (OwnerStructHash set by the caller).</summary>
+        public static void SendInteriorCargoSync(InteriorCargoSyncPayload p)
+        {
+            if (!IsConnected || p == null || string.IsNullOrEmpty(p.AddressKey)) return;
+            Send(MessageEnvelope.Create(MessageType.InteriorCargoSync, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>v10 (T7/ruling 33): owner → host, dirt-values update.</summary>
+        public static void SendInteriorDirtSync(InteriorDirtSyncPayload p)
+        {
+            if (!IsConnected || p == null || string.IsNullOrEmpty(p.AddressKey)) return;
+            Send(MessageEnvelope.Create(MessageType.InteriorDirtSync, MPConfig.PlayerId, p));
+        }
+
+        // ── Passenger (ride shotgun) ──────────────────────────────────────────
+        /// <summary>Client → host: ask to ride vehicle V (host validates owner/lock/seat).</summary>
+        public static void SendBoardRequest(string vehicleId)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(vehicleId)) return;
+            Send(MessageEnvelope.Create(MessageType.PassengerBoardRequest, MPConfig.PlayerId,
+                new PassengerBoardRequestPayload { PlayerId = MPConfig.PlayerId, VehicleId = vehicleId }));
+        }
+
+        /// <summary>Client → host: I'm leaving vehicle V (always allowed, even when locked).</summary>
+        public static void SendPassengerExit(string vehicleId)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.PassengerExit, MPConfig.PlayerId,
+                new PassengerExitPayload { PlayerId = MPConfig.PlayerId, VehicleId = vehicleId }));
+        }
+
+        /// <summary>Key-holder client → host: set vehicle V's passenger lock. The host authorizes
+        /// the SENDER against its live tables (owner or currently-granted); OwnerId here is just
+        /// the spoof-checked sender identity.</summary>
+        public static void SendVehicleLock(string vehicleId, bool locked)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(vehicleId)) return;
+            Send(MessageEnvelope.Create(MessageType.VehicleLockSet, MPConfig.PlayerId,
+                new VehicleLockPayload { OwnerId = MPConfig.PlayerId, VehicleId = vehicleId, Locked = locked }));
+        }
+
+        /// <summary>Owner-client → host: grant/revoke a key for an ONLINE player (by PlayerId).
+        /// Optimistic local apply for a snappy UI; the host's snapshot + grantee-list confirm.</summary>
+        public static void SendPermissionGrant(GrantKind kind, string granteeId, bool granted)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(granteeId)) return;
+            GrantSync.SetGrant(kind, MPConfig.PlayerId, granteeId, granted);
+            Send(MessageEnvelope.Create(MessageType.PermissionGrantSet, MPConfig.PlayerId,
+                new PermissionGrantPayload { OwnerId = MPConfig.PlayerId, GranteeId = granteeId, Granted = granted, Kind = kind }));
+        }
+
+        /// <summary>Member-client → host: a merger action ("propose" with TargetPid, or
+        /// "accept"/"decline"/"leave"). The host arbitrates and rebroadcasts MergerState.</summary>
+        /// <summary>FRIENDS-1: add | accept | decline | cancel | remove a friendship with targetPid (the host decides).</summary>
+        public static void SendFriendAction(string action, string targetPid)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(action) || string.IsNullOrEmpty(targetPid)) return;
+            Send(MessageEnvelope.Create(MessageType.FriendAction, MPConfig.PlayerId, new FriendActionPayload { Action = action, TargetPid = targetPid }));
+        }
+
+        /// <summary>RADIO-SHOP-1: member -> host, a building's loudspeaker stream.</summary>
+        public static void SendShopRadio(ShopRadioPayload p)
+            => Send(MessageEnvelope.Create(MessageType.ShopRadio, MPConfig.PlayerId, p));
+
+        /// <summary>GO-LIVERY-1: the player's service van livery to the host (who passes it on to everybody).</summary>
+        public static void SendVanLivery(VanLiveryPayload p)
+            => Send(MessageEnvelope.Create(MessageType.VanLivery, MPConfig.PlayerId, p));
+
+        /// <summary>DISSOLVE-SALE-1: member -> host, this machine's sale ran (what it brought in).</summary>
+        public static void SendDissolveSaleDone(MergerDissolveSalePayload p)
+            => Send(MessageEnvelope.Create(MessageType.MergerDissolveSaleDone, MPConfig.PlayerId, p));
+
+        public static void SendMergerAction(string action, string targetPid = "")
+        {
+            if (!IsConnected || string.IsNullOrEmpty(action)) return;
+            Send(MessageEnvelope.Create(MessageType.MergerRequest, MPConfig.PlayerId,
+                new MergerRequestPayload { Action = action, TargetPid = targetPid ?? "" }));
+        }
+
+        /// <summary>Member-client → host: a routed owner-only business edit (merger slice 3).</summary>
+        public static void SendBusinessEdit(BusinessEditPayload p)
+        {
+            if (!IsConnected || p == null) return;
+            Send(MessageEnvelope.Create(MessageType.BusinessEditRequest, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>Owner-client → host: revoke an OFFLINE grantee by their StableId handle (taken from
+        /// the owner's grantee list). The host updates the durable store + rebroadcasts.</summary>
+        /// <summary>Owner-client → host: grant/revoke a kind for an OFFLINE grantee by their StableId handle
+        /// (taken from the owner's grantee list). The host updates the durable store + rebroadcasts.</summary>
+        public static void SendPermissionSetOffline(GrantKind kind, string granteeStable, bool granted)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(granteeStable)) return;
+            Send(MessageEnvelope.Create(MessageType.PermissionGrantSet, MPConfig.PlayerId,
+                new PermissionGrantPayload { OwnerId = MPConfig.PlayerId, GranteeStable = granteeStable, Granted = granted, Kind = kind }));
+        }
+
+        /// <summary>Client(driver) → host: I drove vehicle V into a building. The host resolves V's riders
+        /// and tells each to follow (a client can't reach the other riders directly).</summary>
+        public static void SendPassengerFollowRelayEnter(string vehicleId, string addressKey)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(vehicleId)) return;
+            Send(MessageEnvelope.Create(MessageType.PassengerFollowRelayEnter, MPConfig.PlayerId,
+                new PassengerFollowPayload { VehicleId = vehicleId, AddressKey = addressKey }));
+        }
+
+        /// <summary>Client(driver) → host: I drove vehicle V back out of a building.</summary>
+        public static void SendPassengerFollowRelayExit(string vehicleId, int exitId)
+        {
+            if (!IsConnected || string.IsNullOrEmpty(vehicleId)) return;
+            Send(MessageEnvelope.Create(MessageType.PassengerFollowRelayExit, MPConfig.PlayerId,
+                new PassengerFollowPayload { VehicleId = vehicleId, ExitId = exitId }));
+        }
+
+        /// <summary>Client → host: upload our pending disconnect save (Phase 3); the host validates its
+        /// actual in-game day, then sends back the real load.</summary>
+        /// <summary>v9 (review B2): confirm to the host that one mirrored .hsg is in our store —
+        /// the host's absent-member skip records delivery only on this.</summary>
+        public static void SendMirrorAck(string sessionName, string stableId, long sig)
+        {
+            if (!IsConnected || sig == 0) return;
+            Send(MessageEnvelope.Create(MessageType.MirrorAck, MPConfig.PlayerId,
+                 new MirrorAckPayload { SessionName = sessionName, StableId = stableId, Sig = sig }));
+        }
+
+        public static void SendClientDisconnectUpload(SaveDataPayload p)
+        {
+            if (!IsConnected || p == null) return;
+            var env = MessageEnvelope.Create(MessageType.ClientDisconnectUpload, MPConfig.PlayerId, p);
+            env.Attachment = p.HsgRaw;   // v9: raw gzip rides the attachment frame (HsgRaw is JsonIgnore)
+            Send(env);
+        }
+
+        // [PassFollow] SLICE 1a — confirm the rider receives the follow-signal and can resolve the
+        // building (the actual EnterBuilding lands in 1b).  Only the targeted rider acts.
+        private static void HandlePassengerFollowEnterMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PassengerFollowPayload>();
+            if (p == null || p.TargetPlayerId != MPConfig.PlayerId) return;   // not for me
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                Plugin.Logger.LogInfo($"[PassFollow] FollowEnter for '{p.AddressKey}' (riding '{p.VehicleId}') → following driver inside.");
+                PassengerRide.FollowDriverIntoByAddress(p.AddressKey);
+            });
+        }
+
+        private static void HandlePassengerFollowExitMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PassengerFollowPayload>();
+            if (p == null || p.TargetPlayerId != MPConfig.PlayerId) return;   // not for me
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                try
+                {
+                    Plugin.Logger.LogInfo($"[PassFollow] FollowExit (riding '{p.VehicleId}', exit {p.ExitId}) → following driver out.");
+                    PassengerRide.FollowDriverOut(p.ExitId);
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[PassFollow] FollowExit handle: {ex.Message}"); }
+            });
+        }
+
+        private static void HandlePassengerBoardResultMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PassengerBoardResultPayload>();
+            if (p == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                if (p.Seat >= 0) PassengerSync.ApplyBoard(p.VehicleId, p.PlayerId, p.Seat);
+                else if (p.PlayerId == MPConfig.PlayerId) PassengerHud.ToastReason(p.Reason);   // "Vehicle full." etc.
+            });
+        }
+
+        private static void HandlePassengerExitMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PassengerExitPayload>();
+            if (p == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() => PassengerSync.ApplyExit(p.PlayerId));
+        }
+
+        private static void HandleVehicleLockMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<VehicleLockPayload>();
+            if (p == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                PassengerSync.SetLock(p.VehicleId, p.Locked);
+                PassengerLockButton.RefreshFor(p.VehicleId);   // live label if this player sits in it (either side may toggle now)
+            });
+        }
+
+        private static void HandlePermissionOwnGrantsMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PermissionOwnGrantsPayload>();
+            if (p == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() => GrantSync.SetMyGrantees(p.Grantees));
+        }
+
+        private static void HandlePermissionSnapshotMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PermissionSnapshotPayload>();
+            if (p == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() => { GrantSync.ApplySnapshot(p); VehicleManager.OnGrantsChanged(); });
+        }
+
+        private static void HandlePermissionBuildingAccessMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PermissionBuildingAccessPayload>();
+            if (p == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                GrantSync.SetEnterableBuildings(p.AddressKeys);
+                GrantSync.SetHelperBusinesses(p.HelperAddressKeys);
+                GrantSync.SetSharedManage(p.SharedManageKeys);   // shared-shop management (permission feature): direct grants only
+                GrantSync.SetOtherOwned(p.OtherOwnedKeys);   // merger slice 3 repair source
+                PlayerColours.LearnOwners(p.Owners);   // 2026-09-05 colours: addressKey → owner, so each shared building tints in ITS owner's colour
+                HousingMapCues.RefreshSharedPois();
+            });
+        }
+
+        private static void HandlePassengerSnapshotMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<PassengerSnapshotPayload>();
+            if (p == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() => PassengerSync.ApplySnapshot(p));
+        }
+
+        /// <summary>
+        /// Tells the host this player's game scene has finished loading.
+        /// Part of the startup pause hold — the game stays frozen until every
+        /// player has sent this.
+        /// </summary>
+        public static void SendPlayerInGame()
+        {
+            if (!IsConnected) return;
+            _worldReadySent = false;   // re-arm the world-ready ack for this load
+            _settledReported = false;  // round-271: re-arm the settled report for this load
+            WorldSyncApplied = false;  // re-arm: world sync not yet applied for this load
+            _worldReadyContentDeadlineAt = 0f;   // round-205: content-bar deadline re-arms per load
+            var payload = new PlayerInGamePayload { PlayerId = MPConfig.PlayerId };
+            Send(MessageEnvelope.Create(MessageType.PlayerInGame, MPConfig.PlayerId, payload));
+            Plugin.Logger.LogInfo("[Client] Sent PlayerInGame to host.");
+
+            // Wave 5: send our in-character name so other players' UIs can
+            // display it as our identity.  Character name lives in
+            // gi.charactersData[0].name; falls back to PlayerId if not yet set.
+            SendPlayerProfile();
+        }
+
+        private static bool _worldReadySent;
+
+        /// <summary>Set true once the client has APPLIED the bulk world sync (business
+        /// snapshot).  The overlay-freeze gate reads this to decide when to send
+        /// WorldReady — the client must be BOTH overlay-cleared (frozen) AND
+        /// world-synced before it counts as truly in the game.</summary>
+        public static bool WorldSyncApplied { get; set; }
+
+        /// <summary>Tell the host we've APPLIED the world sync, so it can release the
+        /// frozen-until-synced startup hold once everyone is ready.  One-shot per load.</summary>
+        /// <summary>Reports a lifecycle transition to the host (load-fence
+        /// visibility — lets the host excuse a menu-bailed client).  Round-276:
+        /// `detail` carries the sender-side reason (lifecycle discriminators) so the
+        /// host log names WHY a client demoted without needing its Player.log.</summary>
+        /// <summary>Round-283: monotonic freshness stamp for our phase reports (see
+        /// PhaseReportPayload.Seq).  Process-lifetime, never reset — the HOST clears its last-seen
+        /// for us when we disconnect, so a restart of this process starting over at 1 is fine.</summary>
+        private static long _phaseSeq;
+
+        // ── SAVED-SETTINGS-1: the host's saved-world settings on this client (main thread) ──
+        private static int _worldRevApplied;
+        private static WorldSettingsPayload? _worldHeld;
+        private static float _worldReadyAt = -999f, _worldAskNext;
+        internal static int WorldRevApplied => _worldRevApplied;
+
+        private static void ResetWorldSettings() { _worldRevApplied = 0; _worldHeld = null; _worldReadyAt = -999f; _worldAskNext = 0f; }
+
+        private static bool WorldOpen()
+        {
+            var ph = MPLifecycle.Phase;
+            return (ph == MPLifecycle.MPPhase.WorldReady || ph == MPLifecycle.MPPhase.Running) && SaveGameManager.Current?.gameVariables != null;
+        }
+
+        private static void ReceiveWorldSettings(WorldSettingsPayload p)
+        {
+            try
+            {
+                if (!IsConnected || MPServer.IsRunning || p.Settings == null) return;
+                if (!WorldOpen())
+                {   // only in an MP world: my own save is still loading and would overwrite it - apply at my world-ready
+                    _worldHeld = p;
+                    Plugin.Logger.LogInfo($"[World] settings rev={p.Rev} arrived before my world opened - held for world-ready.");
+                    return;
+                }
+                _worldHeld = null;
+                MPServer.ApplyWorldSettings(p.Settings, p.Rev, "client", out bool ok);
+                if (ok) _worldRevApplied = p.Rev;   // F1: a failed apply is never recorded as done
+                else Plugin.Logger.LogWarning($"[World] settings rev={p.Rev} (client) not applied - rev not recorded; the heartbeat will ask again.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[World] client receive: {ex.Message}"); }
+        }
+
+        /// <summary>MPCanvasUI world-ready (client): the world just came from disk, so what it holds is re-checked against the
+        /// host's (applied rev back to 0); a set that arrived during the load is applied now.</summary>
+        internal static void WorldSettingsOnWorldReady()
+        {
+            try
+            {
+                if (!IsConnected || MPServer.IsRunning) return;
+                _worldRevApplied = 0;
+                _worldReadyAt = UnityEngine.Time.unscaledTime;
+                var held = _worldHeld;
+                _worldHeld = null;
+                if (held?.Settings != null)
+                {
+                    MPServer.ApplyWorldSettings(held.Settings, held.Rev, "client, held", out bool ok);
+                    if (ok) _worldRevApplied = held.Rev;   // F1
+                    else Plugin.Logger.LogWarning($"[World] settings rev={held.Rev} (client, held) not applied - rev not recorded; the heartbeat will ask again.");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[World] client world-ready: {ex.Message}"); }
+        }
+
+        private static void WorldRevCheck(int hostRev)
+        {
+            try
+            {
+                if (!IsConnected || MPServer.IsRunning || hostRev == _worldRevApplied || !WorldOpen()) return;
+                float now = UnityEngine.Time.unscaledTime;
+                if (now - _worldReadyAt < 20f || now < _worldAskNext) return;   // the host's world-loaded send normally lands first
+                _worldAskNext = now + 15f;
+                Send(MessageEnvelope.Create(MessageType.WorldSettings, MPConfig.PlayerId, new WorldSettingsPayload { Rev = _worldRevApplied }));
+                Plugin.Logger.LogInfo($"[World] heartbeat says rev={hostRev}, this machine applied rev={_worldRevApplied} - asked the host to re-send.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[World] rev check: {ex.Message}"); }
+        }
+
+        public static void SendPhaseReport(string phase, string detail = "")
+        {
+            if (!IsConnected) return;
+            var env = MessageEnvelope.Create(MessageType.PhaseReport, MPConfig.PlayerId,
+                new PhaseReportPayload
+                {
+                    PlayerId = MPConfig.PlayerId, Phase = phase, Detail = detail,
+                    Seq = System.Threading.Interlocked.Increment(ref _phaseSeq),
+                    LoadGen = ServedLoadGen,   // round-284 load ticket (0 until served / toward non-stamping hosts)
+                });
+
+            // ── Round-284: phase reports ride the EXPRESS lane when the host allows ──
+            // Round-283 audited this send and HELD it ordered: the join-baseline trigger
+            // was the _joinBaselineDone latch, and it depended on cross-type arrival order
+            // (an express 'Settled'/'Running' beating the ordered PlayerInGame would fire
+            // the baseline for a player the host had not yet marked in-game or served).
+            // Round-284 built the trigger that audit asked for — the report carries its
+            // per-load identity (LoadGen above) and the host's fire rule is GEN-KEYED: a
+            // matching report that arrives before PlayerInGame is PARKED and fired by
+            // MarkPlayerInGame when the mark lands, so the inversion can no longer produce
+            // a wrong fire (MPServer.RecordPhaseReport).  The gate is two-sided on purpose:
+            // HostExpressLane (host drops stale reports by Seq — LobbyUpdate.HostExpress)
+            // AND a non-zero ServedLoadGen — only a host that stamps load tickets has the
+            // gen-keyed fire rule, and a round-283 host advertises the lane while still
+            // running the order-dependent latch, so toward it (and until we are served)
+            // delivery order stays the guarantee: the ordered send, byte-identical to
+            // before.
+            if (HostExpressLane && ServedLoadGen != 0) _transport?.SendExpress(env.Serialize());
+            else Send(env);
+        }
+
+        /// <summary>Round-271 (Fix A): one-shot per load — report the moment OUR settled-gate
+        /// opens (the exact predicate that gates our save upload, not the lifecycle 'Running'
+        /// proxy).  The host fires the join baseline save on this instead of WorldReady, so
+        /// the checkpoint a join triggers actually contains the joiner.  Re-armed alongside
+        /// _worldReadySent in SendPlayerInGame (same per-load lifecycle).</summary>
+        private static bool _settledReported;
+
+        internal static void TickSettledReport()
+        {
+            GameStatePatcher.TickHeldForfeits();   // BAN-PLAYERS-1 build B: a forfeit notice held for the settled edge (no-op when none)
+            if (_settledReported || !IsConnected || MPServer.IsRunning || !IsClientInWorld) return;
+            if (!MPWorldReady.IsSettled) return;
+            _settledReported = true;
+            SendPhaseReport("Settled", "settled-gate open (round-271)");
+            Plugin.Logger.LogInfo("[Client] Reported Settled to host (round-271: join baseline save fires on this).");
+        }
+
+        public static void SendWorldReady()
+        {
+            if (!IsConnected || _worldReadySent) return;
+            _worldReadySent = true;
+            Send(MessageEnvelope.Create(MessageType.WorldReady, MPConfig.PlayerId,
+                new PlayerInGamePayload { PlayerId = MPConfig.PlayerId }));
+            Plugin.Logger.LogInfo("[Client] Sent WorldReady to host (world sync applied).");
+        }
+
+        // Round-205: the old readiness bar (overlay gone + business snapshot applied)
+        // released clients into a world still materializing — parked cars visibly
+        // popped in AFTER the unfreeze (user observation). The gate now also waits
+        // for the first parked-vehicle snapshot RECEIPT, with its own deadline so a
+        // lost snapshot can't deadlock the session. Called recurring from the canvas
+        // pre-block (recurrence-covered) AND opportunistically from the old one-shot
+        // call sites.
+        private static float _worldReadyContentDeadlineAt;
+
+        public static void TickWorldReadyGate()
+        {
+            // Merger phase 3-A: the paperwork publisher rides this per-frame canvas call (it is the
+            // only existing tick reachable from the files this slice owns). It self-throttles to 1 Hz
+            // and is one bool read for a non-member, and it must run BEFORE the world-ready early
+            // return below, which is client-only state.
+            PaperworkSync.Tick();
+            TickDeferredDisconnect();   // R2: a Disconnect-button close held one frame behind the leave publish
+            try
+            {
+                if (!IsConnected || _worldReadySent || !WorldSyncApplied) return;
+                if (!ParkedVehicleSync.FirstSnapshotReceived)
+                {
+                    if (_worldReadyContentDeadlineAt == 0f)
+                        _worldReadyContentDeadlineAt = UnityEngine.Time.unscaledTime + 20f;
+                    if (UnityEngine.Time.unscaledTime < _worldReadyContentDeadlineAt) return;
+                    Plugin.Logger.LogWarning("[Client] world-ready content deadline (20s): no parked-vehicle snapshot arrived — reporting ready anyway.");
+                }
+                SendWorldReady();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Reads the local CharacterData.name and broadcasts it as the
+        /// canonical display name for this player.  Safe to call multiple
+        /// times — receivers just update their mapping.  If charactersData
+        /// isn't available yet, falls back to MPConfig.PlayerId so the
+        /// message still goes out with SOMETHING usable.
+        /// </summary>
+        public static void SendPlayerProfile()
+        {
+            if (!IsConnected) return;
+            string name = MPConfig.PlayerId;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi != null && gi.charactersData != null && gi.charactersData.Count > 0)
+                {
+                    var cd = gi.charactersData[0];
+                    var cn = cd?.name?.ToString();
+                    if (!string.IsNullOrWhiteSpace(cn)) name = cn;
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Client] SendPlayerProfile read failed: {ex.Message}"); }
+            string portrait = ""; try { portrait = GameStatePatcher.ReadLocalPortraitBase64(); } catch { }
+            int age = 0; try { age = GameStatePatcher.LocalAgeInYears(); } catch { }
+            int gender = -1; try { var gi2 = SaveGameManager.Current; if (gi2?.charactersData != null && gi2.charactersData.Count > 0) gender = (int)gi2.charactersData[0].gender; } catch { }
+            var p = new PlayerProfilePayload { PlayerId = MPConfig.PlayerId, CharacterName = name, PortraitPngBase64 = portrait, AgeInYears = age, Gender = gender };
+            Friends.OwnSteam(out var steamName, out var steamId); p.SteamName = steamName; p.SteamId = steamId;   // FRIENDS-1
+            if (!string.IsNullOrEmpty(portrait)) GameStatePatcher.LocalPortraitSent = true;   // image goes over once
+            Send(MessageEnvelope.Create(MessageType.PlayerProfile, MPConfig.PlayerId, p));
+            Plugin.Logger.LogInfo($"[Client] Sent PlayerProfile: PlayerId='{MPConfig.PlayerId}' CharacterName='{name}' age={age} portrait={(string.IsNullOrEmpty(portrait) ? "none" : portrait.Length + "b64")}.");
+        }
+
+        /// <summary>Ships this player's saved .hsg (gzipped) up to the host so the
+        /// host holds the canonical copy (Phase 4 — centralized persistence).</summary>
+        public static void SendSaveData(string sessionName, MpSlot slot, byte[] hsgGzip, int rawLength, string metaJson = "")
+        {
+            if (!IsConnected) return;
+            var p = new SaveDataPayload
+            {
+                SessionName   = sessionName,
+                Success       = true,
+                Slot          = slot,
+                RawLength     = rawLength,
+                MetaJson      = metaJson,   // round-275: the sidecar that lets the host DATE this save
+                PlaythroughId = MPSaveManager.ActivePlaythrough,   // round-222: identity travels
+            };
+            var env = MessageEnvelope.Create(MessageType.SaveData, MPConfig.PlayerId, p);
+            env.Attachment = hsgGzip;   // v9: raw gzip rides the attachment frame, no base64
+            Send(env);
+            Plugin.Logger.LogInfo($"[Client] Sent SaveData: session='{sessionName}' raw={rawLength}B day={slot?.Day}.");
+        }
+
+        /// <summary>Sends a business this player runs (in a building it owns) up to the
+        /// host so the host applies it + relays to the other players.  Change-driven
+        /// (BusinessSync.TickClient only calls this when the building's info changed).</summary>
+        public static void SendBusinessChange(BusinessInfo info)
+        {
+            if (!IsConnected || info == null) return;
+            Send(MessageEnvelope.Create(MessageType.BusinessChange, MPConfig.PlayerId,
+                new BusinessChangePayload { Info = info }));
+        }
+
+        /// <summary>Reports this client's self-chosen starting age to the host so it
+        /// shows in everyone's lobby and is baked into this client's start settings.</summary>
+        public static void SendLobbyPref(int age)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.LobbyPref, MPConfig.PlayerId,
+                new LobbyPrefPayload { PlayerId = MPConfig.PlayerId, Age = age }));
+        }
+
+        /// <summary>Sends a chat line to the host, which relays it to everyone
+        /// (including us) so the log stays consistent and host-ordered.</summary>
+        /// <summary>Sends a Business Hub payload to the host.</summary>
+        public static void SendHub<T>(MessageType type, T payload) where T : class
+        {
+            if (!IsConnected || payload == null) return;
+            Send(MessageEnvelope.Create(type, MPConfig.PlayerId, payload));
+        }
+
+        /// <summary>Sends this player's rest-vote (started/ended a rest activity).</summary>
+        // ── DEDICATED-AFK-1: tell the host whether this player is in the pause menu / idle ──────────────────────────
+        private static float _actLastInputAt = -1f, _actNextSendAt;
+        private static UnityEngine.Vector3 _actLastMouse;
+        private static bool _actLastMenu;
+
+        /// <summary>MAIN THREAD, every frame (MPCanvasUI.Update). Tracks keyboard/mouse input and reports to the host every
+        /// 5 s and at once when the pause menu opens or closes. Only while connected to a dedicated server.</summary>
+        internal static void TickActivity()
+        {
+            if (!IsConnected || !HostIsDedicated) { _actLastInputAt = -1f; return; }
+            try
+            {
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (_actLastInputAt < 0f) _actLastInputAt = now;
+                UnityEngine.Vector3 mouse = UnityEngine.Input.mousePosition;
+                if (UnityEngine.Input.anyKey || UnityEngine.Input.mouseScrollDelta.sqrMagnitude > 0f || (mouse - _actLastMouse).sqrMagnitude > 4f)
+                    _actLastInputAt = now;
+                _actLastMouse = mouse;
+                bool menu = false;
+                try { menu = UI.MiniMenu.MiniMenu.IsOpen; } catch { }
+                if (menu == _actLastMenu && now < _actNextSendAt) return;
+                _actLastMenu = menu;
+                _actNextSendAt = now + 5f;
+                Send(MessageEnvelope.Create(MessageType.ClientActivity, MPConfig.PlayerId, new ClientActivityPayload
+                {
+                    PlayerId = MPConfig.PlayerId, InPauseMenu = menu, IdleSeconds = (int)(now - _actLastInputAt),
+                }));
+            }
+            catch { }
+        }
+
+        public static void SendRestVote(RestVotePayload p)
+        {
+            if (!IsConnected || p == null) return;
+            Send(MessageEnvelope.Create(MessageType.RestVote, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>Sends this player's changed retail prices to the host (who
+        /// applies + relays to the other clients).</summary>
+        public static void SendRetailPrices(RetailPricesPayload p)
+        {
+            if (!IsConnected || p == null) return;
+            Send(MessageEnvelope.Create(MessageType.RetailPrices, MPConfig.PlayerId, p));
+        }
+
+        public static void SendStockDigest(ShopStockDigestPayload p)
+        {
+            if (!IsConnected || p == null) return;
+            Send(MessageEnvelope.Create(MessageType.ShopStockDigest, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>Periodic state-hash audit → host (silent-divergence detector).</summary>
+        public static void SendAuditReport(AuditReportPayload p)
+        {
+            if (!IsConnected || p == null) return;
+            Send(MessageEnvelope.Create(MessageType.AuditReport, MPConfig.PlayerId, p));
+        }
+
+        public static void SendChat(string text, string to = "")
+        {
+            if (!IsConnected || string.IsNullOrWhiteSpace(text)) return;
+            Send(MessageEnvelope.Create(MessageType.Chat, MPConfig.PlayerId,
+                new ChatPayload { PlayerId = MPConfig.PlayerId, Text = text, To = to ?? "" }));
+        }
+
+        /// <summary>CHAT-TRANSLATE-1: the player's game language and "Translate chat" (ChatTranslate.ClientTick).</summary>
+        internal static void SendChatPrefs(string lang, bool on)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.ChatPrefs, MPConfig.PlayerId,
+                new ChatPrefsPayload { PlayerId = MPConfig.PlayerId, Lang = lang ?? "", On = on }));
+        }
+
+        /// <summary>Asks the host to run a coordinated MP save (the user hit Save /
+        /// Save-and-Exit in the pause menu).  The host's SaveNow broadcast comes
+        /// back to us, so our own save+upload happens through the normal path.</summary>
+        public static void SendRequestSave(string reason = "client-menu", bool exiting = false, string saveName = "")
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.RequestSave, MPConfig.PlayerId,
+                new RequestSavePayload { Reason = reason, Exiting = exiting, SaveName = saveName }));
+            Plugin.Logger.LogInfo($"[Client] Sent RequestSave (reason={reason}, exiting={exiting}, name='{saveName}').");
+        }
+
+        /// <summary>Reports this player's current money to the host (Phase 4
+        /// loss-minimization — host keeps a near-current cash figure).</summary>
+        public static void SendCashSync(float money)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.CashSync, MPConfig.PlayerId,
+                new CashSyncPayload { PlayerId = MPConfig.PlayerId, Money = money }));
+        }
+
+        /// <summary>GOING-ONLINE-RANK-1: reports this player's cable provider (module 8) to the host for the ranking page.</summary>
+        public static void SendOwnershipReport(OwnershipReportPayload p)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.OwnershipReport, MPConfig.PlayerId, p));   // BUILDING-LIST-2
+        }
+
+        public static void SendProviderReport(ProviderReportPayload p)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.ProviderReport, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>GO-STREET-2: this player's cable network in the street.</summary>
+        public static void SendProviderStreet(ProviderStreetPayload p)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.ProviderStreet, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>GO-WHOLESALE-2: a day's bill for lines on another player's network, or the owner's receipt.</summary>
+        public static void SendLineBill(LineBillPayload p)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.LineBill, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>PLAYER-REPORTS-1: this player's new error lines (PlayerReports decides when, and whether at all).</summary>
+        public static void SendPlayerReport(PlayerReportPayload p)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.PlayerReport, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>PLAYER-REPORTS-1: one piece of the cleaned Player.log, or the answer that it is not sent.</summary>
+        public static void SendPlayerLogChunk(PlayerLogChunkPayload p)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.PlayerLogChunk, MPConfig.PlayerId, p));
+        }
+
+        /// <summary>Tells the host this player toggled the manual (pause-button) pause.</summary>
+        public static void SendManualPause(bool paused)
+        {
+            if (!IsConnected) return;
+            // Round-284/F2 echo suppression: our press is now on the wire — the next heartbeat
+            // can still carry the host's PRE-press intent, and converging on it would revert
+            // the press just before the relay lands.  Recorded HERE (with the actual send, its
+            // only pairing) rather than at the patch site.
+            TimeSync.NotePendingLocalPause(paused);
+            // 284c (user-approved): the press rides the EXPRESS lane — queued behind a store
+            // mirror it can outlive F2's 8s echo bound, and the bound then converges this client
+            // back to the pre-press state until the press finally lands (the verifier's F-1
+            // flicker).  Gate: HostExpressLane alone — NOT ServedLoadGen, which proves the
+            // gen-keyed BASELINE rule (a phase-report hazard; pause has no such consumer).
+            // Presses stay in-lane FIFO, so two presses can't swap; toward an older host the
+            // ordered send is byte-identical to before.
+            var env = MessageEnvelope.Create(
+                MessageType.ManualPause, MPConfig.PlayerId, new ManualPausePayload { Paused = paused });
+            if (HostExpressLane) _transport?.SendExpress(env.Serialize());
+            else Send(env);
+            Plugin.Logger.LogInfo($"[Client] Sent ManualPause: {paused}");
+        }
+
+        /// <summary>Sends a local animator trigger to the host for relay to all players.</summary>
+        public static void SendAnimTrigger(int paramIndex)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.PlayerAnimTrigger, MPConfig.PlayerId,
+                new AnimTriggerPayload { PlayerId = MPConfig.PlayerId, ParamIndex = paramIndex }));
+        }
+
+        /// <summary>Tells the host this player hailed a traffic taxi (host stops the real one).</summary>
+        public static void SendTaxiHail(int taxiIndex)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.TaxiHail, MPConfig.PlayerId,
+                new TaxiHailPayload { PlayerId = MPConfig.PlayerId, TaxiIndex = taxiIndex }));
+        }
+
+        /// <summary>TRAFFIC-APART P5/P6: tells the host that the named mode is really in force here - for a
+        /// "local" flip the host only then stops streaming this client's snapshots and drops its traffic anchor.</summary>
+        public static void SendTrafficModeAck(string mode, int seq)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.TrafficModeAck, MPConfig.PlayerId,
+                new TrafficModeAckPayload { Mode = mode, Seq = seq }));
+        }
+
+        /// <summary>TRAFFIC-CONSIST T1: this client's own leftover ambient cars -> the host, on the UNRELIABLE lane
+        /// (a lost publish costs one 0.2 s beat and the next one carries the same cars) and seq-guarded on the host
+        /// exactly like the host's own snapshot stream. Sent only while this client is in ghost mode and still holds
+        /// local ambient cars of its own.</summary>
+        public static void SendClientTrafficSnapshot(ClientTrafficSnapshotPayload p)
+        {
+            if (!IsConnected || p == null) return;
+            var env = MessageEnvelope.Create(MessageType.ClientTrafficSnapshot, MPConfig.PlayerId, p);
+            _transport?.Send(env.Serialize(), reliable: false);
+        }
+
+        /// <summary>Sends the local player's vehicle fleet to the host for relay.</summary>
+        public static void SendVehicleSync(VehicleFleetPayload payload)
+        {
+            if (!IsConnected) return;
+            Send(MessageEnvelope.Create(MessageType.VehicleSync, MPConfig.PlayerId, payload));
+        }
+
+        /// <summary>Driver(borrower) → host → all: the pose of a borrowed car I'm driving (handoff).</summary>
+        public static void SendVehicleDrive(VehicleDrivePayload p)
+        {
+            if (!IsConnected || p == null) return;
+            Send(MessageEnvelope.Create(MessageType.VehicleDrive, MPConfig.PlayerId, p));
+        }
+
+        private static void HandleVehicleDriveMsg(MessageEnvelope env)
+        {
+            var p = env.GetPayload<VehicleDrivePayload>();
+            if (p == null) return;
+            GameStatePatcher.EnqueueOnMainThread(() => VehicleManager.ApplyDriveSync(p));
+        }
+
+        /// <summary>
+        /// Sends the local player's position to the host so it can be relayed
+        /// to all other clients.  Called from MPCanvasUI at ~10 Hz.
+        /// </summary>
+        public static void SendPlayerPosition(PlayerPositionPayload payload)
+        {
+            if (!IsConnected) return;
+            var env = MessageEnvelope.Create(MessageType.PlayerMove, MPConfig.PlayerId, payload);
+            _transport?.Send(env.Serialize(), reliable: false);
+        }
+
+        /// <summary>
+        /// Called by GamePatches when the local player tries to rent a building.
+        /// Instead of executing locally, sends a request to the host.
+        /// Returns false if not connected (fall through to local execution).
+        /// </summary>
+        public static bool RequestRentBuilding(string addressKey, float dailyRent, float lastDeposit)
+        {
+            if (!IsConnected) return false;
+
+            var payload = new BuildingOwnershipPayload
+            {
+                AddressKey   = addressKey,
+                OwnerPlayerId = MPConfig.PlayerId,
+                DailyRent    = dailyRent,
+                LastDeposit  = lastDeposit
+            };
+            Send(MessageEnvelope.Create(MessageType.RentRequest, MPConfig.PlayerId, payload));
+            Plugin.Logger.LogInfo($"[Client] Sent RentRequest for {addressKey}");
+            return true;
+        }
+
+        /// <summary>Called from the unrent patch when the local client terminates a
+        /// building's lease.  The native unrent already ran locally; this asks the
+        /// host to release ownership so its authoritative state stops re-asserting
+        /// the rental back onto us (and so the other players see the building free).</summary>
+        public static bool RequestVacateBuilding(string addressKey)
+        {
+            if (!IsConnected) return false;
+
+            var payload = new BuildingOwnershipPayload
+            {
+                AddressKey    = addressKey,
+                OwnerPlayerId = MPConfig.PlayerId,
+            };
+            Send(MessageEnvelope.Create(MessageType.VacateRequest, MPConfig.PlayerId, payload));
+            Plugin.Logger.LogInfo($"[Client] Sent VacateRequest for {addressKey}");
+            return true;
+        }
+
+        /// <summary>Client bought a for-sale building locally; ask the host (the owner
+        /// registrar) to ratify it.  If the host denies (someone else already owns it),
+        /// HandleBuyDeny rolls back our optimistic purchase.</summary>
+        public static bool RequestBuyBuilding(string addressKey)
+        {
+            if (!IsConnected) return false;
+
+            var payload = new BuildingOwnershipPayload
+            {
+                AddressKey    = addressKey,
+                OwnerPlayerId = MPConfig.PlayerId,
+            };
+            Send(MessageEnvelope.Create(MessageType.BuyRequest, MPConfig.PlayerId, payload));
+            Plugin.Logger.LogInfo($"[Client] Sent BuyRequest for {addressKey}");
+            return true;
+        }
+
+        /// <summary>Round-204b: offer on an AI-run business — the host arbitrates
+        /// against live data; nothing happens locally until its TakeoverResult.</summary>
+        public static bool SendTakeoverRequest(string addressKey, float offer)
+        {
+            if (!IsConnected) return false;
+            Send(MessageEnvelope.Create(MessageType.TakeoverRequest, MPConfig.PlayerId,
+                new TakeoverPayload { AddressKey = addressKey, OfferAmount = offer }));
+            Plugin.Logger.LogInfo($"[Client] Sent TakeoverRequest for {addressKey} (${offer:N0})");
+            return true;
+        }
+
+        /// <summary>Client listed an owned building for sale; ask the host to add it to
+        /// the authoritative for-sale market (carrying the seller's chosen price/sqm) so
+        /// the listing survives the host's market broadcast and every player sees it.</summary>
+        public static bool RequestListForSale(BuildingForSaleInfo info)
+        {
+            if (!IsConnected || info == null) return false;
+            Send(MessageEnvelope.Create(MessageType.ListForSale, MPConfig.PlayerId, info));
+            Plugin.Logger.LogInfo($"[Client] Sent ListForSale for {info.AddressKey}");
+            return true;
+        }
+
+        /// <summary>Client canceled its building's sale; ask the host to remove it from
+        /// the authoritative market.</summary>
+        public static bool RequestCancelSale(string addressKey)
+        {
+            if (!IsConnected) return false;
+            var payload = new BuildingOwnershipPayload { AddressKey = addressKey, OwnerPlayerId = MPConfig.PlayerId };
+            Send(MessageEnvelope.Create(MessageType.CancelSale, MPConfig.PlayerId, payload));
+            Plugin.Logger.LogInfo($"[Client] Sent CancelSale for {addressKey}");
+            return true;
+        }
+
+        /// <summary>The AI bought one of this client's listed buildings (completed in our
+        /// own sim — we were paid natively).  Tell the host to drop it from the
+        /// authoritative for-sale market + ownership registry.</summary>
+        public static bool SendSaleCompleted(string addressKey)
+        {
+            if (!IsConnected) return false;
+            var payload = new BuildingOwnershipPayload { AddressKey = addressKey, OwnerPlayerId = MPConfig.PlayerId };
+            Send(MessageEnvelope.Create(MessageType.SaleCompleted, MPConfig.PlayerId, payload));
+            Plugin.Logger.LogInfo($"[Client] Sent SaleCompleted for {addressKey}");
+            return true;
+        }
+
+        private static void Send(MessageEnvelope env)
+        {
+            _transport?.Send(env.Serialize(), reliable: true);   // Serialize() emits the 'BZA' frame itself when env.Attachment is set
+        }
+
+        /// <summary>PASSENGER-RADIO-1: the station of the car this player drives, to the host (which tells the others).</summary>
+        internal static void SendVehicleRadio(VehicleRadioPayload p) => Send(MessageEnvelope.Create(MessageType.VehicleRadio, MPConfig.PlayerId, p));
+
+        // ── Round-270: world-download progress reporter (called each frame from the canvas) ──
+        private static float _jpNextAt;
+        private static int   _jpLastPct = -1;
+
+        /// <summary>While THIS client is downloading the world (Steam-relay fragments in
+        /// flight, not yet in-game), report the percent to the host — throttled to a change
+        /// of ≥2% and ≥0.7s. Direct-UDP joins never report (fragmentation is internal to
+        /// that transport — accepted limitation); silence is what the overlay renders as
+        /// "loading world…", so no report is never wrong, only less informative.</summary>
+        /// <summary>JOIN-WAIT-1 (C3): a mid-game join parked for the host's approval has no timeout and, until now,
+        /// left no trace in the client's log — the screen just said "Connected to host" forever. Say how long we
+        /// have been waiting every 10 s, capped at 30 lines, and stop as soon as the roster or a load instruction
+        /// lands (either one means the host accepted us).</summary>
+        public static void TickJoinWaitReport()
+        {
+            try
+            {
+                if (!IsConnected || MPServer.IsRunning || InMpGame || !_helloClock.IsRunning) { _joinWaitLines = 0; return; }
+                if (LobbyPlayers.Count > 0) { _joinWaitLines = 0; return; }   // roster arrived — we are in
+                // Armed on the transport thread (no UnityEngine.Time there), so the first Unity tick after
+                // the Hello sets the clock and the first line lands 10 s later, not instantly.
+                float now = UnityEngine.Time.unscaledTime;
+                if (_joinWaitNextAt <= 0f) { _joinWaitNextAt = now + 10f; return; }
+                if (now < _joinWaitNextAt) return;
+                _joinWaitNextAt = now + 10f;
+                if (_joinWaitLines >= 30) return;
+                _joinWaitLines++;
+                Plugin.Logger.LogInfo($"[Join] waiting: host-approval {_helloClock.Elapsed.TotalSeconds:0}s (hello sent {_helloSentAtText})");
+            }
+            catch { }
+        }
+
+        public static void TickJoinDownloadReport()
+        {
+            try
+            {
+                if (!IsConnected || MPServer.IsRunning || InMpGame) { _jpLastPct = -1; return; }
+                if (!SteamXferProgress.ActiveWithin(2000) || SteamXferProgress.Tag != "SteamClient") return;
+                int cnt = SteamXferProgress.Cnt;
+                if (cnt <= 0) return;
+                int pct = Math.Min(100, SteamXferProgress.Got * 100 / cnt);
+                float now = UnityEngine.Time.unscaledTime;
+                if (Math.Abs(pct - _jpLastPct) < 2 || now < _jpNextAt) return;
+                _jpLastPct = pct; _jpNextAt = now + 0.7f;
+                SendEnvelope(MessageEnvelope.Create(MessageType.JoinProgress, MPConfig.PlayerId,
+                    new JoinProgressPayload { Pid = MPConfig.PlayerId, Percent = pct }));
+            }
+            catch { }
+        }
+
+        // CROSSHR-ROSTER-1: one WARNING per message type per connection; written from the Unity tick AND the
+        // transport's poll thread (handlers call SendEnvelope inline), so every access is under the lock.
+        private static readonly System.Collections.Generic.HashSet<MessageType> _notSentLogged = new();
+        private static readonly object _notSentLock = new();
+        private static void ClearNotSentLog() { lock (_notSentLock) _notSentLogged.Clear(); }
+
+        /// <summary>Reliable send for modules that build their own envelope. Sends when the link is up and
+        /// says so; returns FALSE when it could not, so a caller that keeps a "sent" mark (the staff-roster and
+        /// billboard publishers) can leave it unset and try again on its next pass. CROSSHR-ROSTER-1
+        /// (2026-09-16): on the 0916 game patch the client's eleven staff rosters were handed in here while
+        /// IsConnected was false and vanished without a line; the publisher had already marked them sent, so the
+        /// host never got a partner's people.</summary>
+        public static bool SendEnvelope(MessageEnvelope env)
+        {
+            if (env == null) return false;
+            if (IsConnected) { Send(env); return true; }
+            try
+            {
+                bool first; lock (_notSentLock) first = _notSentLogged.Add(env.Type);
+                if (first)
+                    Plugin.Logger.LogWarning($"[Client] {env.Type} NOT sent - the link is not up yet (connected={_connected}, transport running={_transport is { IsRunning: true }}); the sender must retry.");
+            }
+            catch { }
+            return false;
+        }
+
+        // Poll loop lives in LnlClientTransport now (transport seam) — same
+        // thread name, cadence, and throw-isolation as before.
+
+        // ── MODS-GATE-1 (user-approved 2026-09-29): the Couldn't join sentence for a mod-list refusal ──
+        /// <summary>Parse the host's "BAMP:mods:&lt;nMissing&gt;|&lt;nExtra&gt;|&lt;names&gt;|&lt;names&gt;" tag
+        /// (MPContentFingerprint.ModsRefusalTag) into the approved sentence.</summary>
+        internal static string ModsRefusalFromTag(string tag)
+        {
+            int nMissing = 0, nExtra = 0;
+            var missing = new List<string>();
+            var extra   = new List<string>();
+            try
+            {
+                string rest = tag.StartsWith("BAMP:mods:", StringComparison.Ordinal) ? tag.Substring("BAMP:mods:".Length) : "";
+                var p = rest.Split('|');
+                if (p.Length >= 4)
+                {
+                    int.TryParse(p[0], out nMissing); int.TryParse(p[1], out nExtra);
+                    foreach (var s in p[2].Split('\t')) if (s.Length > 0) missing.Add(s);
+                    foreach (var s in p[3].Split('\t')) if (s.Length > 0) extra.Add(s);
+                }
+            }
+            catch { }
+            return ComposeModsRefusal(nMissing, missing, nExtra, extra);
+        }
+
+        /// <summary>"This host only allows players with the same mods. Yours differ: missing {mods}; extra {mods}." - a side
+        /// with no names is left out; at most 5 names per side, then " and N more".</summary>
+        internal static string ComposeModsRefusal(int nMissing, List<string> missing, int nExtra, List<string> extra)
+        {
+            string Head = Loc.T("gps_mods_head", "This host only allows players with the same mods.");
+            try
+            {
+                // SERVER-MODS-1: say what to do - missing ones come from the host (when it offers them), extra ones go off
+                string a = ModsSide(Loc.T("gps_mods_missing", "Missing"), nMissing, missing), b = ModsSide(Loc.T("gps_mods_extra", "Deactivate (the host does not have them)"), nExtra, extra);
+                if (a.Length == 0 && b.Length == 0) return Head;
+                return Head + " " + (a.Length > 0 && b.Length > 0 ? a + ". " + b : a + b) + ".";
+            }
+            catch { return Head; }
+        }
+
+        private static string ModsSide(string word, int n, List<string> names)
+        {
+            if (names == null || names.Count == 0) return "";
+            int shown = Math.Min(5, names.Count);
+            string s = word + ": " + string.Join(", ", names.GetRange(0, shown));
+            int more = Math.Max(n, names.Count) - shown;
+            if (more > 0) s += " " + Loc.T("gps_mods_more", "and {0} more", more);
+            return s;
+        }
+    }
+}

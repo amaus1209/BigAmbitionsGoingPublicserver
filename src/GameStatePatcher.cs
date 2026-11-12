@@ -1,0 +1,8454 @@
+using Buildings;
+using Helpers;
+using Entities;
+using Enums;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Applies incoming network state to the local GameInstance.
+    /// All writes happen on the main Unity thread via the dispatcher queue.
+    /// </summary>
+    public static class GameStatePatcher
+    {
+        // ── Budgeted main-thread apply queue (perf item 3, 2026-07-14) ─────────
+        // Network threads enqueue, the Unity Update loop drains — but no longer
+        // all at once: the drain has a per-frame millisecond budget, checked
+        // BETWEEN messages only (each apply is ATOMIC within one frame — slicing
+        // inside a message would expose torn world state to the game's Update,
+        // the auto-fill-race class).  Full-state payloads may pass a coalesce
+        // key: a newer enqueue with the same key REPLACES the queued payload in
+        // place (newest wins; queue position kept, so a hammered key cannot
+        // starve).  Safety rails: at least one apply always runs per frame
+        // (forward progress), and once the queue head has waited past the
+        // starvation ceiling the budget is ignored — degrading to exactly the
+        // pre-slicing full drain, never worse.
+
+        private sealed class ApplyEntry
+        {
+            public string? Key;
+            public Action? Action;
+            public int     EnqueuedMs;   // Environment.TickCount (thread-safe; wrap-tolerant diffs)
+        }
+
+        private static readonly object _queueLock = new();
+        private static readonly Queue<ApplyEntry> _applyQueue = new();
+        private static readonly Dictionary<string, ApplyEntry> _keyedEntries = new(StringComparer.Ordinal);
+        private const double FrameBudgetMs       = 5.0;   // target apply time per frame
+        private const int    StarvationCeilingMs = 500;   // head older than this → full drain (pre-slicing behavior)
+
+        /// <summary>Called from the Unity Update loop by MainThreadDispatcher.</summary>
+        public static void DrainQueue()
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool ranOne = false;
+            while (true)
+            {
+                ApplyEntry entry; Action? action; int backlog;
+                lock (_queueLock)
+                {
+                    if (_applyQueue.Count == 0) return;
+                    double elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - start) * 1000.0
+                                     / System.Diagnostics.Stopwatch.Frequency;
+                    int headAge = Environment.TickCount - _applyQueue.Peek().EnqueuedMs;
+                    // Budget gates STARTING the next apply, never finishing one; the
+                    // ceiling turns a pathological backlog back into today's full drain.
+                    if (ranOne && elapsed >= FrameBudgetMs && headAge < StarvationCeilingMs) return;
+                    entry = _applyQueue.Dequeue();
+                    action = entry.Action;   // newest payload (coalescing swaps in place under this lock)
+                    if (entry.Key != null && _keyedEntries.TryGetValue(entry.Key, out var cur) && ReferenceEquals(cur, entry))
+                        _keyedEntries.Remove(entry.Key);
+                    backlog = _applyQueue.Count;
+                }
+                ranOne = true;
+                if (action == null) continue;
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                try { action(); }
+                catch (Exception ex) { Plugin.Logger.LogError($"[Patcher] Dispatch error: {ex.Message}"); }
+                // Drain attribution (perf finding 2026-07-13): name any single apply
+                // over 100ms via the delegate's compiled method name.  Anomaly-gated.
+                double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0
+                            / System.Diagnostics.Stopwatch.Frequency;
+                if (ms >= 100.0)
+                {
+                    string who = "?";
+                    try { var m = action.Method; who = $"{m.DeclaringType?.FullName}::{m.Name}"; } catch { }
+                    Plugin.Logger.LogWarning($"[DrainDiag] slow apply: {who} took {ms:F0}ms (backlog={backlog}).");
+                }
+            }
+        }
+
+        private static void RunOnMainThread(Action action) => EnqueueOnMainThread(action);
+
+        /// <summary>
+        /// Public entry point so MPServer and MPClient can dispatch game-start actions
+        /// from their background network threads onto the Unity main thread.
+        /// </summary>
+        public static void EnqueueOnMainThread(Action action) => EnqueueInternal(action, null);
+
+        /// <summary>Keyed variant for FULL-STATE payloads (a newer snapshot fully
+        /// supersedes an older un-applied one): same key replaces the queued
+        /// payload in place — newest wins, queue position kept.  Only opt in
+        /// where the payload is genuinely idempotent full-state.</summary>
+        public static void EnqueueOnMainThread(Action action, string coalesceKey) => EnqueueInternal(action, coalesceKey);
+
+        private static void EnqueueInternal(Action action, string? key)
+        {
+            if (action == null) return;
+            lock (_queueLock)
+            {
+                if (key != null && _keyedEntries.TryGetValue(key, out var existing) && existing.Action != null)
+                {
+                    existing.Action     = action;                    // newest wins, position kept
+                    existing.EnqueuedMs = Environment.TickCount;
+                    return;
+                }
+                var entry = new ApplyEntry { Key = key, Action = action, EnqueuedMs = Environment.TickCount };
+                _applyQueue.Enqueue(entry);
+                if (key != null) _keyedEntries[key] = entry;
+            }
+        }
+
+        // ── Snapshot application ──────────────────────────────────────────────
+
+        public static void ApplyWorldSnapshot(WorldSnapshotPayload snap)
+        {
+            RunOnMainThread(() =>
+            {
+                Plugin.Logger.LogInfo("[Patcher] Applying world snapshot...");
+
+                // Mark any buildings owned by other players as unavailable locally
+                foreach (var kv in snap.BuildingOwners)
+                {
+                    if (kv.Value != "" && kv.Value != MPConfig.PlayerId)
+                        MarkBuildingUnavailable(kv.Key);
+                }
+
+                // Same for BOUGHT real estate owned by other players.
+                foreach (var kv in snap.BuildingRealEstateOwners)
+                {
+                    if (kv.Value != "" && kv.Value != MPConfig.PlayerId)
+                        MarkBuildingUnavailable(kv.Key);
+                }
+
+                // Apply market entries
+                if (!string.IsNullOrEmpty(snap.MarketEntriesJson))
+                    ApplyMarketSnapshot(snap.MarketEntriesJson);
+
+                Plugin.Logger.LogInfo("[Patcher] World snapshot applied.");
+            });
+        }
+
+        public static void ApplyBuildingOwnership(BuildingOwnershipPayload payload)
+        {
+            RunOnMainThread(() =>
+            {
+                if (payload.OwnerPlayerId == MPConfig.PlayerId)
+                {
+                    // This is confirmation of OUR rent — execute the actual game rent logic
+                    ExecuteLocalRent(payload);
+                }
+                else
+                {
+                    // Another player rented it — mark unavailable locally
+                    MarkBuildingUnavailable(payload.AddressKey);
+                }
+                // Hamptons rendering (2026-09-18): a house a session player now rents must show its real
+                // renderers on THIS machine too, and _renderersEnabled is cached state that nothing else
+                // would repaint until the next native tenancy event (which only the owner's copy gets).
+                try { HamptonsAccess.RefreshAllBlockers(); }
+                catch (Exception ex) { HamptonsAccess.WarnOnce("ApplyBuildingOwnership/hamptons-refresh", ex); }
+            });
+        }
+
+        public static void ApplyBuildingVacated(string addressKey)
+        {
+            RunOnMainThread(() =>
+            {
+                // Mirror the native terminate-lease so the building reads empty +
+                // rentable on THIS machine too: clear any synced business identity so
+                // it can't keep rendering as an occupied shop.  The !RentedByPlayer
+                // guard makes this safe — it never wipes a building the local player
+                // actively rents (only the owner vacates, and they already cleared it
+                // natively before this notify arrives).
+                var reg = FindRegistration(addressKey);
+                bool guarded = false;
+                if (reg != null)
+                {
+                    try
+                    {
+                        // Gate ALL the vacate writes on !RentedByPlayer (was: only the name wipe) — a
+                        // stale/misrouted VacateNotify must not flip a building the LOCAL player actively
+                        // rents to "available" or clear its owner mark.
+                        if (!reg.RentedByPlayer)
+                        {
+                            reg.AvailableForRent      = true;
+                            // H-VACATEDEED-1 (2026-09-18): a vacate ends the TENANT, never the deed. This line
+                            // used to blank buildingOwnerRivalId (the LANDLORD) and leave the tenant stamp - the
+                            // opposite of the host's MakeRegVacant ("the deed field (landlord) stays") and of native
+                            // (ShutDownAIBusiness stashes and restores the deed). Only tenant events send this
+                            // notify (HandleVacateRequest, Patch_TerminateContract). The blank was usually healed
+                            // by the next ownership apply, but not if an autosave landed first, and never for the
+                            // local player's own bought building (that apply keeps the prior value).
+                            reg.businessOwnerRivalId  = "";
+                            reg.BusinessName          = null;
+                            reg.businessTypeName      = "ba:businesstype_empty";
+                            // D3b (fold V1): THE tenancy-end statement for this address. A routine that
+                            // DELETES acts only on positive evidence from the authority — this notify
+                            // names the address and says the tenancy ended; the old tenant-predicate edge
+                            // could read true→false from a mere disconnect or an empty roster and wipe a
+                            // live copy. Inside the !RentedByPlayer branch, so never our own house.
+                            ClearHamptonsInteriorOnTenancyEnd(addressKey, "vacate notify");
+                        }
+                        else guarded = true;
+                    }
+                    catch { }
+                }
+                else MarkBuildingAvailable(addressKey);
+                // Round-260 (T260 agent finding): the old line claimed "is now available"
+                // even when the guard refused the writes — a log asserting state the data
+                // doesn't have. Say which path ran.
+                Plugin.Logger.LogInfo(guarded
+                    ? $"[Patcher] Vacate notify for {addressKey} SKIPPED — the local player actively rents this copy (guard; the native terminate owns local cleanup)."
+                    : $"[Patcher] Building {addressKey} is now available.");
+                // The mirror of the rent path above: a vacated Hamptons house goes back to the closed shell.
+                try { HamptonsAccess.RefreshAllBlockers(); }
+                catch (Exception ex) { HamptonsAccess.WarnOnce("ApplyBuildingVacated/hamptons-refresh", ex); }
+            });
+        }
+
+        // SALE-DETACH-1 (2026-09-18): the mod destroys an ItemController while deliberately
+        // KEEPING the same live ItemInstance (the in-place apply policy, this file's
+        // "IN-PLACE APPLY (the flatbed model)" block).  Native controllers subscribe to the
+        // instance's cargo callback in Start (ShelfController.cs:54 →
+        // ItemInstance.AddCallToOnItemsInCargoUpdated) and unsubscribe only in their own
+        // OnDestroy (ShelfController.cs:209) — which is frame-deferred and is skipped entirely
+        // while the city scene unloads or once ItemInstance is null.  The surviving instance
+        // therefore keeps a delegate aimed at a destroyed component: the next sale charges the
+        // customer and runs SubtractFromStock, the callback NREs inside
+        // ShelfController.UpdateFillState, and native TakeItem aborts BEFORE handing over the
+        // bag — stock down, cash down, no item.  So: before destroying such a controller,
+        // detach every cargo-callback delegate that belongs to its own object tree (and any
+        // whose target is an already-destroyed Unity object, which can never unsubscribe
+        // itself).  Returns how many were detached.
+        internal static int DetachCargoCallbacks(ItemController ic)
+        {
+            int n = 0;
+            try
+            {
+                if (ic == null) return 0;
+                n += DetachCargoCallbacksOn(ic, ic.transform);
+                // FOLD F2 (M1, 2026-09-18): a CHILD ItemController dies with its parent and carries its OWN
+                // live ItemInstance — same stranded delegate, same NRE on the next sale, one level down.
+                // The interior-apply site rescues the children it keeps by REPARENTING them out of this tree
+                // before the destroy, so this sweep reaches only the ones that are actually dying.
+                foreach (ItemController c in ic.GetComponentsInChildren<ItemController>(true))
+                {
+                    if (c == null || ReferenceEquals(c, ic)) continue;
+                    n += DetachCargoCallbacksOn(c, ic.transform);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!_cargoDetachFailLogged)
+                {
+                    _cargoDetachFailLogged = true;
+                    Plugin.Logger.LogWarning($"[Patcher] SALE-DETACH-1 cargo-callback detach FAILED (first failure only): {ex.Message}");
+                }
+            }
+            return n;
+        }
+
+        // SALE-DETACH-1 / FOLD F2: one controller's own ItemInstance, swept against the DYING tree's root
+        // (a delegate owned by a component under 'root', or by an already-destroyed Unity object, goes).
+        private static int DetachCargoCallbacksOn(ItemController owner, UnityEngine.Transform root)
+        {
+            int n = 0;
+            var inst = owner?.ItemInstance;
+            if (inst == null || root == null) return 0;
+            var combined = inst.OnItemsInCargoUpdated();
+            if (combined == null) return 0;
+            foreach (var d in combined.GetInvocationList())
+            {
+                var act = d as Action;
+                if (act == null) continue;
+                bool ours = false;
+                if (act.Target is UnityEngine.Component c)
+                {
+                    if (c == null) ours = true;                       // destroyed: dead weight either way
+                    else { try { ours = c.transform.IsChildOf(root); } catch { ours = false; } }
+                }
+                else if (act.Target is UnityEngine.Object o && o == null) ours = true;
+                if (!ours) continue;
+                try { inst.RemoveCallFromOnItemsInCargoUpdated(act); n++; } catch { }
+            }
+            return n;
+        }
+
+        // SALE-DETACH-1: session budget for the detach notice (40 lines) + first-failure flag.
+        private static int _cargoDetachLines;
+        private static int _respawnWhyLines;   // H-REFRESHSEAT-1 diagnostic: first 20 per game run
+        private static bool _cargoDetachFailLogged;
+
+        /// <summary>Round-269: apply a granted guest's conveyed grab on the OWNER's (or the
+        /// host's) world copy. StockOnly mirrors the native shelf-stock semantic — drain the
+        /// matching stock entries, keep the shelf. Idempotent: an instance already gone (the
+        /// parity-slice channels can convey the same take) logs and returns. MAIN THREAD.</summary>
+        public static void ApplyGuestCargoGrab(GuestCargoGrabPayload? p)
+        {
+            if (p == null || string.IsNullOrEmpty(p.AddressKey) || string.IsNullOrEmpty(p.ItemInstanceId)) return;
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    var reg = FindRegistration(p.AddressKey);
+                    if (reg?.itemInstances == null) return;
+                    string? key = null;
+                    foreach (var kv in reg.itemInstances)
+                        if (kv.Value?.id == p.ItemInstanceId) { key = kv.Key; break; }
+                    if (key == null)
+                    {
+                        Plugin.Logger.LogInfo($"[PickupGate] conveyed grab at '{p.AddressKey}': '{p.ItemName}' already gone (converged; round-269).");
+                        return;
+                    }
+                    if (p.StockOnly)
+                    {
+                        var inst = reg.itemInstances[key];
+                        int cleared = 0;
+                        try
+                        {
+                            if (inst?.cargoInstances != null)
+                                foreach (var c in inst.cargoInstances)
+                                    if (c != null && c.itemName == p.ItemName && c.amount > 0) { c.amount = 0; c.itemName = null; cleared++; }
+                        }
+                        catch { }
+                        Plugin.Logger.LogInfo($"[PickupGate] conveyed STOCK take at '{p.AddressKey}': '{p.ItemName}' drained ({cleared} entr(ies), taker '{p.TakerPid}', round-269).");
+                    }
+                    else
+                    {
+                        reg.itemInstances.Remove(key);
+                        // Standing in the building right now → remove the live object too;
+                        // otherwise the next interior instantiation simply won't spawn it.
+                        try
+                        {
+                            var bm = InstanceBehavior<BuildingManager>.Instance;
+                            if (bm != null && bm.buildingRegistration == reg && bm.allItemControllers != null)
+                            {
+                                ItemController? gone = null;
+                                foreach (var ic in bm.allItemControllers)
+                                    if (ic != null && ic.ItemInstance?.id == p.ItemInstanceId) { gone = ic; break; }
+                                if (gone != null)
+                                {
+                                    // Sweep-3 crash fix (2026-08-29): the game never removes a destroyed
+                                    // controller from allItemControllers itself (ItemController.OnDestroy
+                                    // doesn't), and 1.0 added UNGUARDED sweeps over the list that throw on
+                                    // a dead entry (OnPlacementModeEnd → ForceUpdateNavMesh; two loops
+                                    // inside CancelPlacementMode; HamptonsHouse.HideItems). Every native
+                                    // removal path removes explicitly before destroying — so do we.
+                                    // H-REFRESHSEAT-1: its seat / queue holders take the game's own exits first,
+                                    // while the seat transforms still live (Destroy is frame-deferred).
+                                    CustomerSeatPins.ReleaseHoldersOf(gone, p.ItemInstanceId, "grab");
+                                    CustomerSeatPins.FlushRelease();   // one-item batch: its queuers move / leave now
+                                    try { bm.allItemControllers.Remove(gone); } catch { }
+                                    CustomerSeatPins.ResetLineCache("grab");
+                                    // SALE-DETACH-1: the ItemInstance object stays alive (other
+                                    // native structures still reference it) — take this dying
+                                    // controller's cargo subscriptions with it.
+                                    int det2 = DetachCargoCallbacks(gone);
+                                    if (det2 > 0 && _cargoDetachLines++ < 40)
+                                        Plugin.Logger.LogInfo($"[Patcher] controller '{p.ItemInstanceId}' ('{p.ItemName}') destroyed with its instance kept: {det2} cargo callback(s) detached (SALE-DETACH-1).");
+                                    // Fold F1 (2026-09-27): off its parent's childItemControllers too, as the native removal
+                                    // does (ItemController.cs:1323; scene side only, stackedItems data untouched) - a destroyed
+                                    // child left there made OverlayHelper.GetRelevantEntity return it (hover NRE).
+                                    try { var par = gone.parentItemController; if (par != null) par.childItemControllers?.Remove(gone); } catch { }
+                                    try { UnityEngine.Object.Destroy(gone.gameObject); } catch { }
+                                }
+                            }
+                        }
+                        catch { }
+                        Plugin.Logger.LogInfo($"[PickupGate] conveyed grab at '{p.AddressKey}': '{p.ItemName}' removed (taker '{p.TakerPid}', round-269).");
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[PickupGate] apply grab: {ex.Message}"); }
+            });
+        }
+
+        public static void ApplyGameTime(GameTimeSyncPayload payload)
+        {
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    // SPEED-SHARED: the session clock multiplier rides the heartbeat. Adopt it BEFORE the clock alignment
+                    // below, so the drift maths judges this client at the speed it is about to run at. The host never
+                    // applies its own heartbeat — its slider IS the source.
+                    if (payload.ClockMult >= 0f && !MPServer.IsRunning)
+                        OptionsGuard.SetSessionMultiplier(payload.ClockMult, "heartbeat");
+
+                    // Apply speed/pause change first (exact, no lerp)
+                    if (payload.Speed >= 0f)
+                        TimeSync.ApplyNetwork(payload.Speed);
+
+                    // Apply clock alignment (gradual for small drift, snap for large)
+                    if (payload.Day > 0 || payload.TimeOfDay > 0f)
+                        TimeSync.ReceiveClockSync(payload.Day, payload.TimeOfDay);
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogError($"[Patcher] ApplyGameTime: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Apply only a speed/pause change — no clock data.
+        /// Used when relaying an immediate speed-change event.
+        /// </summary>
+        public static void ApplyTimeSpeed(float speed)
+        {
+            RunOnMainThread(() =>
+            {
+                try { TimeSync.ApplyNetwork(speed); }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogError($"[Patcher] ApplyTimeSpeed: {ex.Message}");
+                }
+            });
+        }
+
+        // ── Rivals roster sync (Phase 1d Wave 2) ─────────────────────────────
+
+        /// <summary>
+        /// Plain-C# id→name dict managed by us.  IL2CPP-Interop wrappers don't
+        /// expose private fields like RivalsHelper.RivalDataCache, so we can't
+        /// populate the game's cache directly.  Instead, our Harmony patch on
+        /// RivalsHelper.GetRivalName consults THIS dict first and short-
+        /// circuits with the host's name — bypassing the game's cache lookup
+        /// entirely for known IDs.
+        /// </summary>
+        // CONCURRENT: written on the poll thread (PlayerProfile handlers, MPServer/
+        // MPClient) and bulk-rebuilt on the main thread (ApplyRivalsSnapshot).
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ClientRivalNames = new();
+
+        /// <summary>
+        /// Ordered FIFO of rival IDs to be consumed by client's GenerateRivals.
+        /// Populated when host's RivalsSnapshot arrives.  Drained by
+        /// Patch_RivalsHelper_GenerateRivals.NextRivalId - the transpiled stand-in
+        /// for GenerateRivals' own two id mints (feeds only while
+        /// RivalsGenerateRunning is true; UuidHelper itself is not patched since
+        /// EFFORT BATCH 28).
+        /// </summary>
+        public static readonly System.Collections.Generic.Queue<string> PendingRivalIdQueue = new();
+
+        /// <summary>Set to true by Patch_RivalsHelper_GenerateRivals around the original method's execution.</summary>
+        public static bool RivalsGenerateRunning = false;
+
+        /// <summary>True only while RivalLeaderboard.Load is executing (set by its
+        /// Prefix, cleared by its Postfix).  Gates the GetAllRivalData Postfix so
+        /// we append remote-player RivalData ONLY for the leaderboard build — not
+        /// for GetAllRivalData's other callers (CityMapFilters, GetPlayerRanking),
+        /// which must not see synthetic players.</summary>
+        public static bool RivalsLeaderboardLoadRunning = false;
+
+        /// <summary>Becomes true once the client has received host's RivalsSnapshot — used by autopilot to gate StartGame.</summary>
+        public static bool ClientRivalsReady = false;
+
+        /// <summary>
+        /// Set to true the first time our UUID-queue injection successfully
+        /// runs through the original GenerateRivals.  Subsequent GenerateRivals
+        /// calls are suppressed so the natural new-game flow can't wipe our
+        /// injected cache.
+        /// </summary>
+        public static bool ClientRivalsInjected = false;
+
+        /// <summary>EFFORT BATCH 29 (R2): ClientRivalsReady / ClientRivalsInjected / the id queue belong to
+        /// ONE world start, not to the process.  They were set once and never cleared, so a retried start
+        /// (or any second new game in the same game session) found Injected already true, suppressed every
+        /// GenerateRivals and left the client with NO rivals.  Called on every new connection and at the
+        /// start of every client world start (MPClient).  MAIN THREAD ONLY (the queue is main-thread state).</summary>
+        internal static void ResetClientRivalFeed(string why)
+        {
+            try
+            {
+                bool had = ClientRivalsReady || ClientRivalsInjected || PendingRivalIdQueue.Count > 0;
+                ClientRivalsReady = false;
+                ClientRivalsInjected = false;
+                PendingRivalIdQueue.Clear();
+                if (had) Plugin.Logger.LogInfo($"[Patcher] client rival feed reset ({why}) - this world's GenerateRivals waits for this start's host ids.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] client rival feed reset ({why}): {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// PlayerId → CharacterName for entries that are HUMAN PLAYERS (not AI
+        /// rivals).  Populated alongside ClientRivalNames when RivalsSnapshot
+        /// arrives.  Used by Patch_RivalLeaderboard_Load_AddPlayers to inject
+        /// additional rows into the rivals leaderboard for each non-local
+        /// player — same approach the game uses to add the local player row.
+        /// </summary>
+        // CONCURRENT: written on the poll thread (host PlayerProfile handler),
+        // bulk-rebuilt and read on the main thread (leaderboard injection).
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ClientPlayerRoster = new();
+
+        /// <summary>
+        /// id → RivalData reference, captured when the local game's
+        /// GetRivalLeaderboardData runs (Postfix).  Host uses this to access
+        /// rd.WeeklyIncome (the correct calc) when computing stats to send
+        /// clients — avoids the inaccurate RentPerDay*7 approximation.
+        /// Client uses this to access rivals' actual data for further sync.
+        /// </summary>
+        public static readonly System.Collections.Generic.Dictionary<string, BigAmbitions.Rivals.RivalData> AiRivalDataRefs = new();
+
+        /// <summary>
+        /// Per-rival stats cache (Phase 1d Wave 4).  Populated by
+        /// ApplyRivalsStatsSnapshot when host responds to a stats request.
+        /// Consulted by the RivalLeaderboard.GetRivalLeaderboardData Postfix
+        /// to override the locally-computed (and therefore stale) values.
+        /// </summary>
+        // CONCURRENT: written on the poll thread (RivalsStatsRequest handler),
+        // bulk-rebuilt and read on the main thread (leaderboard build).
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, RivalStatsInfo> ClientRivalStats = new();
+
+        /// <summary>
+        /// AddressKey → host-authoritative weekly income for a rival-owned
+        /// business.  Populated from RivalStatsInfo.Businesses in
+        /// ApplyRivalsStatsSnapshot.  Consulted by the RivalBusinessesCellView
+        /// .SetData patch to override the client's $0 per-business income (AI
+        /// business sales aren't simulated on the client).
+        /// </summary>
+        public static readonly System.Collections.Generic.Dictionary<string, float> ClientBusinessIncomeByAddress = new();
+
+        /// <summary>PlayerId → their actual portrait Sprite (decoded from the
+        /// relayed PNG).  Consulted by the RivalPortraitHelper patches so a
+        /// remote player's profile shows their real face.</summary>
+        public static readonly System.Collections.Generic.Dictionary<string, UnityEngine.Sprite> ClientPlayerPortraits = new();
+
+        /// <summary>PlayerId → their character age in years (from PlayerProfile),
+        /// so the rivals profile shows the real age, not a default.</summary>
+        // CONCURRENT: written on the poll thread (PlayerProfile handlers).
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> ClientPlayerAges = new();
+        /// <summary>playerId → gender (BigAmbitions.Characters.Gender as int) —
+        /// generated-portrait fallback fidelity.</summary>
+        // CONCURRENT: written on the poll thread (PlayerProfile handlers).
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> ClientPlayerGenders = new();
+
+        /// <summary>True once we've sent our profile WITH a non-empty portrait —
+        /// whether on the initial game-entry send or a later re-send.  Ensures
+        /// the (large) portrait image is transmitted exactly once per session.
+        /// Reset when leaving the game.</summary>
+        public static bool LocalPortraitSent = false;
+
+        /// <summary>Local player's character age in years = ageInDays / daysPerYear.</summary>
+        public static int LocalAgeInYears()
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null || gi.charactersData == null || gi.charactersData.Count == 0) return 0;
+                var cd = gi.charactersData[0];
+                if (cd == null) return 0;
+                int dpy = 60;
+                try { if (gi.gameVariables != null && gi.gameVariables.daysPerYear > 0) dpy = gi.gameVariables.daysPerYear; } catch { }
+                return dpy > 0 ? cd.ageInDays / dpy : 0;
+            }
+            catch { return 0; }
+        }
+
+        /// <summary>Read the LOCAL player's rendered portrait PNG as Base64 (for
+        /// relaying to other players).  Empty if not on disk yet.</summary>
+        public static string ReadLocalPortraitBase64()
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) return "";
+                string path = Character.Customization.PortraitGenerator.GetCharacterPortraitPath(gi);
+                if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path)) return "";
+                var bytes = System.IO.File.ReadAllBytes(path);
+                if (bytes == null || bytes.Length == 0) return "";
+                return Convert.ToBase64String(bytes);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ReadLocalPortraitBase64: {ex.Message}"); return ""; }
+        }
+
+        /// <summary>Decode a relayed portrait PNG into a Sprite and cache it for
+        /// the given player.  MUST run on the main thread (creates a Texture2D).</summary>
+        public static void ApplyPlayerPortrait(string playerId, string base64)
+        {
+            if (string.IsNullOrEmpty(playerId) || string.IsNullOrEmpty(base64)) return;
+            try
+            {
+                var managed = Convert.FromBase64String(base64);
+                if (managed == null || managed.Length == 0) return;
+                var tex = new UnityEngine.Texture2D(2, 2);
+                bool loaded = UnityEngine.ImageConversion.LoadImage(tex, managed);
+                if (!loaded) { Plugin.Logger.LogWarning($"[Patcher] Portrait decode failed for '{playerId}'."); return; }
+                var sprite = UnityEngine.Sprite.Create(
+                    tex,
+                    new UnityEngine.Rect(0, 0, tex.width, tex.height),
+                    new UnityEngine.Vector2(0.5f, 0.5f));
+                ClientPlayerPortraits[playerId] = sprite;
+                Plugin.Logger.LogInfo($"[Patcher] Applied portrait for player '{playerId}' ({tex.width}x{tex.height}, {managed.Length}B).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ApplyPlayerPortrait '{playerId}': {ex.Message}"); }
+        }
+
+        /// <summary>AddressKeys the host reports as a rival's businesses (the
+        /// exact membership the host's leaderboard/breakdown use).  Lets the
+        /// client reconcile its factory-inclusive owner-id matching down to the
+        /// host's set.  Keyed by rivalId → set of address keys.</summary>
+        public static readonly System.Collections.Generic.Dictionary<string, System.Collections.Generic.HashSet<string>> ClientRivalBusinessAddrs = new();
+
+        /// <summary>
+        /// Apply host's rival roster.  Wave 2 just maintains our own
+        /// id→name dict (consulted by the Patch_RivalsHelper_GetRivalName
+        /// patch) and adds matching RivalState entries to gi.rivalStates so
+        /// leaderboard/history queries don't NRE.
+        /// </summary>
+        public static void ApplyRivalsSnapshot(RivalsSnapshotPayload payload)
+        {
+            if (payload == null) return;
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    // RIVAL-FAIR-2 R3: the STATES-ONLY publish (host rival state changed).  It must
+                    // never reseed the identity caches below - that work belongs to the join snapshot.
+                    if ((payload.Rivals == null || payload.Rivals.Count == 0) && payload.States != null)
+                    { ApplyRivalStates(payload.States); return; }
+
+                    ClientRivalNames.Clear();
+                    int added = 0;
+                    foreach (var r in payload.Rivals)
+                    {
+                        if (string.IsNullOrEmpty(r.Id)) continue;
+                        ClientRivalNames[r.Id] = r.Name ?? "";
+                        added++;
+                    }
+                    Plugin.Logger.LogInfo($"[Patcher] ClientRivalNames populated: {added} rival(s).");
+
+                    // Round-257: the UUID queue must hold EXACTLY the ids the client's
+                    // GenerateRivals will mint — the wholesale block then the import block,
+                    // slot for slot. It previously held every non-player id including the
+                    // SPECIAL rivals, which never mint: every dequeue was shifted by the
+                    // special count, duplicating the specials into wholesale slots and
+                    // dropping the host's last ids entirely (rig-measured 19/15 + 127
+                    // dangling refs). Primary source = the payload's verbatim arrays;
+                    // fallback (arrays absent) = old order-inference minus specials.
+                    PendingRivalIdQueue.Clear();
+                    ClientPlayerRoster.Clear();
+                    foreach (var r in payload.Rivals)
+                    {
+                        if (string.IsNullOrEmpty(r.Id)) continue;
+                        if (r.IsPlayer) ClientPlayerRoster[r.Id] = r.Name ?? r.Id;
+                        if (r.IsPlayer && r.ColourSlot > 0) PlayerColours.Learn(r.Id, r.ColourSlot);   // 2026-09-05 colours
+                    }
+                    int wsN = payload.WholesaleIds?.Count ?? 0, imN = payload.ImportIds?.Count ?? 0;
+                    if (wsN + imN > 0)
+                    {
+                        foreach (var id in payload.WholesaleIds!) if (!string.IsNullOrEmpty(id)) PendingRivalIdQueue.Enqueue(id);
+                        foreach (var id in payload.ImportIds!)    if (!string.IsNullOrEmpty(id)) PendingRivalIdQueue.Enqueue(id);
+                        Plugin.Logger.LogInfo($"[Patcher] PendingRivalIdQueue seeded slot-exact: {wsN} wholesale + {imN} import id(s); ClientPlayerRoster has {ClientPlayerRoster.Count} player(s) (round-257).");
+                    }
+                    else
+                    {
+                        // Old-shape payload: infer order, but never enqueue specials.
+                        int skippedSpecials = 0;
+                        foreach (var r in payload.Rivals)
+                        {
+                            if (string.IsNullOrEmpty(r.Id) || r.IsPlayer) continue;
+                            bool special = false;
+                            try { special = BigAmbitions.Rivals.RivalsHelper.IsSpecialRival(r.Id); } catch { }
+                            if (special) { skippedSpecials++; continue; }
+                            PendingRivalIdQueue.Enqueue(r.Id);
+                        }
+                        Plugin.Logger.LogInfo($"[Patcher] PendingRivalIdQueue seeded by order inference: {PendingRivalIdQueue.Count} id(s), {skippedSpecials} special(s) excluded (round-257 fallback — payload carried no id arrays).");
+                    }
+                    ClientRivalsReady = true;
+
+                    EnsureRivalCachesPopulated(payload);
+
+                    // Manually trigger GenerateRivals NOW — the natural startup
+                    // call was suppressed (queue not ready then), and the new-
+                    // game call from customizer.StartGame might not fire if the
+                    // user manually clicks before we're ready.  Our Prefix
+                    // checks ClientRivalsInjected to ensure this is the ONLY
+                    // successful run; subsequent calls (e.g. from the natural
+                    // new-game flow) are skipped to preserve our cache.
+                    //
+                    // Round-235 (field 20260802-230906, MrsLunaris rejoin): GENERATION IS FOR
+                    // UNGENERATED WORLDS ONLY. Native GenerateRivals opens with
+                    // RivalDataCache.Clear() and never refills it (the refill belongs to the
+                    // city-generation flow that only follows on a FRESH world) — and it also
+                    // REBUILDS gi.rivalStates and mints fresh random wholesale/import rival
+                    // ids. Fired on a rejoin into an already-built world it wiped the 19
+                    // rivals EnsureRivalCachesPopulated had just installed → leaderboard
+                    // showed only the teammate. On a generated world the populate above is
+                    // the whole job. CRITICAL for 0.1.17: the round-197 world-ready re-send
+                    // delivers this snapshot on EVERY join — without this gate every join
+                    // into a loaded world would wipe its rivals.
+                    // Discriminator: wholesaleRivalIds is written ONLY by native GenerateRivals
+                    // (our populate above tops up rivalStates, so THAT field can't tell a
+                    // generated world from a just-populated one).
+                    bool worldGenerated = false;
+                    try { var g0 = SaveGameManager.Current; worldGenerated = g0?.wholesaleRivalIds != null && g0.wholesaleRivalIds.Length > 0; } catch { }
+                    if (worldGenerated)
+                    {
+                        Plugin.Logger.LogInfo("[Patcher] World already has rival state — cache populate only, GenerateRivals NOT triggered (round-235).");
+                    }
+                    else if (!ClientRivalsInjected)
+                    {
+                        try
+                        {
+                            var gi = SaveGameManager.Current;
+                            if (gi != null)
+                            {
+                                Plugin.Logger.LogInfo("[Patcher] Manually triggering RivalsHelper.GenerateRivals to consume the queue.");
+                                BigAmbitions.Rivals.RivalsHelper.GenerateRivals(gi);
+
+                                // Round-256 (field 20260809-132321: rivals=0 world, rival-refs×1093):
+                                // when this manual run happens AFTER city generation (the natural call
+                                // was suppressed mid-generation because the ids lost the network race),
+                                // NOTHING downstream refills the caches — city-gen's FillData already
+                                // came and went, and GenerateRivals itself opens with RivalDataCache
+                                // .Clear(). Refill from the just-written rivalStates, the exact call
+                                // the native load path makes (GameManager init). Harmless in the
+                                // won-race ordering: city-gen's own FillData simply redoes it.
+                                try
+                                {
+                                    var ids = new System.Collections.Generic.List<string>();
+                                    if (gi.rivalStates != null)
+                                        foreach (var s in gi.rivalStates)
+                                        {
+                                            string sid = s?.rivalId?.ToString() ?? "";
+                                            if (!string.IsNullOrEmpty(sid)) ids.Add(sid);
+                                        }
+                                    BigAmbitions.Rivals.RivalsHelper.FillData(ids);
+                                    int cacheN = 0;
+                                    try { var all = BigAmbitions.Rivals.RivalsHelper.GetAllRivalData(); if (all != null) cacheN = System.Linq.Enumerable.Count(all); } catch { }
+                                    // Discriminator (measured here, at the right layer): a world
+                                    // with building registrations but no wholesale ids already
+                                    // generated WITHOUT rivals — the ids arrived late (lost race).
+                                    int regsN = 0; try { regsN = gi.BuildingRegistrations?.Count ?? 0; } catch { }
+                                    Plugin.Logger.LogInfo(
+                                        $"[Patcher] rival caches refilled after manual GenerateRivals: rivalStates={ids.Count} cache={cacheN}" +
+                                        (regsN > 0
+                                            ? $" — LATE ids ({regsN} regs already generated rival-less; lost-race world repaired, round-256)."
+                                            : " (pre-generation; city-gen finishes the job, round-256)."));
+                                }
+                                catch (Exception exFill) { Plugin.Logger.LogWarning($"[Patcher] round-256 cache refill: {exFill.Message}"); }
+                            }
+                        }
+                        catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] Manual GenerateRivals: {ex.Message}"); }
+                    }
+
+                    // RIVAL-FAIR-2 R3: the host's rival state rides the identity snapshot too.
+                    if (payload.States != null) ApplyRivalStates(payload.States);
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ApplyRivalsSnapshot: {ex.Message}"); }
+            });
+        }
+
+        /// <summary>RIVAL-FAIR-2 R3 - CLIENT, MAIN THREAD.  Overwrite this machine's specialRivalStates
+        /// from the host's.  Since H-RIVALPARITY-1 A the host sends THIS player's own isActive plus its own
+        /// sent keys / completed ids (SentKeys / CompletedIds, applied in place when present); before that,
+        /// completedTimelineEntryIds and sentMessageKeys were the HOST's bookkeeping and this machine runs no timeline
+        /// (Patch_RivalsHelper_CheckRivalTimelines_SkipOnClient), so overwriting them would destroy
+        /// nothing useful and could resurrect messages.  ItemHelper.ClearPriceCaches (public,
+        /// ItemHelper.cs:152) is called when something changed so the price consumers re-read.
+        /// Inert on the host and in single player.</summary>
+        private static bool _dupLogged;   // fold e: the duplicate sweep logs once per session
+        public static void ApplyRivalStates(List<CbRivalState>? states)
+        {
+            try
+            {
+                if (states == null) return;
+                if (MPServer.IsRunning) return;            // the host IS the authority
+                if (!MPClient.IsClientInWorld) return;     // single player: nothing to apply
+                var gi = SaveGameManager.Current;
+                if (gi?.specialRivalStates == null) return;
+
+                int changed = 0, active = 0, defenses = 0;
+                foreach (var s in states)
+                {
+                    if (s == null || string.IsNullOrEmpty(s.RivalId)) continue;
+                    if (s.IsActive) active++;
+                    defenses += s.Defenses?.Count ?? 0;
+
+                    BigAmbitions.Rivals.SpecialRivalState? st = null;
+                    foreach (var e in gi.specialRivalStates)
+                        if (e != null && e.rivalId == s.RivalId) { st = e; break; }
+                    if (st == null)
+                    {
+                        st = new BigAmbitions.Rivals.SpecialRivalState
+                        {
+                            rivalId = s.RivalId,
+                            completedTimelineEntryIds = new List<string>(),
+                            sentMessageKeys = new List<string>(),
+                            defenseStates = new List<BigAmbitions.Rivals.DefenseState>(),
+                        };
+                        gi.specialRivalStates.Add(st);
+                        changed++;
+                    }
+                    if (st.isActive   != s.IsActive)   { st.isActive   = s.IsActive;   changed++; }
+                    if (st.isDefeated != s.IsDefeated) { st.isDefeated = s.IsDefeated; changed++; }
+                    // H-RIVALPARITY-1 A (per-peer R3): THIS player's own sent keys / completed ids, applied IN PLACE (never a
+                    // new list) - the game caches RivalsHelper.SentMessages pointing at the existing list (decompile
+                    // RivalsHelper.cs:172-175). Part D F1: ADD-ONLY - a key missing here is added, nothing is ever removed:
+                    // this machine records keys of its own (the rent-refusal monologue, SendRentBuildingMessage ->
+                    // RivalsHelper.cs:585-601) that the host never hears of, and removing them replays that monologue.
+                    // Completed ids likewise (no reset exists: the host's per-key lists only ever grow).
+                    // NULL = an older host: the lists are left alone.
+                    if (s.SentKeys != null)
+                    {
+                        if (st.sentMessageKeys == null) st.sentMessageKeys = new List<string>();
+                        foreach (var k in s.SentKeys) if (!string.IsNullOrEmpty(k) && !st.sentMessageKeys.Contains(k)) { st.sentMessageKeys.Add(k); changed++; }
+                    }
+                    if (s.CompletedIds != null)
+                    {
+                        if (st.completedTimelineEntryIds == null) st.completedTimelineEntryIds = new List<string>();
+                        foreach (var c in s.CompletedIds) if (!string.IsNullOrEmpty(c) && !st.completedTimelineEntryIds.Contains(c)) { st.completedTimelineEntryIds.Add(c); changed++; }
+                    }
+
+                    if (DefensesDiffer(st.defenseStates, s.Defenses))
+                    {
+                        var rebuilt = new List<BigAmbitions.Rivals.DefenseState>();
+                        if (s.Defenses != null)
+                            foreach (var d in s.Defenses)
+                            {
+                                if (d == null) continue;
+                                rebuilt.Add(new BigAmbitions.Rivals.DefenseState
+                                {
+                                    timestamp         = new BigAmbitions.DayNightCycle.Timestamp(d.Day, d.Hour, d.Minute),
+                                    defensiveMechanic = (BigAmbitions.Rivals.DefensiveMechanic)d.Mechanic,
+                                    aggression        = (Enums.Priority)d.Aggression,
+                                    affectedItems     = new List<string>(d.Items ?? new List<string>()),
+                                    affectedEmployeeIds = new List<string>(d.EmployeeIds ?? new List<string>()),
+                                });
+                            }
+                        st.defenseStates = rebuilt;
+                        changed++;
+                    }
+                }
+                // Fold e (rig T-BATCH1 run 1): a client mirror held each special rival 21 times (an old
+                // accumulation in the save). The game reads only the FIRST entry per id, so the extra ones are
+                // dead weight that also made the two machines' signatures disagree - drop them, keeping the first.
+                try
+                {
+                    var keep = new HashSet<string>(StringComparer.Ordinal);
+                    int dropped = gi.specialRivalStates.RemoveAll(e => e != null && !string.IsNullOrEmpty(e.rivalId) && !keep.Add(e.rivalId));
+                    if (dropped > 0 && !_dupLogged) { _dupLogged = true; Plugin.Logger.LogInfo($"[RivalSync] removed {dropped} duplicate special rival state(s) from this save, keeping the first per rival as the game reads it."); changed++; }
+                }
+                catch (Exception dx) { Plugin.Logger.LogWarning($"[RivalSync] duplicate sweep: {dx.Message}"); }
+                if (changed == 0) return;                  // log only when something actually moved
+                try { ItemHelper.ClearPriceCaches(); } catch { }
+                Plugin.Logger.LogInfo($"[RivalSync] applied host rival state: {states.Count} rival(s), {active} active, {defenses} defense(s).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[RivalSync] apply: {ex.Message}"); }
+        }
+
+        private static bool DefensesDiffer(List<BigAmbitions.Rivals.DefenseState>? local, List<CbDefense>? wire)
+        {
+            int ln = local?.Count ?? 0, wn = wire?.Count ?? 0;
+            if (ln != wn) return true;
+            for (int i = 0; i < ln; i++)
+            {
+                var l = local![i]; var w = wire![i];
+                if (l == null || w == null) return true;
+                if ((int)l.defensiveMechanic != w.Mechanic || (int)l.aggression != w.Aggression) return true;
+                try
+                {
+                    if (l.timestamp == null) return true;
+                    if (l.timestamp.Day != w.Day || l.timestamp.Hour != w.Hour || (int)l.timestamp.Minute != (int)w.Minute) return true;
+                }
+                catch { return true; }
+                int li = l.affectedItems?.Count ?? 0, wi = w.Items?.Count ?? 0;
+                if (li != wi) return true;
+                for (int j = 0; j < li; j++) if (l.affectedItems![j] != w.Items![j]) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Populates gi.rivalStates + RivalsHelper.RivalDataCache on the
+        /// LOCAL machine from a rivals snapshot.  Tries Harmony's AccessTools
+        /// for the private cache field; falls back to RivalsHelper.FillData
+        /// if direct access fails.  Safe to call from either role (client
+        /// applying snapshot, or host applying its own roster).
+        /// </summary>
+        public static void EnsureRivalCachesPopulated(RivalsSnapshotPayload payload)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) return;
+
+                // 1. gi.rivalStates — top up missing AI rival IDs only.
+                //    Player IDs are EXCLUDED here.  Why: the game's leaderboard
+                //    iterates gi.rivalStates and renders rows for every id.  If
+                //    we add player IDs but never get RivalData entries for them
+                //    in the private RivalDataCache, the game renders ghost rows
+                //    with raw template placeholders (e.g. "{numBusinesses}").
+                //    Player rows come exclusively from our Patch_Load_AddPlayers
+                //    Postfix; the game must never see player IDs in rivalStates.
+                if (gi.rivalStates != null)
+                {
+                    var existing = new System.Collections.Generic.HashSet<string>();
+                    for (int i = 0; i < gi.rivalStates.Count; i++)
+                    {
+                        var s = gi.rivalStates[i];
+                        if (s == null) continue;
+                        string sid = s.rivalId?.ToString() ?? "";
+                        if (!string.IsNullOrEmpty(sid)) existing.Add(sid);
+                    }
+                    int statesAdded = 0;
+                    foreach (var r in payload.Rivals)
+                    {
+                        if (string.IsNullOrEmpty(r.Id)) continue;
+                        if (r.IsPlayer) continue;          // ← key change
+                        if (existing.Contains(r.Id)) continue;
+                        gi.rivalStates.Add(new BigAmbitions.Rivals.RivalState { rivalId = r.Id });
+                        statesAdded++;
+                    }
+                    if (statesAdded > 0)
+                        Plugin.Logger.LogInfo($"[Patcher] gi.rivalStates topped up: +{statesAdded} AI entries ({gi.rivalStates.Count} total).");
+                }
+
+                // 1b. gi.specialRivalStates — heal missing special-rival progress
+                //     entries (round-64, Tali report 20260722-210703).  Only native
+                //     GenerateRivals creates these, and on clients that call is
+                //     suppressed/raced (Wave6) — a save created on the losing side
+                //     of the race carries an EMPTY list forever.  The rivalStates
+                //     top-up above then arms the trap: FillData registers the
+                //     special ids in SpecialRivalCache on load, so RivalLeaderboard
+                //     .Load:37 derefs GetSpecialRivalState(id).isActive → null →
+                //     NRE mid-build → leaderboard shows only the rows built before
+                //     the throw ("only 1 rival showing").  Same shape GenerateRivals
+                //     writes (inactive, no story progress) — nothing invented.
+                //     Special ids come from the private SpecialRivalsCache asset
+                //     array (machine-independent addressables); if it isn't loaded
+                //     yet we skip silently — snapshots re-arrive on every join.
+                try
+                {
+                    var srFi = HarmonyLib.AccessTools.Field(typeof(BigAmbitions.Rivals.RivalsHelper), "SpecialRivalsCache");
+                    if (srFi?.GetValue(null) is BigAmbitions.Rivals.SpecialRival[] srAssets && srAssets.Length > 0)
+                    {
+                        var specialIds = new System.Collections.Generic.HashSet<string>();
+                        foreach (var sr in srAssets)
+                        {
+                            string sid = sr?.rivalData?.id;
+                            if (!string.IsNullOrEmpty(sid)) specialIds.Add(sid);
+                        }
+
+                        gi.specialRivalStates ??= new System.Collections.Generic.List<BigAmbitions.Rivals.SpecialRivalState>();
+                        var haveStates = new System.Collections.Generic.HashSet<string>();
+                        foreach (var st in gi.specialRivalStates)
+                        {
+                            string sid = st?.rivalId ?? "";
+                            if (sid.Length > 0) haveStates.Add(sid);
+                        }
+
+                        int specialAdded = 0;
+                        foreach (var r in payload.Rivals)
+                        {
+                            if (string.IsNullOrEmpty(r.Id) || r.IsPlayer) continue;
+                            if (!specialIds.Contains(r.Id) || haveStates.Contains(r.Id)) continue;
+                            gi.specialRivalStates.Add(new BigAmbitions.Rivals.SpecialRivalState
+                            {
+                                rivalId = r.Id,
+                                completedTimelineEntryIds = new System.Collections.Generic.List<string>(),
+                            });
+                            specialAdded++;
+                        }
+                        if (specialAdded > 0)
+                            Plugin.Logger.LogInfo($"[Patcher] gi.specialRivalStates topped up: +{specialAdded} special entries ({gi.specialRivalStates.Count} total) — leaderboard NRE heal.");
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] specialRivalStates heal: {ex.Message}"); }
+
+                // 2. RivalsHelper.RivalDataCache — try AccessTools first, then fall back to FillData.
+                int cacheAdded = 0;
+                try
+                {
+                    var fi = HarmonyLib.AccessTools.Field(typeof(BigAmbitions.Rivals.RivalsHelper), "RivalDataCache");
+                    if (fi != null)
+                    {
+                        var dictObj = fi.GetValue(null);
+                        if (dictObj is System.Collections.Generic.Dictionary<string, BigAmbitions.Rivals.RivalData> dict)
+                        {
+                            int playerPurged = 0;
+                            foreach (var r in payload.Rivals)
+                            {
+                                if (string.IsNullOrEmpty(r.Id)) continue;
+                                // PLAYERS never enter the cache (same rule as the
+                                // rivalStates half above).  On 0.10 this whole
+                                // AccessTools path silently failed, so the missing
+                                // filter never fired; Mono resurrected it and the
+                                // leaderboard grew a bare unselectable "defeated"
+                                // stub per player NEXT TO our synthetic row
+                                // (user, 2026-06-12).
+                                if (r.IsPlayer) { if (dict.Remove(r.Id)) playerPurged++; continue; }
+                                if (dict.ContainsKey(r.Id)) continue;
+                                dict[r.Id] = new BigAmbitions.Rivals.RivalData
+                                {
+                                    id        = r.Id,
+                                    rivalName = string.IsNullOrEmpty(r.Name) ? r.Id : r.Name,
+                                    // Init owned-lists empty (Site-2/BuildSyntheticPlayerRivalData does the same) so
+                                    // RivalData.WeeklyIncome / leaderboard reads never NRE if anything touches this
+                                    // cache entry before the game's RefreshRivals backfills them.
+                                    ownedBuildings              = new System.Collections.Generic.List<BuildingRegistration>(),
+                                    ownedBusinesses             = new System.Collections.Generic.List<BuildingRegistration>(),
+                                    ownedRetailOfficeBusinesses = new System.Collections.Generic.List<BuildingRegistration>(),
+                                };
+                                cacheAdded++;
+                            }
+                            Plugin.Logger.LogInfo($"[Patcher] RivalDataCache populated via AccessTools: +{cacheAdded} entries{(playerPurged > 0 ? $", purged {playerPurged} player stub(s)" : "")}.");
+                        }
+                        else
+                        {
+                            Plugin.Logger.LogWarning($"[Patcher] AccessTools got field but value is {(dictObj == null ? "null" : dictObj.GetType().FullName)} — falling back to FillData.");
+                            cacheAdded = -1;
+                        }
+                    }
+                    else
+                    {
+                        Plugin.Logger.LogWarning("[Patcher] AccessTools.Field returned null for RivalDataCache — falling back to FillData.");
+                        cacheAdded = -1;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogWarning($"[Patcher] RivalDataCache AccessTools path: {ex.Message} — falling back to FillData.");
+                    cacheAdded = -1;
+                }
+
+                if (cacheAdded < 0)
+                {
+                    // FillData was a candidate fallback here, but calling it
+                    // at runtime triggers Addressables.LoadAssetsAsync which
+                    // hangs the client at 100% loading (FillData is only safe
+                    // during SaveGameManager.Load context).  Leaving the cache
+                    // alone — leaderboard will fall back to whatever rivals the
+                    // client's own GenerateRivals produced.  Building popups
+                    // still resolve via the GetRivalName Prefix override.
+                    Plugin.Logger.LogInfo("[Patcher] Skipping RivalDataCache populate; leaderboard will use client-local rivals (see context log 2026-05-22 Wave 5 rollback).");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] EnsureRivalCachesPopulated: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Apply host's rivals stats snapshot.  Replaces ClientRivalStats dict.
+        /// The RivalLeaderboard.GetRivalLeaderboardData Postfix in MPPatches
+        /// reads from this dict to override the leaderboard rows with host's
+        /// authoritative values.
+        /// </summary>
+        public static void ApplyRivalsStatsSnapshot(RivalsStatsSnapshotPayload payload)
+        {
+            if (payload == null) return;
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    ClientRivalStats.Clear();
+                    ClientBusinessIncomeByAddress.Clear();
+                    ClientRivalBusinessAddrs.Clear();
+                    int bizRows = 0;
+                    foreach (var s in payload.Stats)
+                    {
+                        if (string.IsNullOrEmpty(s.Id)) continue;
+                        ClientRivalStats[s.Id] = s;
+                        if (s.Businesses != null && s.Businesses.Count > 0)
+                        {
+                            var addrs = new System.Collections.Generic.HashSet<string>();
+                            foreach (var b in s.Businesses)
+                            {
+                                if (string.IsNullOrEmpty(b.AddressKey)) continue;
+                                ClientBusinessIncomeByAddress[b.AddressKey] = b.WeeklyIncome;
+                                addrs.Add(b.AddressKey);
+                                bizRows++;
+                            }
+                            ClientRivalBusinessAddrs[s.Id] = addrs;
+                        }
+                    }
+                    Plugin.Logger.LogInfo($"[Patcher] ClientRivalStats populated: {payload.Stats.Count} entries, {bizRows} business income rows.");
+
+                    // The just-arrived stats change every row: re-Load an OPEN leaderboard.
+                    RefreshRivalLeaderboardIfVisible();
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ApplyRivalsStatsSnapshot: {ex.Message}"); }
+            });
+        }
+        /// <summary>RIVALS-HOST-SWITCH-1 fold G3: empty the host's rival stats at a session end (caller: the
+        /// leave-the-city patch in MPPatches, Patch_LoadScene_LoadMainMenuFromCity_ClearRivalStats). MAIN THREAD.</summary>
+        public static void ClearClientRivalStats(string why)
+        {
+            try
+            {
+                int n = ClientRivalStats.Count;
+                ClientRivalStats.Clear();
+                ClientBusinessIncomeByAddress.Clear();   // the two companion maps filled from the same host snapshot (fold leftover)
+                ClientRivalBusinessAddrs.Clear();
+                if (n > 0) Plugin.Logger.LogInfo($"[RivalStats] session end ({why}): cleared {n} rival stats entr{(n == 1 ? "y" : "ies")} - a new session starts without the previous session's figures.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[RivalStats] session-end clear: {ex.Message}"); }
+        }
+
+        /// <summary>Re-Load an OPEN rivals leaderboard so a state change is reflected without
+        /// closing the app. We CHECK activeInHierarchy explicitly - Load() on a hidden/uninitialized
+        /// RivalLeaderboard can dereference null serialized fields and crash the process natively.
+        /// MAIN THREAD ONLY. Callers: the rivals-stats apply above, and MergerSync.ApplyState
+        /// (Phase 1-B: membership decides which rows fold into one company entry).</summary>
+        // JOIN-SMOOTH-1 (1.0.16, field a6373798: every rivals-stats packet cost 120-160 ms): FindObjectsOfType walks the whole
+        // city; the leaderboard can only be on screen while the phone's full menu is open - and once found, it is kept.
+        private static UnityEngine.Object[]? _leaderboards;
+
+        public static void RefreshRivalLeaderboardIfVisible()
+        {
+            try
+            {
+                if (!UI.Smartphone.FullMenu.IsOpen) return;
+                bool alive = _leaderboards != null && _leaderboards.Length > 0;
+                if (alive) foreach (var o in _leaderboards!) if (o == null) { alive = false; break; }
+                if (!alive) _leaderboards = UnityEngine.Object.FindObjectsOfType(typeof(UI.Smartphone.Apps.Rivals.RivalLeaderboard));
+                var lbs = _leaderboards;
+                if (lbs == null || lbs.Length == 0) return;
+                for (int i = 0; i < lbs.Length; i++)
+                {
+                    var lb = lbs[i] as UI.Smartphone.Apps.Rivals.RivalLeaderboard;
+                    if (lb == null) continue;
+                    bool active = false;
+                    try { active = lb.gameObject != null && lb.gameObject.activeInHierarchy; } catch { }
+                    if (!active)
+                    {
+                        Plugin.Logger.LogInfo("[Patcher] Skipping Load() on inactive RivalLeaderboard.");
+                        continue;
+                    }
+                    try { lb.Load(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] RivalLeaderboard.Load refresh: {ex.Message}"); }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] leaderboard refresh: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Build a synthetic RivalData for a REMOTE human player so the game's
+        /// own RivalLeaderboard.Load can include + rank them by income alongside
+        /// AI rivals.  Owned-business lists are populated from local registrations
+        /// (owner ids synced from host) so the count + estimated income resolve;
+        /// non-null lists are mandatory (downstream code iterates them natively).
+        /// Used by the GetAllRivalData Postfix (leaderboard) and the GetRivalData
+        /// fallback (detail view click).
+        /// </summary>
+        public static BigAmbitions.Rivals.RivalData? BuildSyntheticPlayerRivalData(string playerId)
+        {
+            if (string.IsNullOrEmpty(playerId)) return null;
+            string name = playerId;
+            try { if (ClientRivalNames.TryGetValue(playerId, out var n) && !string.IsNullOrWhiteSpace(n)) name = n; } catch { }
+            int age = 30;
+            try { if (ClientPlayerAges.TryGetValue(playerId, out var a) && a > 0) age = a; } catch { }
+            var rd = new BigAmbitions.Rivals.RivalData
+            {
+                id        = playerId,
+                rivalName = name,
+                startingAgeInYears = age,
+                ownedBuildings              = new System.Collections.Generic.List<BuildingRegistration>(),
+                ownedBusinesses             = new System.Collections.Generic.List<BuildingRegistration>(),
+                ownedRetailOfficeBusinesses = new System.Collections.Generic.List<BuildingRegistration>(),
+            };
+            // Generated-portrait fallback matches the real character's gender
+            // (the synced PNG overrides this whenever it has arrived).
+            try
+            {
+                if (ClientPlayerGenders.TryGetValue(playerId, out var g) && g >= 0)
+                    rd.gender = (BigAmbitions.Characters.Gender)g;
+            }
+            catch { }
+            PopulateRivalOwnedFromSync(rd, playerId);
+            return rd;
+        }
+
+        /// <summary>
+        /// (Re)populate a rival/player RivalData's owned-* lists from local
+        /// registrations.  The leaderboard COUNT and the detail BREAKDOWN both use
+        /// ownedRetailOfficeBusinesses, which (confirmed via HostBizDiag) contains
+        /// Retail+Office+Cinema+Theater and excludes factories — so we mirror the
+        /// HOST'S EXACT membership by address (ClientRivalStats[id].Businesses,
+        /// built host-side from rd.ownedRetailOfficeBusinesses) rather than guess
+        /// by BuildingType (which dropped cinema/theater).  ownedBusinesses gets
+        /// the same set so the breakdown matches regardless of which list the game
+        /// reads.  Falls back to owner-id-match-minus-factory before stats arrive.
+        /// ownedBuildings = real estate (buildingOwnerRivalId), independent.
+        /// </summary>
+        public static void PopulateRivalOwnedFromSync(BigAmbitions.Rivals.RivalData rd, string id)
+        {
+            if (rd == null || string.IsNullOrEmpty(id)) return;
+            try
+            {
+                if (rd.ownedBuildings  != null) rd.ownedBuildings.Clear();
+                if (rd.ownedBusinesses != null) rd.ownedBusinesses.Clear();
+                if (rd.ownedRetailOfficeBusinesses != null) rd.ownedRetailOfficeBusinesses.Clear();
+
+                System.Collections.Generic.HashSet<string>? syncedAddrs = null;
+                if (ClientRivalStats.TryGetValue(id, out var stat) && stat.Businesses != null && stat.Businesses.Count > 0)
+                {
+                    syncedAddrs = new System.Collections.Generic.HashSet<string>();
+                    foreach (var b in stat.Businesses)
+                        if (!string.IsNullOrEmpty(b.AddressKey)) syncedAddrs.Add(b.AddressKey);
+                }
+
+                var gi = SaveGameManager.Current;
+                if (gi == null || gi.BuildingRegistrations == null) return;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    try
+                    {
+                        string bldg = reg.buildingOwnerRivalId?.ToString() ?? "";
+                        string biz  = reg.businessOwnerRivalId?.ToString() ?? "";
+                        if (bldg == id && rd.ownedBuildings != null) rd.ownedBuildings.Add(reg);
+
+                        bool isBiz;
+                        if (syncedAddrs != null)
+                            isBiz = syncedAddrs.Contains(GameStateReader.AddressKey(reg));   // host's exact set
+                        else
+                        {
+                            // Fallback before stats arrive: owner match minus factory.
+                            bool isFactory = false; try { isFactory = reg.businessTypeName == "ba:businesstype_factory"; } catch { }
+                            isBiz = (biz == id) && !isFactory;
+                        }
+                        if (isBiz)
+                        {
+                            if (rd.ownedBusinesses             != null) rd.ownedBusinesses.Add(reg);
+                            if (rd.ownedRetailOfficeBusinesses != null) rd.ownedRetailOfficeBusinesses.Add(reg);
+                            // RIVALS-HOST-SWITCH-1 part 2 (decision 55, design D4a): the synced weekly figure is NO
+                            // LONGER written into the real reg.dailyIncomes as 7 x (weekly/7) - that fake series was
+                            // saved into every client's copy (identical-7 lists, many negative) and became the world
+                            // of a client that later hosted. The client's Rivals app now reads the host's figures
+                            // directly: RivalData.WeeklyIncome / MostActiveNeighborhood (MPPatches
+                            // Patch_RivalData_*_ClientStats), the business rows (Patch_RivalBusinessesCellView_SetData)
+                            // and the chart (Patch_SelectedRivalUI_SetChartWeeklyIncome_ClientStats).
+                        }
+                    }
+                    catch { }
+                }
+
+                // Real graphs: install the synced per-day series as this
+                // player's RivalState (runtime-only; stripped at save).
+                InstallPlayerRivalStateHistory(id);
+            }
+            catch { }
+        }
+
+        // ── Interior sync (Phase 2a: simple fields only — items deferred to 2b) ──
+
+        /// <summary>
+        /// Apply a host's interior snapshot to the local BuildingRegistration.
+        /// Phase 2a writes Layout / interiorDesigns / retailPrices / dirtSpots.
+        /// ItemInstances are NOT yet synced (Phase 2b).
+        /// </summary>
+        /// <summary>Stage 3 (2026-08-25): the grantedEdit parameter is GONE with the 140 — a guest's
+        /// edit now arrives only as a BuildingInteriorDelta (ApplyInteriorEditDelta below), never as
+        /// a full snapshot, so every remaining caller of this method is host-stream / owner-push /
+        /// seed-heal traffic and the granted-edit special cases folded away.
+        /// seedOrHealOverride (Stage 0): the host's owner-push accept consumes the wire's per-hop
+        /// SeedOrHeal flag before caching (the cached object must never carry it into rebroadcasts)
+        /// and passes the consumed value through here; every other caller leaves it null and the
+        /// gate reads the payload's own flag.</summary>
+        public static void ApplyInteriorSnapshot(InteriorSnapshotPayload payload, bool? seedOrHealOverride = null)
+        {
+            if (payload == null || string.IsNullOrEmpty(payload.AddressKey)) return;
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    // ── Round-281 (S4-lite): IDENTICAL PAYLOAD, ALREADY APPLIED → SKIP ─────────────
+                    // The degree-1 echo — a guest's own edit coming back from the host — arrives as a
+                    // byte-for-byte repeat of what this machine just applied, and the apply below is
+                    // the most expensive thing the mod does on the main thread (field 20260818-22*:
+                    // #1 slow-apply on BOTH machines, mean 119ms, max 284ms).  Re-deriving state we
+                    // already hold is pure cost, so compare first and leave.  No protocol change: the
+                    // signature is computed over the PAYLOAD (both hash halves + the two flags that
+                    // change how the same content applies), so it is exact, not a heuristic.
+                    // NOTE the deliberate asymmetry: only a payload that actually RAN to completion
+                    // records a signature (the recording sits at the end, past every refusal), so a
+                    // refused apply can never be mistaken for an applied one.
+                    string applySig;
+                    {
+                        // v10 review B1: dirt moved out of `full` for the SEND gates, but this sig is
+                        // the RECEIVER's duplicate-apply detector — without the dirt band an entry
+                        // snapshot whose only news is dirt matches the old sig and gets skipped,
+                        // stranding stale dirt with no heal (the host's dirt tracker is seeded on the
+                        // assumption this snapshot applied). Fold the dirt band in explicitly.
+                        var (sHs, sHv, _, sHd) = InteriorSync.ComputeHashes(payload);
+                        applySig = $"{sHs}|{sHv}|{sHd}|{(payload.ItemInstancesAuthoritative ? 1 : 0)}|0|{payload.Layout ?? ""}";   // the constant 0 was the grantedEdit bit (Stage 3)
+                    }
+                    // Round-281b (verifier finding a): only an apply that RAN TO COMPLETION may
+                    // become the S4-lite baseline.  The round-103 empty-snapshot refusal and the
+                    // item-apply catch both fell through to the recordings — a refused-or-thrown
+                    // apply recorded a signature, and a byte-identical re-send (the host's only
+                    // corrective move) was then skipped forever.
+                    bool appliedFully = true;
+                    bool itemsKeptOverEmpty = false;   // ABSENCE-HANDBACK-1 fold 2 (D3): the empty-set guard kept my items
+                    // Two halves, cheap one first.  The payload half says "the host is telling me the
+                    // same thing again"; the LOCAL half says "and my copy is still the one I applied it
+                    // to".  Both are required — a save load, a heal, or any other path that replaces
+                    // reg.itemInstances underneath us makes a repeat payload NEWS again, and a skip
+                    // there would strand the stale copy with no second chance (the host has no reason
+                    // to ever send a different snapshot).  The registration lookup is only paid when
+                    // the payload half already matched.
+                    if (_lastAppliedSig.TryGetValue(payload.AddressKey, out var prevSig) && prevSig == applySig
+                        && _lastAppliedLocalTag.TryGetValue(payload.AddressKey, out var prevLocal)
+                        && prevLocal == LocalInteriorTag(FindRegistration(payload.AddressKey)))
+                    {
+                        // Record the version even on a skip.  Otherwise a full snapshot whose CONTENT
+                        // is identical but whose StructVersion moved (a host restart re-mints from 1)
+                        // would be skipped, the receiver would keep the old number, every cargo sync
+                        // would mismatch, and the re-request would loop forever against a snapshot
+                        // that keeps getting skipped.  One line closes that loop.
+                        _lastAppliedStructVersion[payload.AddressKey] = payload.StructVersion;
+                        // Stage 0 review MAJOR-6: an identical payload against an unchanged local copy
+                        // means this machine already HOLDS the state a re-ask would fetch — owed satisfied.
+                        InteriorSync.ClearResyncOwed(payload.AddressKey);
+                        // ABSENCE-HANDBACK-1 F7: a returned owner who already holds this exact hand-back state must still ack
+                        // it - the host keeps the address held until it hears "applied" (ConsumeReturnInterior sends that).
+                        if (payload.SeedOrHeal && MergerAbsence.IsReturnInterior(payload.AddressKey))
+                            MergerAbsence.ConsumeReturnInterior(payload.AddressKey);
+                        // ABSENCE-HANDBACK-1 R4: a client stand-in that already holds the host's copy confirms it the same way.
+                        if (payload.SeedOrHeal) MergerAbsence.NoteSeedApplied(payload.AddressKey, payload.Authoritative);
+                        InteriorSync.HostNoteWorldApplied(payload);   // ABSENCE-HANDBACK-1 fold 2 (D1 b): the host's world holds it
+                        NoteApplySkipped(payload.AddressKey);
+                        return;
+                    }
+                    // Round-178 (user design ruling, 2026-07-28): FOR A BUILDING THIS MACHINE OWNS, a
+                    // generic snapshot may only FILL AN EMPTY COPY — never modify a developed one.  The
+                    // owner is the authority; the generic channel exists to update REPLICAS, and the
+                    // only legitimate inbound edit of your own building is the delta channel
+                    // (BuildingInteriorDelta, grant-verified at the host — Stage 3 retired the 140
+                    // full-snapshot bypass).  Keeping the fill-when-empty case preserves the
+                    // stale-save heal (a player whose save lost its interiors receives the host's
+                    // good copy) and the arbitration hand-over.
+                    {
+                        var regO = FindRegistration(payload.AddressKey);
+                        bool mineO = false; try { mineO = regO != null && MergerFlip.TrulyMine(regO); } catch { }
+                        // MERGER PHASE 3-C (C2a) - the ONE narrow exception to the rule above: while THIS
+                        // machine is a RETURNED owner whose return payload names this address, the host's
+                        // SeedOrHeal copy IS the state a co-member simulated in my absence, and replacing
+                        // my stale developed copy with it is the whole point of the return leg (D2's only
+                        // carve-out). r2 F1b: the test is NON-CONSUMING - the set is drained only where the
+                        // apply actually COMMITS (further down), so a return snapshot refused or deferred after
+                        // this point still finds its address in the set when it is re-sent or re-asked. Every
+                        // other address, sender and flag still refuse exactly as before.
+                        if (mineO && !ContestedTenancy.IsKnownEssentiallyEmpty(regO, out int myScore)
+                            && !(payload.SeedOrHeal && MergerAbsence.IsReturnInterior(payload.AddressKey)))
+                        {
+                            Plugin.Logger.LogWarning($"[Patcher] Interior apply REFUSED for '{payload.AddressKey}': this machine OWNS the building and its copy is "
+                                + (myScore < 0 ? "not yet readable" : $"developed (score {myScore})")
+                                + " — a generic snapshot may only fill an empty copy; renovations arrive via the delta channel only.");
+                            return;
+                        }
+                    }
+                    // Round-184 fix 3 (rig-proven, TEST184-INT2): EMPTINESS MAY NOT REPLACE
+                    // DEVELOPMENT IN ONE STEP.  A member whose .hsg went missing/stale rejoins
+                    // with a REAL, materialized, genuinely near-empty save — every unread-state
+                    // guard rightly passes it, and its owner-authoritative push blanked the
+                    // developed replica live on the rig (items 9→2, business name gone).  While
+                    // the sender is inside the resurrection window (10 min after joining), a
+                    // wholesale snapshot that is essentially-empty (≤3 non-default items) may not
+                    // replace a positively-developed copy; the developed copy is pushed BACK to
+                    // the owner instead (heal), and their next push carries the restored content.
+                    // A legitimate teardown converges per-change and never presents this cliff;
+                    // after the window, force pushes apply normally.
+                    if (MPServer.IsRunning)
+                    {
+                        try
+                        {
+                            string senderPid = payload.OwnerPlayerId ?? "";
+                            if (senderPid.Length > 0 && senderPid != MPConfig.PlayerId
+                                && MPServer.JoinedAtByPid.TryGetValue(senderPid, out var joinedMs)
+                                && unchecked(Environment.TickCount - joinedMs) < ResurrectionWindowMs)
+                            {
+                                int incomingDev = 0;
+                                foreach (var it in payload.ItemInstances)
+                                    if (it != null && !ContestedTenancy.IsDefaultFixture(it.ItemName ?? "")) incomingDev++;
+                                if (incomingDev <= 3)
+                                {
+                                    var regR = FindRegistration(payload.AddressKey);
+                                    int myDev = -1;
+                                    try { if (regR != null) myDev = ContestedTenancy.DevelopmentScore(regR); } catch { }
+                                    if (myDev > 3)
+                                    {
+                                        Plugin.Logger.LogWarning($"[Patcher] Interior apply REFUSED for '{payload.AddressKey}': recently-joined '{senderPid}' pushed an essentially-empty copy ({incomingDev} non-default item(s)) over a developed one (score {myDev}) — the stale/fresh-save signature (round-184). Healing the owner back with our copy instead.");
+                                        try { InteriorSync.SendSnapshotToPlayer(payload.AddressKey, senderPid); } catch { }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    // Round-177 — WHOLE-SNAPSHOT all-zero refusal (approved 2026-07-28).  Round-103
+                    // refused empty ITEM sets but let designs/dirt/prices apply, so an unmaterialized
+                    // sender still wiped the receiver's renovations through the side door.  An
+                    // all-zero payload replacing existing content is absence of knowledge, never
+                    // evidence — refuse it wholesale.  (The send-side guard now skips these pushes at
+                    // the source; this is the belt for older senders and any other snapshot path.)
+                    if (payload.ItemInstances.Count == 0 && payload.InteriorDesigns.Count == 0
+                        && payload.DirtSpots.Count == 0 && payload.RetailPrices.Count == 0)
+                    {
+                        var regZ = FindRegistration(payload.AddressKey);
+                        bool hasContent = false;
+                        try { hasContent = regZ != null && ((regZ.itemInstances?.Count ?? 0) > 0 || (regZ.interiorDesigns?.Count ?? 0) > 0); } catch { }
+                        if (hasContent)
+                        {
+                            Plugin.Logger.LogWarning($"[Patcher] Interior apply REFUSED for '{payload.AddressKey}': an ALL-ZERO snapshot " +
+                                "(no items, designs, dirt or prices) may never replace existing content — absence of knowledge is not evidence.");
+                            // ABSENCE-HANDBACK-1 R2: a refused hand-back still answers the host, or its hold never ends.
+                            if (payload.SeedOrHeal && MergerAbsence.IsReturnInterior(payload.AddressKey))
+                                MergerAbsence.RefuseReturnInterior(payload.AddressKey, "an all-zero copy may not replace my content");
+                            return;
+                        }
+                    }
+                    var reg = FindRegistration(payload.AddressKey);
+                    if (reg == null)
+                    {
+                        Plugin.Logger.LogWarning($"[Patcher] ApplyInteriorSnapshot: no reg for '{payload.AddressKey}'");
+                        if (payload.SeedOrHeal && MergerAbsence.IsReturnInterior(payload.AddressKey))   // R2: answer the host
+                            MergerAbsence.RefuseReturnInterior(payload.AddressKey, "no registration for it here");
+                        return;
+                    }
+
+                    // CATCH-ALL (2026-06-17): the host's own replica of a PLAYER-owned business is flagged
+                    // non-authoritative (InteriorSync.BuildSnapshotForHostSend). Such a snapshot must NEVER
+                    // touch the owner's real interior — only the owner's OWN authoritative push may. This one
+                    // gate protects EVERY collection below (designs / prices / dirt / items + any added later).
+                    // Stage 0 review MIN-7: this REFUSAL runs BEFORE the busy gate — a snapshot that would
+                    // be refused anyway must not owe a re-ask (the answer would just be refused again).
+                    bool isPlayerBusiness = false;
+                    try { isPlayerBusiness = IsAnyPlayerBusiness(reg) || reg.RentedByPlayer || !string.IsNullOrEmpty(payload.OwnerPlayerId); }
+                    catch { }
+                    // MERGER PHASE 3-C r2 (F1b, belt and braces): a RETURN snapshot is vouched AT THE SOURCE
+                    // (InteriorSync.SendSnapshotToPlayer's vouchEmpty - the host copy of a marked address is
+                    // the truth even when it holds zero items), so this gate never fires for one. If it ever
+                    // does - an older host, or any path that loses the vouch - the return leg's own address
+                    // list carries it through rather than leaving the returned owner on a stale interior, and
+                    // the miss is LOGGED so it can never be silent.
+                    bool returnVouchMiss = isPlayerBusiness && !payload.Authoritative
+                                        && payload.SeedOrHeal && MergerAbsence.IsReturnInterior(payload.AddressKey);
+                    if (returnVouchMiss)
+                        Plugin.Logger.LogWarning($"[Patcher] return snapshot for '{payload.AddressKey}' arrived NON-authoritative — the host did not vouch it; applied anyway because the return leg names this address (P3-C r2 F1b).");
+                    if (isPlayerBusiness && !payload.Authoritative && !returnVouchMiss)
+                    {
+                        Plugin.Logger.LogWarning($"[Patcher] Interior apply SKIPPED for '{payload.AddressKey}': non-authoritative snapshot for a player-owned business — kept local interior.");
+                        return;
+                    }
+
+                    // ── Interior-edit Stage 0 (design 2026-08): ROLE-BLIND mid-edit gate ─────────────
+                    // Replaces the guest-only designer drop (which was also a drop with NO recurrence —
+                    // the host stamps its hash trackers BEFORE broadcasting, so a dropped snapshot was
+                    // never re-sent).  While the LOCAL player — any role, the owner included — is
+                    // mid-edit in this building, a routine full snapshot is DISCARDED, never applied
+                    // and never deferred as bytes (a deferred snapshot is stale by construction), and
+                    // a re-ask is owed: the edit-end events drain it and the answer is rebuilt live.
+                    // Exempt: SeedOrHeal (recovery traffic — entry serves, heals, re-request answers;
+                    // discarding those can loop).  A guest's edit — the other never-discardable class —
+                    // no longer arrives here at all: it is a BuildingInteriorDelta (Stage 3 retired
+                    // the 140), and the delta apply's per-item hands/drag/pending rules defang it.
+                    bool seedOrHeal = seedOrHealOverride ?? payload.SeedOrHeal;
+                    string? busyHere = HousingDesign.InteriorEditBusyAt(payload.AddressKey);
+                    if (!seedOrHeal && busyHere != null)
+                    {
+                        InteriorSync.NoteResyncOwed(payload.AddressKey, $"snapshot discarded ({busyHere} here)");
+                        Plugin.Logger.LogInfo($"[Patcher] Interior snapshot for '{payload.AddressKey}' DISCARDED — local player mid-edit ({busyHere}); re-ask owed, drained at edit end (Stage 0).");
+                        return;   // nothing recorded — an identical re-send stays news (round-281b)
+                    }
+                    // Round-227 (repositioned in Stage 3, review M3): the piggybacked speaker state —
+                    // applied FIRST among the bands, so an entering player hears the right station
+                    // before the heavy item apply runs, but BEHIND every refusal above.  The old
+                    // pre-gate call flipped the radio from snapshots this machine then refused —
+                    // non-authoritative replicas of a player business included — with no ownership
+                    // check at all.  A snapshot that is not entitled to assert this building's state
+                    // is not entitled to assert its radio either (THE INVARIANT).  The S4-identical
+                    // skip path above no longer re-asserts the radio: its values were applied when
+                    // the recorded apply completed, and live changes are RadioState's own channel.
+                    try { MPRadioSync.ApplyFromSnapshot(payload.AddressKey, payload.RadioStation, payload.RadioVolume); } catch { }
+                    // Stage 0 review MAJOR-3 (the round-281 serialized-then-reverted trap): while the
+                    // DESIGNER is open here, an exempt apply (SeedOrHeal) must not rewrite
+                    // the design bands — the scene's InteriorElements would revert under the open
+                    // designer, and its close would then serialize the REVERTED scene back out as this
+                    // player's own edit (worse than losing: it launders the other side's state as the
+                    // last writer's).  Skipping designs+layout IS the approved Q2 last-write-wins: the
+                    // designer close that is open right now will write this player's version last.
+                    // Items and the rest still apply — furniture must never be lost to a paint session.
+                    // Verification MAJOR-B: asked via DesignerOpenAt, NOT busyHere — placement runs
+                    // WHILE the designer is open and busyHere answers placement first, which made the
+                    // skip inert during every drag of a designer session.
+                    bool skipDesignBands = HousingDesign.DesignerOpenAt(payload.AddressKey);
+                    if (skipDesignBands)
+                        Plugin.Logger.LogInfo($"[Patcher] design bands (layout/designs) of an exempt apply for '{payload.AddressKey}' SKIPPED — designer open here; local designer close writes last (Q2 LWW, Stage 0).");
+
+                    // Layout (string; controls which BusinessLayoutSet is used).
+                    // Capture whether it ACTUALLY changes — the visual refresh below re-calls
+                    // LoadBuilding only when it did.  Re-calling LoadBuilding on a building that already
+                    // shows the right layout (the IRS; or a 2nd/Nth snapshot for the same shop) spawns a
+                    // DUPLICATE set of stations on top → the "8 booths vs 4 / 30 stations" duplication
+                    // (user 2026-06-23) plus malformed duplicates that NRE on staffing.
+                    string _layoutBefore = reg.Layout;
+                    if (!string.IsNullOrEmpty(payload.Layout) && !skipDesignBands)
+                        reg.Layout = payload.Layout;
+                    bool _layoutChanged = !string.Equals(_layoutBefore, reg.Layout, StringComparison.Ordinal);
+
+                    // Interior designs (wall/floor/ceiling material+color).
+                    // Diffed like items: only elements whose serialized form
+                    // changed get re-Deserialized in the refresh below.
+                    var changedDesignUuids = new HashSet<string>();
+                    try
+                    {
+                        if (reg.interiorDesigns != null && !skipDesignBands)
+                        {
+                            if (!_lastDesignSer.TryGetValue(payload.AddressKey, out var lastDSer))
+                                lastDSer = new Dictionary<string, string>();
+                            var newDSer = new Dictionary<string, string>();
+                            reg.interiorDesigns.Clear();
+                            foreach (var d in payload.InteriorDesigns)
+                            {
+                                // `materials` MUST be a non-null array: the game's InteriorElement.Deserialize does
+                                // `materials.Length` with NO null-check, so a null here NRE's inside LoadBuilding →
+                                // aborts the building-enter coroutine → the player is stuck on a BLACK SCREEN on load
+                                // (user 2026-06-30). The game's own Serialize() always uses an array (empty, never
+                                // null) — match that. (The old `if (Count>0)` left it null for empty designs.)
+                                int mcount = d.Materials?.Count ?? 0;
+                                var arr = new SerializedInteriorDesign.SerializableInteriorMaterial[mcount];
+                                for (int i = 0; i < mcount; i++)
+                                {
+                                    var m = d.Materials[i];
+                                    arr[i] = new SerializedInteriorDesign.SerializableInteriorMaterial
+                                    {
+                                        MaterialID    = m.MaterialID,
+                                        MaterialIndex = m.MaterialIndex,
+                                        ColorIndex    = m.ColorIndex,
+                                    };
+                                }
+                                var sd = new SerializedInteriorDesign { UUID = d.UUID, materials = arr };
+                                reg.interiorDesigns.Add(sd);
+
+                                string uuid = d.UUID ?? "";
+                                if (string.IsNullOrEmpty(uuid)) continue;
+                                string ser = Newtonsoft.Json.JsonConvert.SerializeObject(d);
+                                newDSer[uuid] = ser;
+                                if (!lastDSer.TryGetValue(uuid, out var prev) || prev != ser)
+                                    changedDesignUuids.Add(uuid);
+                            }
+                            _lastDesignSer[payload.AddressKey] = newDSer;
+                            // Field 20260831-223144 (approved 2026-09-01): native renders walls at ENTRY from
+                            // BuildingRegistration._interiorLookup, a LAZY cache regenerated only when
+                            // empty or when native writers call this explicitly. Every mod write to
+                            // interiorDesigns left it stale, so the OWNER's next entry drew the OLD paint
+                            // and their exit serialized it back over the data — the field revert.
+                            try { reg.GenerateInteriorDesignerLookup(); } catch (Exception lx) { Plugin.Logger.LogWarning($"[Patcher] design lookup regen: {lx.Message}"); }
+                        }
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] interiorDesigns apply: {ex.Message}"); }
+
+                    // Retail prices
+                    try
+                    {
+                        if (reg.retailPrices != null)
+                        {
+                            reg.retailPrices.Clear();
+                            foreach (var rp in payload.RetailPrices)
+                                reg.retailPrices.Add(new RetailPrice { itemName = rp.ItemName, price = rp.Price });
+                        }
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] retailPrices apply: {ex.Message}"); }
+
+                    // Dirt spots
+                    try
+                    {
+                        if (reg.dirtSpots != null)
+                            ApplySnapshotDirt(reg, payload.DirtSpots, payload.AddressKey, "full snapshot");   // G1: values in place - a network apply never changes the local list's length
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] dirtSpots apply: {ex.Message}"); }
+
+                    // ItemInstances (Phase 2b).  PER-ITEM DIFF apply (2026-06-12):
+                    // a full wipe-and-rebuild re-rolled every shelf's visual
+                    // shuffle on every snapshot (ShelfController.CollectVisualItems
+                    // uses global UnityEngine.Random at spawn; flicker every few
+                    // seconds — user bug).  Items whose serialized form is
+                    // UNCHANGED keep their live ItemInstance object so their
+                    // ItemController (and its shuffled look) survives untouched.
+                    var changedIds = new HashSet<string>();
+                    var removedIds = new HashSet<string>();
+                    var movedIds   = new HashSet<string>();   // REAL transform deltas → move in place (round-22; round-86b: cargo-only no longer lands here)
+                    var cargoOnlyIds = new HashSet<string>(); // round-86b: in-place restocks — fully handled at apply time, feed NOTHING downstream
+                    int stackedInPlace = 0;   // round-278/F3: attachment-list-only in-place updates (same feed-nothing contract)
+                    try
+                    {
+                        if (reg.itemInstances != null)
+                        {
+                            bool protectPlayerBusiness = false;
+                            try
+                            {
+                                protectPlayerBusiness = IsAnyPlayerBusiness(reg)
+                                                        || reg.RentedByPlayer
+                                                        || !string.IsNullOrEmpty(payload.OwnerPlayerId);
+                            }
+                            catch { }
+
+                            // Round-103 (field 2026-07-27): the authoritative-flag exemption is GONE.
+                            // An empty item set may never clear a player-owned business, whatever it
+                            // claims — that exemption is exactly how one join deleted 128 items from a
+                            // client's cinema (and 33/31/6 from three more shops). Keeping stale items
+                            // is recoverable; deleting real ones is not. Genuine emptying still syncs:
+                            // removals travel as per-item diffs while the owner is inside.
+                            if (protectPlayerBusiness && payload.ItemInstances.Count == 0 && reg.itemInstances.Count > 0)
+                            {
+                                appliedFully = false;   // round-281b: a refusal is not a baseline
+                                itemsKeptOverEmpty = true;
+                                Plugin.Logger.LogWarning($"[Patcher] Interior item apply REFUSED for '{payload.AddressKey}': an empty snapshot (itemAuth={payload.ItemInstancesAuthoritative}) would have cleared {reg.itemInstances.Count} stored item(s) of a player-owned business. Kept the stored interior.");
+                            }
+                            else
+                            {
+                            if (!_lastItemSer.TryGetValue(payload.AddressKey, out var lastSer))
+                                lastSer = new Dictionary<string, string>();
+                            var newSer  = new Dictionary<string, string>();
+                            var newDict = new Dictionary<string, BigAmbitions.Items.ItemInstance>();
+                            int restocked = 0;
+                            // Round-38d — CARGO AUTHORITY SHIELD. The only guest→owner interior flow is the
+                            // furniture-edit forward, and its snapshot carries the guest's REPLICA cargo — never
+                            // authoritative (all legit cargo mutations route via BStore ops). Field-proven leak
+                            // (2026-07-07): a guest's UNROUTED local register take diverged their replica; their
+                            // next furniture forward was adopted wholesale and EMPTIED the owner's real register
+                            // (''×0 at the 1467 setstock audit) — laundering a replica divergence into owner
+                            // state. When THIS machine owns the building, pre-existing items keep their LIVE
+                            // cargo; new items (a placed box) keep the snapshot's. Guests applying owner pushes
+                            // are untouched (RentedByPlayer false there).
+                            // ABSENCE-HANDBACK-1 F8: EXCEPT the absence hand-back (a SeedOrHeal snapshot of an address my
+                            // return named): that cargo IS my shop's truth - what my stand-in sold and restocked while I was
+                            // away - so it replaces my stale live cargo instead of being shielded from it.
+                            bool receiverOwnsThis = false;
+                            try { receiverOwnsThis = MergerFlip.TrulyMine(reg)
+                                                     && !(payload.SeedOrHeal && MergerAbsence.IsReturnInterior(payload.AddressKey)); } catch { }   // TrulyMine: never shield replica cargo against the true owner
+                            int cargoShielded = 0;
+                            // Stage 0 — THE HANDS RULE (user decision Q4 + F-2026-08-25-A): while an item is
+                            // in the LOCAL player's hands, no incoming message may RE-CREATE it in this
+                            // building.  Re-creation started the whole 20260823-110955 cascade: ground
+                            // ghost, ArgumentException on the next Place click, leaked previews, poisoned
+                            // AddressCached, and the sweep destroying the hand-slot visual.  Narrow by
+                            // design: only a true re-creation (id NOT locally present) is skipped — an
+                            // update to a locally-present id, and the REMOVAL of a held id (legitimate
+                            // convergence: it is what freed the id in the field episode), pass through.
+                            string? heldId = null;
+                            try { heldId = PlayerHelper.ItemInstanceInHands?.id; } catch { }
+                            _pendingLocalPlacements.TryGetValue(payload.AddressKey, out var pendingPlaced);
+                            // ── STAGE 1a (design 2026-08): PURE EXTRACTION ─────────────────────────
+                            // The ~180-line per-item body now lives in ApplyOneItem below — verbatim
+                            // logic, `continue` → `return`, locals threaded through ItemApplyCtx — so
+                            // Stage 1b's delta path can apply a single item through the IDENTICAL code
+                            // the full-snapshot path runs. NO semantic change in this build.
+                            var itemCtx = new ItemApplyCtx
+                            {
+                                Reg = reg, AddressKey = payload.AddressKey,
+                                LastSer = lastSer, NewSer = newSer, NewDict = newDict,
+                                ChangedIds = changedIds, MovedIds = movedIds, CargoOnlyIds = cargoOnlyIds,
+                                HeldId = heldId, PendingPlaced = pendingPlaced,
+                                ReceiverOwnsThis = receiverOwnsThis,
+                            };
+                            try
+                            {
+                                foreach (var i in payload.ItemInstances)
+                                    ApplyOneItem(itemCtx, i);
+                            }
+                            finally
+                            {
+                                // Review MIN-J (purity, exact): pre-move the counters WERE the locals, so a
+                                // thrown apply still logged the partial stackedInPlace count downstream —
+                                // the read-back must survive the throw the same way.
+                                restocked      = itemCtx.Restocked;
+                                cargoShielded  = itemCtx.CargoShielded;
+                                stackedInPlace = itemCtx.StackedInPlace;
+                            }
+                            // Stage 0 — THE DRAG RULE, data half (referee ADDITION 1): the id being
+                            // actively placed is in reg since drag START; placement-confirm only writes
+                            // its position, never re-adds — so a whole-set apply computing "not in the
+                            // payload → remove" mid-drag deletes it PERMANENTLY while round-48b keeps
+                            // the GameObject ("looks placed, data gone"; the toilet stall).  The busy
+                            // gate discards routine snapshots, so this guards the never-discardable
+                            // SeedOrHeal leg that can still land mid-drag.  The kept
+                            // baseline entry keeps the next diff honest.
+                            string? dragId = null;
+                            try
+                            {
+                                if (BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode)
+                                    dragId = BigAmbitions.PlacementSystem.PlacementSystem.CurrentPlaceableItemBeingPlaced?.GetItemInstance()?.id;
+                            }
+                            catch { }
+                            foreach (var k in reg.itemInstances.Keys)
+                                if (!newDict.ContainsKey(k))
+                                {
+                                    if (dragId != null && k == dragId)
+                                    {
+                                        newDict[k] = reg.itemInstances[k];   // survives; the confirm's own forward conveys it
+                                        if (lastSer.TryGetValue(k, out var dragSer)) newSer[k] = dragSer;
+                                        Plugin.Logger.LogInfo($"[Patcher] drag rule: kept '{k}' in '{payload.AddressKey}' — it is being placed on this machine and the sender cannot know it yet (Stage 0).");
+                                        continue;
+                                    }
+                                    // BLOCKER-1: placed here, not yet echoed by any incoming payload —
+                                    // the sender cannot know it; its absence is ignorance, not deletion.
+                                    if (pendingPlaced != null && pendingPlaced.TryGetValue(k, out var placedAt))
+                                    {
+                                        newDict[k] = reg.itemInstances[k];
+                                        if (lastSer.TryGetValue(k, out var pSer)) newSer[k] = pSer;
+                                        Plugin.Logger.LogInfo($"[Patcher] pending-placement rule: kept '{k}' in '{payload.AddressKey}' — placed locally {UnityEngine.Time.unscaledTime - placedAt:F0}s ago, not yet echoed (Stage 0; a never-shrinking age here means the forward was refused upstream).");
+                                        continue;
+                                    }
+                                    removedIds.Add(k);
+                                }
+                            // BLOCKER-1 prune: a pending id no longer in the local data (picked back up,
+                            // discarded) has nothing left to protect.
+                            if (pendingPlaced != null && pendingPlaced.Count > 0)
+                            {
+                                List<string>? gone = null;
+                                foreach (var pk in pendingPlaced.Keys)
+                                    if (!newDict.ContainsKey(pk)) (gone ??= new List<string>()).Add(pk);
+                                if (gone != null) foreach (var pk in gone) pendingPlaced.Remove(pk);
+                            }
+
+                            // Round-198c (field 20260730-235612, user-approved): a SMALL delta names
+                            // its items — an item rhythmically flapping in/out of snapshots was
+                            // undiagnosable because applies only logged counts. ≤3 per bucket keeps
+                            // legitimate bulk applies count-only.
+                            _deltaNames = "";
+                            try
+                            {
+                                if (removedIds.Count > 0 && removedIds.Count <= 3)
+                                    foreach (var k in removedIds)
+                                        _deltaNames += $" -[{(reg.itemInstances.TryGetValue(k, out var oi) ? oi?.itemName : "?")} {k}]";
+                                if (changedIds.Count > 0 && changedIds.Count <= 3)
+                                    foreach (var k in changedIds)
+                                        _deltaNames += $" ~[{(newDict.TryGetValue(k, out var ni) ? ni?.itemName : "?")} {k}]";
+                            }
+                            catch { _deltaNames = ""; }
+
+                            // Buyer-side purchasability (2026-06-12): hover highlight
+                            // + take-product in a shop come from playerItemPurchaserSettings
+                            // (that's what AI shops set; ItemController.Start builds the
+                            // PlayerItemPurchaser from it).  Owners replicate their items
+                            // with it DISABLED (owners manage, not buy) — enable it here
+                            // on cargo shelves so this machine can shop natively.  Price
+                            // display reads reg.retailPrices = the synced store table.
+                            int purchasable = 0;
+                            // RESIDENCE GUARD (round-15): fresh food etc. are RetailProducts, so a guest's stocked
+                            // FRIDGE qualified for shop-shelf purchaser settings — and the game then treats it as a
+                            // SHOP SHELF for NON-owners: ItemController.Interact (:492) buys instead of opening the
+                            // menu, and OverlayHelper.GetRelevantEntity's non-owner branch (:178) remaps the entity.
+                            // Buyer-purchasing only makes sense in a building that RUNS A BUSINESS — skip the rest.
+                            bool hasBusiness = false;
+                            try { hasBusiness = !string.IsNullOrEmpty(reg.businessTypeName?.ToString()); } catch { }
+                            // HELPER GUARD (round-69, user repro 2026-07-24): the shoppable flag never
+                            // discriminated HELPERS from ordinary visitors. A granted helper who stocked a
+                            // display got it flagged by the owner's echo; the flag arms on the next building
+                            // RELOAD (ItemController.Start reads it) — one exit+re-enter and the helper is
+                            // demoted to CUSTOMER: deposit-on-click gone (dropdown/shop overlay instead) and
+                            // the refill route deliberately steps aside on purchaser-enabled items. Helpers
+                            // get MANAGE affordances, not the shop flow — never flag displays on a machine
+                            // whose local player holds a helper grant here. Folding the check into
+                            // `qualifies` reuses the !qualifies branch below, which auto-DISABLES any flag
+                            // an earlier apply already set — wrongly-flagged displays heal on the next sync.
+                            bool localIsHelper = false;
+                            try { localIsHelper = GrantSync.IsHelperBusiness(payload.AddressKey); } catch { }
+                            if (hasBusiness)
+                            foreach (var kv in newDict)
+                            {
+                                var ii = kv.Value;
+                                try
+                                {
+                                    if (ii == null) continue;
+                                    // Round-34 (supersedes round-33's storage-shelf skip): buyer-purchasability
+                                    // belongs ONLY on retail DISPLAY surfaces — the game's own stock-carrier set
+                                    // (PointOfSale | ShowcaseShelf, ItemHelper.IsStockCarrier). It was landing on
+                                    // ANY cargo item holding retail products: backroom STORAGE shelves (no box
+                                    // visuals) and guest-placed BOXES — and because the OWNER adopts guest edits
+                                    // through this same apply, the flags hit the owner's machine and SAVE too
+                                    // (owner couldn't grab the box or manage the shelf; user 2026-07-04).
+                                    // Whitelist display types, skip on the owner's own machine, heal the rest.
+                                    bool qualifies = false;
+                                    try
+                                    {
+                                        qualifies = !reg.RentedByPlayer
+                                            && !localIsHelper
+                                            && ii.ItemCached != null
+                                            && (ii.ItemCached.type & (BigAmbitions.Items.ItemType.PointOfSale | BigAmbitions.Items.ItemType.ShowcaseShelf)) != 0;
+                                    }
+                                    catch { }
+                                    if (!qualifies)
+                                    {
+                                        try { if (ii.playerItemPurchaserSettings != null && ii.playerItemPurchaserSettings.enabled) ii.playerItemPurchaserSettings.enabled = false; } catch { }
+                                        continue;
+                                    }
+                                    var cargo = ii.cargoInstances;
+                                    if (cargo == null || cargo.Count == 0) continue;
+                                    if (ii.playerItemPurchaserSettings != null && ii.playerItemPurchaserSettings.enabled) continue;
+                                    string? product = null;
+                                    foreach (var c in cargo)
+                                    {
+                                        if (c == null || string.IsNullOrEmpty(c.itemName)) continue;
+                                        var it = BigAmbitions.Items.ItemsGetter.GetByName(c.itemName);
+                                        if (it != null && (it.type & BigAmbitions.Items.ItemType.RetailProduct) != 0)
+                                        { product = c.itemName; break; }
+                                    }
+                                    if (product == null) continue;
+                                    ii.playerItemPurchaserSettings = new BigAmbitions.Items.PlayerItemPurchaserSettings
+                                    {
+                                        enabled      = true,
+                                        itemName     = product,
+                                        itemQuantity = 1,
+                                    };
+                                    purchasable++;
+                                }
+                                catch { }
+                            }
+                            if (purchasable > 0)
+                                Plugin.Logger.LogInfo($"[Patcher] enabled buyer purchasing on {purchasable} cargo shelf/shelves for '{payload.AddressKey}'.");
+
+                            if (restocked > 0)
+                                Plugin.Logger.LogInfo($"[Patcher] {restocked} item(s) restocked IN PLACE for '{payload.AddressKey}' (live objects kept; native cargo callbacks fired).");
+                            if (cargoShielded > 0)
+                                Plugin.Logger.LogInfo($"[Patcher] cargo authority shield kept OWNER cargo on {cargoShielded} item(s) for '{payload.AddressKey}' (guest-edit adoption carries replica cargo — never authoritative).");
+                            reg.itemInstances.Clear();
+                            foreach (var kv in newDict) reg.itemInstances[kv.Key] = kv.Value;
+                            _lastItemSer[payload.AddressKey] = newSer;
+                            }
+                        }
+                    }
+                    catch (Exception ex) { appliedFully = false; Plugin.Logger.LogWarning($"[Patcher] itemInstances apply: {ex.Message}"); }   // round-281b: a thrown apply is not a baseline
+
+                    // Round-39d — Phase 3 customer presence: seed the local shopper table from the owner's
+                    // schedule (no-op on the owner; local completed flags preserved inside SeedFor).
+                    try
+                    {
+                        if (payload.Authoritative && payload.CustomerEntries != null && payload.CustomerEntries.Count > 0)
+                            CustomerEntrySync.SeedFor(reg, payload.CustomerEntries);
+                        // H-SALEHOLE-1 (log-only): a FLIPPED address whose interior payload brings no shopper
+                        // schedule at all never reaches the seed — a different hole from the seed's own skip,
+                        // and indistinguishable from it in the field log until now. Same 60-line budget.
+                        else if ((payload.CustomerEntries == null || payload.CustomerEntries.Count == 0)
+                                 && MergerFlip.IsFlipped(payload.AddressKey))
+                            CustomerEntrySync.NoteEmptyInteriorPayload(payload.AddressKey, payload.Authoritative, reg.businessTypeName ?? "");   // batch 16b: the TYPE tells a genuine hole from an HQ/warehouse that never has shoppers
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] customer-entry seed: {ex.Message}"); }
+                    // Round-39e — complaint parity: adopt the owner's fulfilled-demand set so the seeded
+                    // customers complain about the RIGHT things (never on the owner's own machine).
+                    try
+                    {
+                        // Batch 16b: TrulyMine, not the raw flag — under a merger flip a MEMBER read its own
+                        // name on a PARTNER's shop and refused the owner's fulfilled-demand set, so the seeded
+                        // customers there complained about the wrong things.
+                        if (payload.Authoritative && !MergerFlip.BooksHere(reg)
+                            && payload.FulfilledDemands != null && payload.FulfilledDemands.Count > 0)
+                            reg.cachedFulfilledCustomerDemands = new System.Collections.Generic.List<string>(payload.FulfilledDemands);
+                    }
+                    catch { }
+
+                    Plugin.Logger.LogInfo($"[Patcher] Interior applied for '{payload.AddressKey}': layout='{payload.Layout}' {InteriorSync.SnapshotSummary(payload)} (changed={changedIds.Count} moved={movedIds.Count} cargoOnly={cargoOnlyIds.Count} stackedInPlace={stackedInPlace} removed={removedIds.Count}){_deltaNames}.");
+                    // MERGER PHASE 3-C r2 (F1c): THE RETURN SET IS CONSUMED HERE, and nowhere else - this is
+                    // the one point at which this snapshot's items and designs are actually on the local
+                    // copy. Every refusal and every deferral returns ABOVE this line (the S4-identical skip -
+                    // which, since ABSENCE-HANDBACK-1 F7, consumes a return address itself: this machine already
+                    // holds that exact state -, the round-178 owner guard, the round-184 resurrection window, the all-zero refusal, the
+                    // no-registration miss, the non-authoritative skip and the mid-edit busy gate), so a
+                    // return snapshot that did not land still finds its address in the set when the host
+                    // re-sends or the re-ask is answered. A return whose host copy is EMPTY reaches here too
+                    // and drains the set exactly like a full one, so the set can never be left holding an
+                    // address for a much later generic heal to walk through (r1 m4).
+                    // ABSENCE-HANDBACK-1 R2: the two refusals above that can meet a hand-back (all-zero, no registration) and
+                    // the throw below now ANSWER the host ("return-interior-refused"), so its hold ends there too.
+                    if (payload.SeedOrHeal) MergerAbsence.ConsumeReturnInterior(payload.AddressKey);
+                    // ABSENCE-HANDBACK-1 R4: a client stand-in confirms the host's authoritative copy is on its machine.
+                    // fold 2 (D3): NOT when the empty-set guard kept this machine's own items - its copy is not the host's then.
+                    if (payload.SeedOrHeal && !itemsKeptOverEmpty) MergerAbsence.NoteSeedApplied(payload.AddressKey, payload.Authoritative);
+                    else if (payload.SeedOrHeal && payload.Authoritative && MergerAbsence.SimulatesHere(payload.AddressKey))
+                        Plugin.Logger.LogWarning($"[Absence] stand-in: the host's copy of '{payload.AddressKey}' carries no items and my own were kept - "
+                                               + "not confirmed as applied (my uploads of it stay refused).");
+                    InteriorSync.NoteSnapshotApply(payload.AddressKey);   // round-213: re-send-loop detector
+                    // Round-281: this apply COMPLETED, so it is now the baseline for both guards —
+                    // the S4-lite duplicate test above, and the struct version every incoming cargo
+                    // sync is measured against.  (Stage 3: with the 140 gone, every payload reaching
+                    // here is host-stream / owner-push / seed-heal traffic, so the version and the
+                    // owed-clear record unconditionally — the grantedEdit exclusions folded away.)
+                    // Verification MAJOR-C: an apply whose design bands were withheld is a PARTIAL
+                    // apply — recording it as a baseline would let the S4-lite skip absorb the very
+                    // re-send that must deliver those bands after the designer closes, and clearing
+                    // the owed entry would end the recurrence entirely (an entry serve only repeats
+                    // on re-entry).  So: no baseline (the identical answer stays news, round-281b),
+                    // and the address is RE-OWED so the drain re-fetches at designer close.
+                    if (skipDesignBands)
+                    {
+                        appliedFully = false;
+                        // Round-3 verification MAJOR-G: INVALIDATE the baselines, don't merely skip
+                        // refreshing them — the old fully-applied sig survives a partial, and since
+                        // LocalInteriorTag is three COUNTS (blind to a paint session, which recolors
+                        // existing UUIDs), a later answer byte-equal to an older applied payload could
+                        // S4-match the stale baseline, skip, and CLEAR the bands debt unpaid.
+                        _lastAppliedSig.Remove(payload.AddressKey);
+                        _lastAppliedLocalTag.Remove(payload.AddressKey);
+                        InteriorSync.NoteResyncOwed(payload.AddressKey, "design bands deferred (designer open here)");
+                    }
+                    if (appliedFully)
+                    {
+                        _lastAppliedSig[payload.AddressKey]      = applySig;
+                        _lastAppliedLocalTag[payload.AddressKey] = LocalInteriorTag(reg);   // what our copy looks like NOW
+                        _lastAppliedStructVersion[payload.AddressKey] = payload.StructVersion;
+                        // Stage 0 review MAJOR-6: the owed entry retires only when an authoritative
+                        // apply actually COMPLETES here — never at re-ask time (fire-and-forget lost
+                        // the answer whenever the owner's push deferred or skipped).
+                        InteriorSync.ClearResyncOwed(payload.AddressKey);
+                        InteriorSync.HostNoteWorldApplied(payload);   // ABSENCE-HANDBACK-1 fold 2 (D1 b): a FULL apply only
+                    }
+                    else
+                        Plugin.Logger.LogInfo($"[Patcher] baseline NOT recorded for '{payload.AddressKey}' — " +
+                            (skipDesignBands ? "design bands were deliberately withheld (designer open), so the re-send must stay news (Stage 0)."
+                                             : "the apply was refused or threw, so an identical re-send stays news (round-281b)."));
+
+                    // Trigger a visual refresh of the interior IF the local
+                    // player is currently inside THIS building.  Writing to
+                    // reg.* only updates the data model; the walls/floor/items
+                    // GameObjects were already instantiated from stale data
+                    // when LoadBuilding ran on entry.  Calling LoadBuilding
+                    // again re-runs the full pipeline (layout, designs, items)
+                    // against the now-fresh fields.
+                    TryRefreshActiveInteriorIfMatches(payload.AddressKey, changedIds, removedIds, changedDesignUuids, _layoutChanged, movedIds);
+                    // H2 (2026-09-12): a Hamptons house does not rebuild from an interior write. Its
+                    // loader is one-shot — HamptonsHouse.LoadItemsIfNeeded (decompile :349) is
+                    // IsHouseLoaded-gated — so a visitor already standing at LOD0 keeps the empty house
+                    // it loaded before the owner's snapshot arrived.
+                    // D3a (2026-09-19): this apply KNOWS which ids it touched, so the redraw is now
+                    // incremental; the whole-house ReloadHouseCoroutine(true) (decompile :64-86, ~1500
+                    // objects destroyed and re-instantiated in one frame) is kept as the fallback for an
+                    // apply that carries no diff information, and for one that repainted or re-laid-out
+                    // the house — the paint lives in ApplyInteriorDesign, which only that coroutine runs.
+                    TryReloadHamptonsHouseAfterApply(payload.AddressKey, reg, changedIds, removedIds,
+                        movedIds, "snapshot", changedDesignUuids.Count > 0 || _layoutChanged);
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogWarning($"[Patcher] ApplyInteriorSnapshot: {ex.Message}");
+                    // ABSENCE-HANDBACK-1 R2: a hand-back that threw before its commit (still in the return set) answers the host.
+                    try
+                    {
+                        if (payload.SeedOrHeal && MergerAbsence.IsReturnInterior(payload.AddressKey))
+                            MergerAbsence.RefuseReturnInterior(payload.AddressKey, "the apply threw: " + ex.Message);
+                    }
+                    catch { }
+                }
+            });
+        }
+
+        // ── STAGE 1a (design 2026-08): the per-item apply, extracted ─────────────────────────────
+        // PURE extraction of the full-snapshot path's per-item body (verbatim; `continue`→`return`).
+        // The context object threads the caller's per-apply locals through unchanged — collections
+        // are the caller's own references (no copy-back needed); the three counters are read back
+        // after the loop. Stage 1b's BuildingInteriorDelta upserts will call this same method so a
+        // single-item delta and a full snapshot apply one item through IDENTICAL code (round-37j
+        // flatbed model, round-278/F3 stacked lists, round-137 queue, task-28 factory config,
+        // round-38d cargo shield, Stage 0 hands rule + pending-placement echo all included).
+        private sealed class ItemApplyCtx
+        {
+            public BuildingRegistration Reg = null!;
+            public string AddressKey = "";
+            public Dictionary<string, string> LastSer = null!;
+            public Dictionary<string, string> NewSer = null!;
+            public Dictionary<string, BigAmbitions.Items.ItemInstance> NewDict = null!;
+            public HashSet<string> ChangedIds = null!;
+            public HashSet<string> MovedIds = null!;
+            public HashSet<string> CargoOnlyIds = null!;
+            public string? HeldId;
+            public Dictionary<string, float>? PendingPlaced;
+            public bool ReceiverOwnsThis;
+            public int Restocked, CargoShielded, StackedInPlace;
+        }
+
+        private static void ApplyOneItem(ItemApplyCtx ctx, ItemInstanceInfo i)
+        {
+            if (string.IsNullOrEmpty(i.Id)) return;
+            // BLOCKER-1: the ECHO — a payload that CONTAINS the id proves the wire
+            // has carried our placement; the removal protection retires.
+            if (ctx.PendingPlaced != null && ctx.PendingPlaced.Remove(i.Id) && ctx.PendingPlaced.Count == 0)
+                _pendingLocalPlacements.Remove(ctx.AddressKey);
+            if (ctx.HeldId != null && i.Id == ctx.HeldId && !ctx.Reg.itemInstances.ContainsKey(i.Id))
+            {
+                Plugin.Logger.LogInfo($"[Patcher] hands rule: skipped re-creating '{i.ItemName}' ({i.Id}) in '{ctx.AddressKey}' — it is in the local player's hands (Stage 0).");
+                return;   // also kept out of newSer: if it lands back here later, the diff treats it as news
+            }
+            string ser = Newtonsoft.Json.JsonConvert.SerializeObject(i);
+            ctx.NewSer[i.Id] = ser;
+            if (ctx.LastSer.TryGetValue(i.Id, out var prev) && prev == ser
+                && ctx.Reg.itemInstances.TryGetValue(i.Id, out var live) && live != null)
+            {
+                ctx.NewDict[i.Id] = live;   // unchanged → keep the live object
+                return;
+            }
+            var ii = DeserializeItemInstance(i);
+            if (ii == null) return;
+            // Round-37j — IN-PLACE APPLY (the flatbed model, user-mandated after the 6th
+            // destroy+respawn bug): deltas that don't change WHAT the item is keep the LIVE
+            // ItemInstance object — its native callbacks (ShelfController.UpdateVisuals et al,
+            // wired at Start) and any PlacementSystem references stay valid. IdentitySig is
+            // 'core#cargo#stacked':
+            //   whole sig equal            → transform-only  → move in place (round-22);
+            //   core+stacked equal         → cargo-only      → swap the cargo list on the live
+            //                                 object + fire the native cargo callback (visuals
+            //                                 refresh exactly like a local deposit);
+            //   core or stacked changed    → a genuinely different item → destroy+respawn.
+            if (ctx.Reg.itemInstances.TryGetValue(i.Id, out var prevLive) && prevLive != null)
+            {
+                string ns = IdentitySig(i), ls = IdentitySig(prevLive);
+                bool transformOnly = ns == ls;
+                bool cargoOnly = false, stackedOnly = false;
+                if (!transformOnly)
+                {
+                    var np = ns.Split('#'); var lp = ls.Split('#');
+                    cargoOnly = np.Length == 3 && lp.Length == 3 && np[0] == lp[0] && np[2] == lp[2];
+                    // Round-278/F3 (field 20260818-222130): an attachment-list-only delta is
+                    // NOT a different item.  Destroying the parent took its attached children
+                    // down as Unity collateral — the guest attaching to the host's counter ate
+                    // the till the counter carried.  The stacked list swaps onto the live
+                    // object; the child travels under its OWN id and the post-spawn re-link
+                    // attaches it to this kept parent.
+                    stackedOnly = !cargoOnly && np.Length == 3 && lp.Length == 3 && np[0] == lp[0] && np[1] == lp[1];
+                }
+                // Task-28 fix 1: a workstation arriving where a base copy lives (or vice
+                // versa) cannot be updated in place — the TYPE is wrong; fall through to
+                // destroy+respawn, which heals a previously type-erased copy.
+                bool typeMismatch = (ii is FactoryWorkstationInstance) != (prevLive is FactoryWorkstationInstance);
+                if (!typeMismatch && (transformOnly || cargoOnly || stackedOnly))
+                {
+                    if (cargoOnly)
+                    {
+                        if (ctx.ReceiverOwnsThis)
+                        {
+                            ctx.CargoShielded++;         // keep the live (owner-true) cargo
+                        }
+                        else
+                        {
+                            prevLive.cargoInstances = ii.cargoInstances;
+                            try { prevLive.OnItemsInCargoUpdated()?.Invoke(); } catch { }
+                            ctx.Restocked++;
+                        }
+                    }
+                    else if (stackedOnly)
+                    {
+                        prevLive.stackedItems = ii.stackedItems;   // round-278/F3: in-place attachment-list update
+                        ctx.StackedInPlace++;
+                    }
+                    // Round-86b (user-approved, MEASURED): the move pass's ONLY effects are a
+                    // controller rebind (same live object → no-op) and a transform set — so when
+                    // the position/rotation did NOT actually change, there is provably nothing
+                    // left to do. Bucketing sales (cargo-only deltas) into movedIds opened the
+                    // itemWork gate and ran the ~120ms whole-scene ItemController scan every 2s
+                    // in a busy shop. Only a REAL pose delta feeds movedIds now.
+                    bool posDelta = false;
+                    try
+                    {
+                        posDelta = prevLive.position.x != ii.position.x
+                                || prevLive.position.y != ii.position.y
+                                || prevLive.position.z != ii.position.z
+                                || prevLive.yRotation  != ii.yRotation;
+                    }
+                    catch { posDelta = true; }           // can't compare → conservative: full move pass
+                    prevLive.position  = ii.position;    // data transform follows the wire
+                    prevLive.yRotation = ii.yRotation;
+                    // ROUND-137: the drawn queue (customPositions) was FROZEN on every
+                    // receiver - this branch copied pose+cargo only and the diff hash
+                    // ignored the field, so each machine kept its own version forever
+                    // (field-proved: custPos=8 on the placer vs a truncated 4 here, whose
+                    // lone stored spot then blocked the native rebuild -> a 1-spot till
+                    // every session).  Copy on change and rebuild the live line.
+                    try
+                    {
+                        var incQ = ii.customPositions;
+                        if (incQ != null && incQ.Count > 0)
+                        {
+                            var curQ = prevLive.customPositions;
+                            bool qDelta = curQ == null || curQ.Count != incQ.Count;
+                            if (!qDelta)
+                                for (int qi = 0; qi < incQ.Count; qi++)
+                                {
+                                    UnityEngine.Vector3 qa = incQ[qi], qb = curQ[qi];
+                                    if ((qa - qb).sqrMagnitude > 0.0001f) { qDelta = true; break; }
+                                }
+                            if (qDelta)
+                            {
+                                prevLive.customPositions = incQ;
+                                MPRegisterSync.RebuildDrawnQueueAt(
+                                    new UnityEngine.Vector3(ii.position.x, ii.position.y, ii.position.z), ii.id, incQ);
+                            }
+                        }
+                        else if (prevLive.customPositions != null && prevLive.customPositions.Count > 0)
+                        {
+                            // Task-28 fix 3: the owner's copy holds NO line data (moving-service
+                            // reset, or a poison-stripped sender) — follow it.  ResetQueueAt
+                            // rebuilds the live line at its template position and re-nulls the
+                            // data copy afterwards (Reset's callback writes the rebuilt line
+                            // back into the instance), so repeated empty pushes are no-ops.
+                            prevLive.customPositions = null;
+                            MPRegisterSync.ResetQueueAt(
+                                new UnityEngine.Vector3(ii.position.x, ii.position.y, ii.position.z), prevLive);
+                        }
+                    }
+                    catch { }
+                    // Task-28 fix 3: the dirt footprint follows the wire — native recomputes it
+                    // only at placement-confirm on the MOVING machine, so the pose-only copy
+                    // above left ours stale after moves (dirt kept appearing at the item's OLD
+                    // footprint on the simulating machine).
+                    try
+                    {
+                        var incD = ii.dirtSpotsThatAffects;
+                        var curD = prevLive.dirtSpotsThatAffects;
+                        bool dDelta = (incD?.Count ?? 0) != (curD?.Count ?? 0);
+                        if (!dDelta && incD != null && curD != null)
+                            for (int di = 0; di < incD.Count; di++)
+                                if (incD[di] != curD[di]) { dDelta = true; break; }
+                        if (dDelta) prevLive.dirtSpotsThatAffects = incD;
+                    }
+                    catch { }
+                    // Task-28 fix 1 (in-place leg): factory config follows the wire on the LIVE
+                    // instance — a recipe/priority edit needs no respawn.
+                    try
+                    {
+                        if (prevLive is FactoryWorkstationInstance pfw && ii is FactoryWorkstationInstance nfw)
+                        {
+                            bool recipeChanged = pfw.selectedRecipeId != nfw.selectedRecipeId;
+                            if (recipeChanged || pfw.priority != nfw.priority || pfw.produceUpTo != nfw.produceUpTo
+                                || pfw.produceUpToValue != nfw.produceUpToValue || pfw.workstationType != nfw.workstationType)
+                            {
+                                pfw.selectedRecipeId = nfw.selectedRecipeId;
+                                pfw.priority         = nfw.priority;
+                                pfw.produceUpTo      = nfw.produceUpTo;
+                                pfw.produceUpToValue = nfw.produceUpToValue;
+                                pfw.workstationType  = nfw.workstationType;
+                                // Slice-6 review #5: tell the work-tab scan this write is NOT a
+                                // user edit — a stale in-flight snapshot could otherwise be routed
+                                // back and silently revert the owner's config.
+                                try { SharedShopWorkTabs.OnExternalWorkstationWrite(pfw); } catch { }
+                                // native tools announce recipe edits with exactly this event; the
+                                // assembly controller re-reads its config on it
+                                if (recipeChanged) try { GameEvent.Invoke("ba:gameevent_onfactorymachinerecipechanged"); } catch { }
+                            }
+                        }
+                    }
+                    catch { }
+                    ctx.NewDict[i.Id] = prevLive;            // KEEP the live object
+                    if (posDelta) ctx.MovedIds.Add(i.Id);    // GameObject transform sync pass
+                    else ctx.CargoOnlyIds.Add(i.Id);         // in-place restock/no-op — nothing to refresh
+                    return;
+                }
+                // H-REFRESHSEAT-1 diagnostic: WHICH identity field sends this item through destroy+respawn
+                // (a partner edit hit 9 restaurant booths in the field and the log never said why).
+                try
+                {
+                    if (_respawnWhyLines < 20)
+                    {
+                        _respawnWhyLines++;
+                        var rwWhy = new List<string>();
+                        if (typeMismatch) rwWhy.Add("type");
+                        var rwN = ns.Split('#'); var rwL = ls.Split('#');
+                        string rwNc = rwN.Length > 0 ? rwN[0] : "", rwLc = rwL.Length > 0 ? rwL[0] : "";
+                        if (rwNc != rwLc)
+                        {
+                            string[] rwNames = { "name", "parent", "linked", "secured", "state", "alias", "custom", "worldtext", "priceOnPurchase" };
+                            var rwNf = rwNc.Split('|'); var rwLf = rwLc.Split('|');
+                            for (int rk = 0; rk < rwNames.Length; rk++)
+                                if ((rk < rwNf.Length ? rwNf[rk] : "") != (rk < rwLf.Length ? rwLf[rk] : "")) rwWhy.Add(rwNames[rk]);
+                            string rwNp = rwNf.Length > rwNames.Length ? string.Join("|", rwNf, rwNames.Length, rwNf.Length - rwNames.Length) : "";
+                            string rwLp = rwLf.Length > rwNames.Length ? string.Join("|", rwLf, rwNames.Length, rwLf.Length - rwNames.Length) : "";
+                            if (rwNp != rwLp) rwWhy.Add("paint");
+                        }
+                        if ((rwN.Length > 1 ? rwN[1] : "") != (rwL.Length > 1 ? rwL[1] : "")) rwWhy.Add("cargo");
+                        if ((rwN.Length > 2 ? rwN[2] : "") != (rwL.Length > 2 ? rwL[2] : "")) rwWhy.Add("stacked");
+                        Plugin.Logger.LogInfo($"[Patcher] '{i.Id}' ('{i.ItemName}') respawns: core field(s) changed: {(rwWhy.Count > 0 ? string.Join(",", rwWhy) : "none")}.");
+                    }
+                }
+                catch { }
+                // Core/stacked changed → respawn below; the shield still applies: the
+                // replacement keeps the OWNER's live cargo, not the guest replica's.
+                if (ctx.ReceiverOwnsThis)
+                {
+                    ii.cargoInstances = prevLive.cargoInstances;
+                    ctx.CargoShielded++;
+                }
+            }
+            ctx.NewDict[i.Id] = ii;
+            ctx.ChangedIds.Add(i.Id);
+        }
+
+        // ── Round-281: cargo sync (receiver) ──────────────────────────────────────────────────────
+        // Per-address baselines for the two round-281 guards.  `_lastAppliedSig` is the S4-lite
+        // duplicate test; `_lastAppliedStructVersion` is which STRUCTURE this machine actually holds,
+        // recorded from the last full snapshot that ran to completion.
+        private static readonly Dictionary<string, string> _lastAppliedSig           = new(StringComparer.Ordinal);
+        private static readonly Dictionary<string, string> _lastAppliedLocalTag      = new(StringComparer.Ordinal);
+        private static readonly Dictionary<string, int>    _lastAppliedStructVersion = new(StringComparer.Ordinal);
+
+        // ── Stage 0 review BLOCKER-1: locally-placed ids the wire has not echoed yet ──────────
+        // A NEW item is inserted into reg at placement START and forwarded at CONFIRM; until some
+        // incoming payload CONTAINS the id (the echo — the world now knows it), no whole-set apply
+        // may compute it as a removal.  Without this, the drain's own re-request answer — built
+        // from a copy that cannot know the item yet, arriving SeedOrHeal so no gate stops it, in
+        // the same frame the drag rule went inert — deterministically deleted the item just
+        // placed.  Event-cleared (echo / local disappearance), never time-expired; a block is
+        // logged each time so a never-echoing id (an upstream-refused forward) stays visible.
+        // MAIN THREAD ONLY.  addr → (id → realtime noted).
+        private static readonly Dictionary<string, Dictionary<string, float>> _pendingLocalPlacements = new(StringComparer.Ordinal);
+
+        /// <summary>Called from the TryToStartPlacingItem postfix — the moment the game inserts a
+        /// new-from-hands item into the building's data.</summary>
+        public static void NotePendingLocalPlacement(string addressKey, string id)
+        {
+            if (string.IsNullOrEmpty(addressKey) || string.IsNullOrEmpty(id)) return;
+            if (!_pendingLocalPlacements.TryGetValue(addressKey, out var set))
+                _pendingLocalPlacements[addressKey] = set = new Dictionary<string, float>(StringComparer.Ordinal);
+            set[id] = UnityEngine.Time.unscaledTime;
+        }
+
+        /// <summary>Session hygiene — called from InteriorSync.Reset (scene-ready).</summary>
+        public static void ClearPendingLocalPlacements() { _pendingLocalPlacements.Clear(); _deferredDeltaRemoves.Clear(); }
+
+        // ── Stage 1b review MAJOR-M: remove ops deferred past a local drag of the same id ────────
+        // A named remove's information exists nowhere else once dropped; while the id is being moved
+        // HERE, the remove waits and executes the moment the drag ends. addr → ids. MAIN THREAD ONLY.
+        private static readonly Dictionary<string, HashSet<string>> _deferredDeltaRemoves = new(StringComparer.Ordinal);
+        /// <summary>Verification MINOR-T: cheap emptiness probe so the per-frame belt can fast-path out.</summary>
+        internal static bool HasDeferredDeltaRemoves => _deferredDeltaRemoves.Count > 0;
+
+        /// <summary>Drains at drag end (the StopPlacingItem postfix, alongside the owed-resync drain)
+        /// plus the 2 s belt. Executes each deferred remove whose id is no longer being dragged, then
+        /// RE-CONVEYS the removal: this machine's own confirm forward (which fired an instant earlier
+        /// in the same frame) re-asserted the item to everyone, so without re-conveyance the remove
+        /// would win here and lose everywhere else. A guest re-forwards (the diff emits the remove);
+        /// an owner's own send channels carry the absence on their next beat (hash moved).</summary>
+        public static void DrainDeferredDeltaRemoves()
+        {
+            if (_deferredDeltaRemoves.Count == 0) return;
+            // Verification MINOR-S: no draining while ANY placement is active — the re-convey diffs
+            // the whole registration, and a different item's mid-drag pose must not be asserted (the
+            // owner-push path has PlacementQuiescedAt for exactly this; the diff path keeps the
+            // broader ANY-drag rule deliberately — reviewed as MINOR-S, and a drain is rare enough
+            // that per-address precision buys nothing). The exact game variable, not a proxy; the
+            // StopPlacingItem postfix fires
+            // with this already false, and the 2 s belt re-tries — recurrence-covered.
+            try { if (BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode) return; } catch { }
+            try
+            {
+                List<string>? doneAddrs = null;
+                foreach (var kv in _deferredDeltaRemoves)
+                {
+                    string addr = kv.Key; var ids = kv.Value;
+                    var reg = FindRegistration(addr);
+                    var removedIds = new HashSet<string>();
+                    List<string>? doneIds = null;
+                    foreach (var id in ids)
+                    {
+                        (doneIds ??= new List<string>()).Add(id);
+                        if (reg?.itemInstances != null && reg.itemInstances.Remove(id))
+                        {
+                            removedIds.Add(id);
+                            // Verification BLOCKER-R: the baseline entry is deliberately KEPT — the
+                            // re-convey's diff emits a remove only for an id present in the baseline
+                            // and absent from live; deleting it here silenced the re-convey and let
+                            // the confirm's upsert stand (duplication, round-10 #3b). The builder
+                            // itself reconciles the baseline in the same call that emits the remove.
+                            Plugin.Logger.LogInfo($"[Patcher] deferred delta REMOVE of '{id}' in '{addr}' executed at drag end (Stage 1b) — the removal wins over the local move.");
+                        }
+                    }
+                    if (doneIds != null) foreach (var id in doneIds) ids.Remove(id);
+                    if (ids.Count == 0) (doneAddrs ??= new List<string>()).Add(addr);
+                    if (removedIds.Count > 0)
+                    {
+                        TryRefreshActiveInteriorIfMatches(addr, new HashSet<string>(), removedIds,
+                            changedDesignUuids: new HashSet<string>(), layoutChanged: false, movedIds: new HashSet<string>());
+                        // Re-convey: the confirm forward that just fired re-asserted the item; the
+                        // removal must overtake it. Guests forward the diff; owners' own channels
+                        // (tick/immediate push — the hash moved) carry the absence.
+                        if (!InteriorSync.OwnsAddressLocally(addr))
+                            InteriorSync.ForwardGuestInteriorEditDelta(addr);
+                        else if (!MPServer.IsRunning)
+                            InteriorSync.PushOwnedBuildingNow(addr);
+                    }
+                }
+                if (doneAddrs != null) foreach (var a in doneAddrs) _deferredDeltaRemoves.Remove(a);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] DrainDeferredDeltaRemoves: {ex.Message}"); }
+        }
+        private static readonly Dictionary<string, int>    _applySkipCount           = new(StringComparer.Ordinal);
+        private static readonly Dictionary<string, float>  _applySkipLoggedAt        = new(StringComparer.Ordinal);
+        private static readonly Dictionary<string, float>  _cargoReRequestedAt       = new(StringComparer.Ordinal);
+        private const float ApplySkipLogSeconds  = 60f;
+        private const float CargoReRequestSeconds = 5f;
+
+        /// <summary>A coarse fingerprint of what THIS machine's copy of an interior currently looks
+        /// like.  Recorded right after an apply and re-checked before the S4-lite skip, so anything
+        /// that rewrote the registration out-of-band — a save load, a heal, a native teardown — turns
+        /// the next repeat payload back into news instead of a skip.  Deliberately coarse and O(1):
+        /// this runs on the hot receive path, and its job is to catch a REPLACED copy, not to audit
+        /// one.  A null registration returns a distinct tag, so "gone" never matches "present".</summary>
+        private static string LocalInteriorTag(BuildingRegistration? reg)
+        {
+            if (reg == null) return "none";
+            try { return $"{reg.itemInstances?.Count ?? -1}:{reg.interiorDesigns?.Count ?? -1}:{reg.dirtSpots?.Count ?? -1}"; }
+            catch { return "unreadable"; }
+        }
+
+        /// <summary>The full snapshot's dirt apply (fold cleanfix2 G1, 2026-09-28): a network apply NEVER changes the length of
+        /// the local dirt list. The game sizes registration.dirtSpots itself - one entry per floor cell
+        /// (BuildingCleanlinessHelper.GetDirtSpotsForBuilding), regrown only on building entry when the counts differ
+        /// (BuildingManager) - and a floor cell's index is its sibling position (DirtSpotObject.DirtSpot). The old
+        /// clear-and-rebuild left a SHORTER list under cells with a larger index range, so the next stroke on a tail cell read
+        /// past the end (MopController.FloorCellClick has no length check), threw inside its coroutine and fused the mop.
+        /// Values are now updated IN PLACE, like the band path (ApplyInteriorDirtSync):
+        ///  - equal counts: copied by index after the X/Z check (the band's load-bearing guard - X/Z alone is not unique
+        ///    across stacked storeys); if any index fails that check the whole list is paired by X/Z instead (below);
+        ///  - different counts: paired by X/Z, the Nth local entry of a tile taking the Nth incoming entry of that tile (both
+        ///    lists are built storey by storey in the same order); the local length is kept;
+        ///  - local list empty or shorter than the incoming one: first regrown with the game's own GetDirtSpotsForBuilding
+        ///    (only when that yields MORE cells - it never shortens; X/Z-matching values carried over; RegrowDirtLattice).
+        /// A local entry with no incoming match keeps its value. Every write goes through StrokeGuard.Clamp while this
+        /// machine's stroke is live, so a mid-stroke snapshot never re-dirties the stroke's cells - and applying mid-stroke is
+        /// safe because the list never shrinks under the stroke. Main thread; allocates only when the lists do not align.</summary>
+        internal static void ApplySnapshotDirt(BuildingRegistration reg, List<DirtSpotInfo> spots, string addr, string source)
+        {
+            if (reg?.dirtSpots == null || spots == null) return;
+            int before = reg.dirtSpots.Count, m = spots.Count, regrown = -1;
+            if (before == 0 || before < m) regrown = RegrowDirtLattice(reg, addr);
+            var local = reg.dirtSpots;
+            if (local == null) return;
+            int n = local.Count, matched = 0, unmatched = 0, clamped = 0, touched = 0;
+            bool paired = false;
+            bool mopProbe = MopProbe.LiveOn(reg);   // [PROBE:P-CLEANLOOP] log-only: does this apply raise a live stroke's cells?
+            if (mopProbe) MopProbe.Snap(reg);
+            // H-CLEANLOOP-1 fix F1: a live local mop stroke's cells take min(incoming, local) - StrokeGuard.
+            bool strokeGuard = StrokeGuard.Begin(reg);
+            bool live = StrokeGuard.LiveOn(reg);
+            try
+            {
+                if (n == m)
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        var ds = local[i];
+                        if (ds == null) continue;
+                        var s = spots[i];
+                        if (s == null || s.X != ds.x || s.Z != ds.z) { unmatched++; continue; }   // lattice order divergence (or the owner's null placeholder, G3)
+                        SnapshotDirtWrite(i, ds, s.Dirtiness, strokeGuard, ref matched, ref clamped, ref touched);
+                    }
+                }
+                if (n > 0 && m > 0 && (n != m || unmatched > 0))
+                {
+                    paired = true;
+                    matched = 0; unmatched = 0; clamped = 0;   // the pairing pass re-writes the aligned entries with the same values
+                    var head = new Dictionary<long, int>(m);
+                    var nextOf = new int[m];
+                    for (int j = m - 1; j >= 0; j--)
+                    {
+                        nextOf[j] = -1;
+                        var s = spots[j];
+                        if (s == null) continue;
+                        long k = DirtKey(s.X, s.Z);
+                        if (head.TryGetValue(k, out var h)) nextOf[j] = h;
+                        head[k] = j;
+                    }
+                    for (int i = 0; i < n; i++)
+                    {
+                        var ds = local[i];
+                        if (ds == null) continue;
+                        long k = DirtKey(ds.x, ds.z);
+                        if (!head.TryGetValue(k, out var j)) { unmatched++; continue; }   // no incoming entry for this tile: keeps its value
+                        if (nextOf[j] >= 0) head[k] = nextOf[j]; else head.Remove(k);
+                        SnapshotDirtWrite(i, ds, spots[j].Dirtiness, strokeGuard, ref matched, ref clamped, ref touched);
+                    }
+                }
+                else if (n > 0 && m == 0) unmatched = n;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] dirtSpots apply ({source}) for '{addr}': {ex.Message}"); }
+            if (strokeGuard) StrokeGuard.End(reg, source);
+            if (mopProbe) MopProbe.AfterWrite(reg, source);
+            _sdIncoming = m; _sdBefore = before; _sdAfter = local.Count; _sdRegrown = regrown; _sdMatched = matched;
+            _sdUnmatched = unmatched; _sdClamped = clamped; _sdTouched = touched; _sdLive = live; _sdPaired = paired;
+            if (paired || regrown >= 0) NoteSnapshotDirtAlign(addr, source);
+        }
+
+        private static void SnapshotDirtWrite(int i, DirtSpot ds, float incoming, bool strokeGuard, ref int matched, ref int clamped, ref int touched)
+        {
+            matched++;
+            float v = incoming;
+            if (strokeGuard) { v = StrokeGuard.Clamp(i, v, ds.dirtiness); if (v != incoming) clamped++; }   // F1: a live stroke's cell is never raised
+            if (ds.dirtiness != v) { ds.dirtiness = v; touched++; }
+        }
+
+        private static long DirtKey(int x, int z) => ((long)x << 32) | (uint)z;
+
+        // G1: the last full-snapshot dirt apply (the alignment log line and the DEV `dirtshrink` lever) and the band's line count
+        // (the DEV `dirtstate` lever - CTRL-NOSEED). Plain counters, written on the main thread only.
+        private static int _sdIncoming = -1, _sdBefore = -1, _sdAfter = -1, _sdRegrown = -1, _sdMatched, _sdUnmatched, _sdClamped, _sdTouched;
+        private static bool _sdLive, _sdPaired;
+        internal static int DirtSyncLines, DirtSyncTouched;
+        internal static string SnapshotDirtStats() =>
+            $"incoming={_sdIncoming} localBefore={_sdBefore} localAfter={_sdAfter} regrown={_sdRegrown} pairedByXZ={_sdPaired} matched={_sdMatched} unmatched={_sdUnmatched} clamped={_sdClamped} touched={_sdTouched} liveStroke={_sdLive}";
+
+        private static readonly Dictionary<string, float> _sdNoteAt = new(StringComparer.Ordinal);
+        private static void NoteSnapshotDirtAlign(string addr, string source)
+        {
+            try
+            {
+                string k = addr ?? "";
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                bool dev = source != null && source.StartsWith("dev", StringComparison.Ordinal);
+                if (!dev && _sdNoteAt.TryGetValue(k, out var at) && now - at < 60f) return;
+                _sdNoteAt[k] = now;
+                Plugin.Logger.LogInfo($"[Patcher] '{k}' {source} dirt: lists do not align - applied in place, local length kept (G1): {SnapshotDirtStats()}");
+            }
+            catch { }
+        }
+
+        private static readonly Dictionary<string, float> _regrowTriedAt = new(StringComparer.Ordinal);
+        private static readonly HashSet<string> _regrowWarned = new(StringComparer.Ordinal);
+        /// <summary>G1: lengthen a local dirt list that is empty or shorter than the incoming one with the game's own lattice
+        /// builder, BuildingCleanlinessHelper.GetDirtSpotsForBuilding(reg.BuildingCached) - the call BuildingManager makes on
+        /// entry (count differs from the floor cells) and BizManPresentation makes from outside. Used only when the fresh
+        /// lattice is LONGER (never shortens); an old entry whose index and X/Z still match keeps its value; the list object
+        /// is kept. One attempt per address per 30 s (the builder needs the building's structure loaded, else it warns "No
+        /// floors found" or throws - caught). Returns the new count, or -1 when nothing changed.</summary>
+        private static int RegrowDirtLattice(BuildingRegistration reg, string addr)
+        {
+            string k = addr ?? "";
+            try
+            {
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (_regrowTriedAt.TryGetValue(k, out var at) && now - at < 30f) return -1;
+                _regrowTriedAt[k] = now;
+                var b = reg.BuildingCached;
+                var old = reg.dirtSpots;
+                if (b == null || old == null) return -1;
+                var fresh = Buildings.BuildingTypes.Shared.Dirtiness.BuildingCleanlinessHelper.GetDirtSpotsForBuilding(b);
+                if (fresh == null || fresh.Count <= old.Count) return -1;
+                for (int i = 0; i < old.Count; i++)
+                {
+                    var o = old[i]; var f = fresh[i];
+                    if (o != null && f != null && o.x == f.x && o.z == f.z) f.dirtiness = o.dirtiness;
+                }
+                int was = old.Count;
+                old.Clear();
+                old.AddRange(fresh);
+                _regrowTriedAt.Remove(k);
+                Plugin.Logger.LogInfo($"[Patcher] '{k}': local dirt list regrown {was} -> {old.Count} cell(s) with the game's own lattice before a network apply (G1).");
+                return old.Count;
+            }
+            catch (Exception ex)
+            {
+                try { if (_regrowWarned.Add(k)) Plugin.Logger.LogInfo($"[Patcher] '{k}': dirt lattice regrow not possible now ({ex.GetType().Name}: {ex.Message}) - the local length is kept; the game regrows on entry."); } catch { }
+                return -1;
+            }
+        }
+
+        /// <summary>S4-lite counter.  Throttled to one line per address per minute WITH the count —
+        /// a per-skip line would cost more than the skip saves, and a silent optimization is one
+        /// nobody can confirm is working from a field log.</summary>
+        private static void NoteApplySkipped(string addr)
+        {
+            try
+            {
+                _applySkipCount.TryGetValue(addr, out var n);
+                _applySkipCount[addr] = n + 1;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (_applySkipLoggedAt.TryGetValue(addr, out var at) && now - at < ApplySkipLogSeconds) return;
+                _applySkipLoggedAt[addr] = now;
+                int total = _applySkipCount[addr];
+                _applySkipCount[addr] = 0;
+                Plugin.Logger.LogInfo($"[Patcher] '{addr}': skipped {total} interior apply(ies) — byte-identical to the state already applied (round-281 S4-lite; each one avoided a full ~120ms main-thread rebuild).");
+            }
+            catch { }
+        }
+
+        /// <summary>Round-281: a per-address, per-kind, once-a-minute notice.  Cargo syncs arrive many
+        /// times a minute by design, so ANY unconditional line inside the cargo apply becomes exactly
+        /// the kind of log flood this round was opened to reduce — the notices that describe a standing
+        /// condition (we own this building; ids we don't know) say it once and then stay quiet.</summary>
+        private static readonly Dictionary<string, float> _cargoNoteAt = new(StringComparer.Ordinal);
+        // TILL-PUT-1 diagnostic: the owner's cargo statement is ABSOLUTE — a lower incoming amount on a
+        // single-slot station (cash register / producer) is the moment a deposit that only ever landed on
+        // this replica gets erased. One line per item per minute names the station and both amounts.
+        private static readonly System.Collections.Generic.Dictionary<string, float> _reduceNoted = new System.Collections.Generic.Dictionary<string, float>();
+
+        private static void NoteRemoteReduce(string addr, InteriorCargoItemInfo entry, BigAmbitions.Items.ItemInstance live)
+        {
+            try
+            {
+                if (live.cargoInstances == null || live.cargoInstances.Count != 1) return;
+                if (entry.CargoInstances == null || entry.CargoInstances.Count != 1) return;
+                int liveAmt = live.cargoInstances[0]?.amount ?? 0;
+                int incAmt  = entry.CargoInstances[0]?.Amount ?? 0;
+                if (incAmt >= liveAmt) return;
+                string key = addr + "/" + entry.Id;
+                float now = UnityEngine.Time.unscaledTime;
+                if (_reduceNoted.TryGetValue(key, out var next) && now < next) return;
+                _reduceNoted[key] = now + 60f;
+                Plugin.Logger.LogInfo($"[Cargo] REMOTE REDUCE '{addr}'/{entry.Id} '{live.itemName}' {liveAmt}->{incAmt} — the owner's statement is absolute (TILL-PUT-1 diagnostic)");
+            }
+            catch (Exception ex) { try { Plugin.Logger.LogWarning($"[Cargo] NoteRemoteReduce: {ex.Message}"); } catch { } }
+        }
+
+        // PUT-PERM-1 (A3, 2026-09-18): REMOTE REDUCE above only ever speaks for a ONE-slot holder.
+        // The multi-slot holders — a storage shelf, a fridge, a display with several stacks — had no
+        // line at all, and that is exactly where an ungranted visitor's local-only deposit died in
+        // silence (bundle 20260918-195543: six items merged into the host's shelf, erased by the
+        // owner's next absolute statement). This machine is NOT the owner of the building here (the
+        // authority shield above already returned for buildings we own), so anything the owner's
+        // statement drops or reduces was local-only. Budgeted, not change-tracked: 60 lines a session.
+        private static int _applyDiscardedLines;
+
+        // NULLNAME-1: session budget for the wire-side skip notice (this file's writer half).
+        private static int _namelessWireLogged;
+
+        // FOLD F2 (M1+M2, review 2026-09-18): this diagnostic runs on the HEALTHY path of every
+        // remote cargo apply, so it allocates nothing there.  ApplyInteriorCargoSync's whole body is
+        // inside RunOnMainThread (GameStatePatcher.cs:2294), so these three scratch buffers are
+        // MAIN-THREAD ONLY and safe to reuse; each call Clear()s them first.
+        private static readonly Dictionary<string, int> _adIncoming = new Dictionary<string, int>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, int> _adMine     = new Dictionary<string, int>(StringComparer.Ordinal);
+        private static readonly System.Text.StringBuilder _adLost   = new System.Text.StringBuilder();
+        private static bool _applyDiscardedFailLogged;   // budget the guard: first failure only
+
+        private static void NoteApplyDiscarded(string addr, InteriorCargoItemInfo entry, BigAmbitions.Items.ItemInstance live)
+        {
+            try
+            {
+                if (_applyDiscardedLines >= 60) return;
+                var liveCargo = live.cargoInstances;
+                if (liveCargo == null || liveCargo.Count <= 1) return;   // the one-slot case keeps its REMOTE REDUCE line
+                // Cheap allocation-free pre-pass: a holder that holds nothing cannot have lost
+                // anything.  NOTE the per-name comparison below is NOT replaceable by a count/total
+                // test — equal counts and equal totals still hide "lost 3 apples, gained 3 pears".
+                int liveTotal = 0;
+                for (int i = 0; i < liveCargo.Count; i++) { var lc = liveCargo[i]; if (lc != null) liveTotal += lc.amount; }
+                if (liveTotal <= 0) return;
+
+                var incoming = _adIncoming; incoming.Clear();
+                if (entry.CargoInstances != null)
+                    foreach (var c in entry.CargoInstances)
+                    {
+                        if (c == null) continue;
+                        string cn = c.ItemName ?? "";   // M1: null names key as "" on BOTH halves
+                        incoming.TryGetValue(cn, out var had);
+                        incoming[cn] = had + c.Amount;
+                    }
+                var mine = _adMine; mine.Clear();
+                foreach (var c in liveCargo)
+                {
+                    if (c == null) continue;
+                    string n = c.itemName ?? "";
+                    mine.TryGetValue(n, out var had);
+                    mine[n] = had + c.amount;
+                }
+                var lost = _adLost; lost.Clear();
+                foreach (var kv in mine)
+                {
+                    incoming.TryGetValue(kv.Key, out var inc);
+                    if (inc >= kv.Value) continue;
+                    if (lost.Length > 0) lost.Append(", ");
+                    lost.Append($"{kv.Key}x{kv.Value - inc}");
+                }
+                if (lost.Length == 0) return;
+                _applyDiscardedLines++;
+                Plugin.Logger.LogWarning($"[Cargo] APPLY DISCARDED {addr} '{live.itemName}' id={entry.Id}: {lost}");
+            }
+            catch (Exception ex)
+            {
+                if (_applyDiscardedFailLogged) return;
+                _applyDiscardedFailLogged = true;
+                try { Plugin.Logger.LogWarning($"[Cargo] NoteApplyDiscarded: {ex.Message} (further failures silent)"); } catch { }
+            }
+        }
+
+        private static void CargoNoteThrottled(string addr, string kind, string message)
+        {
+            try
+            {
+                string key = kind + "|" + addr;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (_cargoNoteAt.TryGetValue(key, out var at) && now - at < ApplySkipLogSeconds) return;
+                _cargoNoteAt[key] = now;
+                Plugin.Logger.LogInfo(message);
+            }
+            catch { }
+        }
+
+        /// <summary>Ask the host for a fresh full interior.  Loud on purpose and throttled per address:
+        /// a re-request means this machine received cargo for a structure it does not hold, which
+        /// should be rare (a structural edit racing a cargo send) — if a log is full of these, the
+        /// version stamping is wrong and that is worth seeing immediately.  Recurrence-covered rather
+        /// than retried: cargo keeps flowing, so the NEXT stale cargo sync re-asks once the throttle
+        /// window passes, and the arriving full snapshot re-seeds the version.</summary>
+        private static void ReRequestInterior(string addr, string why)
+        {
+            try
+            {
+                if (!MPClient.IsConnected || MPServer.IsRunning) return;
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (_cargoReRequestedAt.TryGetValue(addr, out var at) && now - at < CargoReRequestSeconds) return;
+                _cargoReRequestedAt[addr] = now;
+                Plugin.Logger.LogWarning($"[Patcher] cargo sync for '{addr}' IGNORED and a full interior RE-REQUESTED — {why} (round-281). Cargo keeps flowing; it will match once the full snapshot lands.");
+                MPClient.SendInteriorRequest(addr);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] cargo re-request for '{addr}': {ex.Message}"); }
+        }
+
+        /// <summary>v10 (T7/ruling 33): apply a dirt-values update (MessageType.InteriorDirtSync).
+        /// ABSOLUTE dirty-set semantics: listed lattice spots take the sent value, every other
+        /// spot reads clean. Deliberately UPDATE-only — the lattice is one fixed entry per floor
+        /// tile and the cleanliness score AVERAGES the values, so adding/removing entries (or the
+        /// snapshot path's clear-and-rebuild) on a partial list would corrupt the score.
+        /// Review B2: keyed by lattice INDEX with X/Z verification — (X, Z) alone is NOT unique
+        /// (stacked storeys share footprints; the lattice builder discards Y). A verify miss skips
+        /// that spot; the next entry snapshot heals.</summary>
+        public static void ApplyInteriorDirtSync(InteriorDirtSyncPayload payload)
+        {
+            if (payload == null || string.IsNullOrEmpty(payload.AddressKey)) return;
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    // Lineage guard — same rule as the cargo channel: a dirt write is state, and
+                    // names can collide across worlds. Either side empty = legacy, not a mismatch.
+                    try
+                    {
+                        string mine = MPSaveCoordinator.ActivePlaythroughId ?? "";
+                        if (!string.IsNullOrEmpty(mine) && !string.IsNullOrEmpty(payload.PlaythroughId)
+                            && mine != payload.PlaythroughId) return;
+                    }
+                    catch { }
+                    var gi = SaveGameManager.Current;
+                    if (gi == null) return;
+                    BuildingRegistration? reg = null;
+                    foreach (var r in gi.BuildingRegistrations)
+                        if (r != null && GameStateReader.AddressKey(r) == payload.AddressKey) { reg = r; break; }
+                    if (reg?.dirtSpots == null) return;
+                    bool mopProbe = MopProbe.LiveOn(reg);   // [PROBE:P-CLEANLOOP] log-only: does this update raise a live stroke's cells?
+                    if (mopProbe) MopProbe.Snap(reg);
+                    // H-CLEANLOOP-1 fix F1 (2026-09-28): this ABSOLUTE set re-dirtied a live local mop stroke's cells
+                    // every band, so the stroke never ended - its cells now take min(incoming, local) (StrokeGuard).
+                    bool strokeGuard = StrokeGuard.Begin(reg);
+                    var byIndex = new System.Collections.Generic.Dictionary<int, DirtSpotDeltaInfo>();
+                    foreach (var s in payload.Spots) if (s != null) byIndex[s.Index] = s;
+                    int touched = 0, mismatched = 0;
+                    for (int i = 0; i < reg.dirtSpots.Count; i++)
+                    {
+                        var ds = reg.dirtSpots[i];
+                        if (ds == null) continue;
+                        float v = 0f;
+                        if (byIndex.TryGetValue(i, out var sent))
+                        {
+                            if (sent.X != ds.x || sent.Z != ds.z) { mismatched++; continue; }   // lattice order divergence — don't guess (exact restored, review-mopping #4: this guard is load-bearing for stacked storeys and this channel SETS absolutely)
+                            v = sent.Dirtiness;
+                        }
+                        if (strokeGuard) v = StrokeGuard.Clamp(i, v, ds.dirtiness);   // F1: a live stroke's cell is never raised
+                        if (ds.dirtiness != v) { ds.dirtiness = v; touched++; }
+                    }
+                    if (strokeGuard) StrokeGuard.End(reg, MPServer.IsRunning ? "owner upload (host world)" : "dirt band");
+                    if (mopProbe) MopProbe.AfterWrite(reg, MPServer.IsRunning ? "owner upload (host world)" : "dirt band");
+                    if (touched > 0)
+                    {
+                        // Review B1 (the cargo channel's :1818 precedent): a dirt write moves state the
+                        // S4-lite fingerprint's local half cannot see (counts unchanged) — drop the
+                        // duplicate-apply baseline so the next full snapshot is never mistaken for a dupe.
+                        try { _lastAppliedSig.Remove(payload.AddressKey); } catch { }
+                        // Review m1: repaint the decals if the local player is standing in this very
+                        // building (otherwise the game repaints on entry / its own hourly tick).
+                        // Recheck #7: also refresh the HUD cleanliness meter — the unpin patch feeds
+                        // it live values, but only when something CALLS RefreshMetaCleanliness; a
+                        // synced dirt change would otherwise sit invisible until the next mop swing.
+                        try
+                        {
+                            var bm = InstanceBehavior<BuildingManager>.Instance;
+                            if (bm?.buildingRegistration != null
+                                && GameStateReader.AddressKey(bm.buildingRegistration) == payload.AddressKey)
+                            {
+                                bm.UpdateDirtinessInCurrentBuilding();
+                                try { InstanceBehavior<UI.UIs>.Instance?.playerHUD?.itemPanelUI?.RefreshMetaCleanliness(); } catch { }
+                            }
+                        }
+                        catch { }
+                        DirtSyncLines++; DirtSyncTouched += touched;   // DEV `dirtstate` lever (CTRL-NOSEED): counts exactly these lines
+                        Plugin.Logger.LogInfo($"[Patcher] DirtSync '{payload.AddressKey}': {payload.Spots.Count} dirty spot(s) sent, {touched} value(s) updated{(mismatched > 0 ? $", {mismatched} index/coord MISMATCH(ES) skipped" : "")} (v10).");
+                    }
+                    else if (mismatched > 0)
+                        Plugin.Logger.LogWarning($"[Patcher] DirtSync '{payload.AddressKey}': {mismatched} index/coord mismatch(es), nothing applied — lattice order differs from the sender; the entry snapshot heals.");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ApplyInteriorDirtSync: {ex.Message}"); }
+            });
+        }
+
+        /// <summary>Apply a cargo-only interior update (MessageType.InteriorCargoSync, round-281).
+        ///
+        /// What it does NOT do is as load-bearing as what it does:
+        ///  • no scene refresh — cargo owns no scene objects.  The full apply's refresh exists to
+        ///    rebuild walls/floors/items; the existing in-place cargo branch already skips it and
+        ///    fires the native cargo callback instead, which is what makes a shelf redraw its boxes.
+        ///  • no round-213 tripwire — these are the CHEAP path; feeding a counter calibrated on
+        ///    ~120ms applies would turn the resend-loop alarm into permanent noise (contract item 6).
+        ///  • no structural inference — an id this machine doesn't know is skipped, never created.
+        ///    An unknown id means a structural change is in flight, and the version check is what
+        ///    covers that; guessing an item into existence from a cargo message is how a cheap
+        ///    channel starts quietly authoring structure.</summary>
+        public static void ApplyInteriorCargoSync(InteriorCargoSyncPayload payload, int wireBytes)
+        {
+            if (payload == null || string.IsNullOrEmpty(payload.AddressKey)) return;
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    string addr = payload.AddressKey;
+                    // Lineage guard: a cargo write is a save-state write, and session/address names can
+                    // collide across worlds (the handoff-slice-3 hazard).  Both sides must know their
+                    // identity for this to mean anything — either side empty is legacy, not a mismatch.
+                    try
+                    {
+                        string mine = MPSaveCoordinator.ActivePlaythroughId ?? "";
+                        if (!string.IsNullOrEmpty(mine) && !string.IsNullOrEmpty(payload.PlaythroughId)
+                            && mine != payload.PlaythroughId)
+                        {
+                            Plugin.Logger.LogWarning($"[Patcher] cargo sync for '{addr}' DROPPED — it belongs to a different world (lineage '{payload.PlaythroughId}' vs ours '{mine}').");
+                            return;
+                        }
+                    }
+                    catch { }
+
+                    // No baseline at all: this machine has never applied a full snapshot for the
+                    // address, so it has no structure to hang cargo on.  Ask for one.
+                    if (!_lastAppliedStructVersion.TryGetValue(addr, out var mineVer))
+                    {
+                        ReRequestInterior(addr, "no full snapshot has ever been applied for this building");
+                        return;
+                    }
+                    // Stale structure: the host is describing cargo for a layout/item set we do not
+                    // hold.  Applying it would write the right amounts onto the wrong shelves.
+                    if (mineVer != payload.StructVersion)
+                    {
+                        ReRequestInterior(addr, $"our structure is version {mineVer}, the cargo claims version {payload.StructVersion}");
+                        return;
+                    }
+
+                    var reg = FindRegistration(addr);
+                    if (reg?.itemInstances == null)
+                    {
+                        ReRequestInterior(addr, "no local registration for this building");
+                        return;
+                    }
+
+                    // CARGO AUTHORITY SHIELD (round-38d) — the same rule as the full apply's in-place
+                    // cargo branch, for the same reason: when THIS machine owns the building, its live
+                    // cargo IS the truth and an inbound copy is a replica.  The host's relay of our own
+                    // pushed snapshot can come back to us, and letting it write would launder a stale
+                    // replica into owner state.  TrulyMine excludes merger-flipped shops — never shield
+                    // a replica against its real owner.
+                    bool receiverOwnsThis = false;
+                    try { receiverOwnsThis = MergerFlip.TrulyMine(reg); } catch { }
+                    if (receiverOwnsThis)
+                    {
+                        CargoNoteThrottled(addr, "shield", $"[Patcher] cargo sync for '{addr}' SHIELDED — this machine owns the building; kept our own cargo on all {payload.Items.Count} item(s) (round-38d).");
+                        InteriorSync.NoteCargoSyncApply(addr, 0, wireBytes);
+                        return;
+                    }
+
+                    int changed = 0, unknown = 0;
+                    // I2: ids we actually wrote — the helper icon refresh below needs them by id.
+                    var cargoChangedIds = new System.Collections.Generic.HashSet<string>();
+                    _lastItemSer.TryGetValue(addr, out var lastSer);
+                    foreach (var entry in payload.Items)
+                    {
+                        if (entry == null || string.IsNullOrEmpty(entry.Id)) continue;
+                        if (!reg.itemInstances.TryGetValue(entry.Id, out var live) || live == null) { unknown++; continue; }
+                        if (!CargoDiffers(live, entry.CargoInstances)) continue;
+                        NoteRemoteReduce(addr, entry, live);   // TILL-PUT-1 diagnostic
+                        NoteApplyDiscarded(addr, entry, live); // PUT-PERM-1 (A3) diagnostic
+                        FillCargoInstances(live, entry.CargoInstances, addr);
+                        // The native announcement a local deposit/sale makes — ShelfController and
+                        // friends redraw their boxes off this, so it is what makes the change VISIBLE.
+                        try { live.OnItemsInCargoUpdated()?.Invoke(); } catch { }
+                        // Invalidate this item's per-item diff baseline.  _lastItemSer records what the
+                        // last SNAPSHOT said; we just changed the live object out from under it, so a
+                        // later snapshot whose cargo happens to match that old record would be judged
+                        // "unchanged", keep the live object, and freeze our out-of-band value in place.
+                        // Dropping the entry costs one deserialize on the next full apply and closes it.
+                        try { lastSer?.Remove(entry.Id); } catch { }
+                        cargoChangedIds.Add(entry.Id);
+                        changed++;
+                    }
+
+                    // I2 (2026-09-12): the native per-stock-change icon refresh
+                    // (OnItemsInCargoUpdated -> UpdateVisuals -> SetStockAmount -> UpdateSelectedStockOverlay
+                    // -> UpdateWarningIcon) is IsPlayerOwnedBusiness-gated and must STAY gated (its
+                    // FillUpShowcaseShelfOrPointOfSale tail mutates the replica). So when the local player
+                    // stands in this address as a HELPER, refresh the changed items' icons directly — the
+                    // parity prefix supplies the scoped flip. A merger co-member already refreshes through
+                    // the flipped native path.
+                    try
+                    {
+                        if (cargoChangedIds.Count > 0
+                            && BusinessHelperRoute.HelperHere(out var helperAddr) && helperAddr == addr)
+                            InstanceBehavior<Player.HUD.ItemWarningIcons.ItemWarningIconManager>.Instance?
+                                .UpdateWarningIconByIds(cargoChangedIds);
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] helper warning-icon refresh for '{addr}': {ex.Message}"); }
+
+                    // A cargo write moves state the S4-lite fingerprint cannot see (counts are
+                    // unchanged — same items, same designs, same dirt cells; only amounts moved), so
+                    // drop the duplicate-apply baseline.  Without this, a later full snapshot that
+                    // happens to match the LAST one byte-for-byte would be skipped as a duplicate
+                    // while our cargo sits at whatever the cargo syncs left it — the host's cargo
+                    // going X → Y → X is enough to produce that.  The cost is one un-skipped apply.
+                    if (changed > 0) { try { _lastAppliedSig.Remove(addr); } catch { } }
+
+                    if (unknown > 0)
+                        CargoNoteThrottled(addr, "unknown", $"[Patcher] cargo sync for '{addr}': {unknown} unknown item id(s) ignored — a structural change is in flight; the version check covers it.");
+                    InteriorSync.NoteCargoSyncApply(addr, changed, wireBytes);
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ApplyInteriorCargoSync: {ex.Message}"); }
+            });
+        }
+
+        /// <summary>
+        /// If the local player is inside the building whose interior we just
+        /// applied, re-paint the wall/floor/ceiling visuals to match the new
+        /// reg.interiorDesigns data.  No-op if not in that building.
+        ///
+        /// Implementation: element-level.  For each InteriorElement GameObject
+        /// in the scene, look up its UUID in our fresh reg.interiorDesigns dict
+        /// and call element.Deserialize(design) directly.  This is the primitive
+        /// the game uses internally and re-applies materials on every call.
+        ///
+        /// Two higher-level alternatives we tried and disproved:
+        ///   - BuildingManager.LoadBuilding(false): returns true but doesn't
+        ///     re-paint existing InteriorElements on subsequent calls.
+        ///   - BuildingManager.ApplyInteriorDesign(building, elements): same —
+        ///     likely resolves the registration via building.GetRegistration()
+        ///     which returns a different instance than our gi.BuildingRegistrations
+        ///     write target, so it reads stale designs.
+        /// element.Deserialize works because it operates directly on the scene
+        /// element using the design object we pass in.
+        /// </summary>
+        /// <summary>Last-applied serialized form per item id, per address —
+        /// the diff baseline that keeps unchanged shelf visuals alive.</summary>
+        private static readonly Dictionary<string, Dictionary<string, string>> _lastItemSer = new();
+        /// <summary>Round-198c: names of a SMALL interior-apply delta (≤3 removed/changed),
+        /// built during the apply, appended to its log line. Main-thread only.</summary>
+        private static string _deltaNames = "";
+
+        /// <summary>Same baseline for interior-design elements (walls/doors):
+        /// UUID → serialized form, per address.  Re-Deserializing all ~120
+        /// elements on every snapshot made the door (+ its light shaft)
+        /// visibly flicker (user, 2026-06-12).</summary>
+        private static readonly Dictionary<string, Dictionary<string, string>> _lastDesignSer = new();
+
+        /// <summary>True if this address has had an interior snapshot applied —
+        /// i.e. it's ANOTHER session player's building replicated here.  Used by
+        /// the shelf-fill patch to tell player shops from AI shops.</summary>
+        public static bool IsReplicatedInterior(string addressKey)
+            => !string.IsNullOrEmpty(addressKey) && _lastItemSer.ContainsKey(addressKey);
+
+        /// <summary>Addresses whose interiors are replicas here (audit scope —
+        /// the source machine's copy is the reference to compare against).</summary>
+        public static List<string> ReplicatedInteriorAddresses()
+            => new List<string>(_lastItemSer.Keys);
+
+        /// <summary>Replace gi.marketEvents with the host's authoritative list
+        /// (MAIN THREAD).  MarketEvent is a plain data class — Newtonsoft
+        /// round-trips it wholesale.</summary>
+        public static void ApplyMarketEvents(string json)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.marketEvents == null)
+                {
+                    // Round-101: this used to be a SILENT no-op — the join-time send and the
+                    // first change-broadcast both land while the client's world is still
+                    // loading, and nothing retried, so a client ran a whole session with no
+                    // market events (S7 audit: "events DIVERGED" in every window). Hold the
+                    // payload and let TickPendingMarketEvents apply it once the world is live.
+                    _pendingMarketEventsJson = json;
+                    Plugin.Logger.LogInfo("[Patcher] market events arrived before the world was live — held for retry.");
+                    return;
+                }
+                var list = Newtonsoft.Json.JsonConvert.DeserializeObject<List<MarketEvent>>(json);
+                if (list == null) return;
+                gi.marketEvents.Clear();
+                foreach (var e in list) if (e != null) gi.marketEvents.Add(e);
+                _pendingMarketEventsJson = null;
+                Plugin.Logger.LogInfo($"[Patcher] market events applied: {list.Count} event(s) from host.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ApplyMarketEvents: {ex.Message}"); }
+        }
+
+        // Round-101: payload held because it arrived pre-world; retried from the main tick.
+        private static volatile string? _pendingMarketEventsJson;
+
+        /// <summary>MAIN THREAD, per-frame: apply a market-events payload that arrived before the
+        /// world existed. Cheap (a null check) until there is something held.</summary>
+        public static void TickPendingMarketEvents()
+        {
+            var held = _pendingMarketEventsJson;
+            if (held == null) return;
+            try
+            {
+                if (SaveGameManager.Current?.marketEvents == null) return;   // still not live — keep holding
+                _pendingMarketEventsJson = null;
+                ApplyMarketEvents(held);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] TickPendingMarketEvents: {ex.Message}"); }
+        }
+
+        /// <summary>MAIN THREAD, per-frame on clients: retry a market payload that arrived before
+        /// the world existed, and WARN when host demand updates have gone quiet — the condition
+        /// that made a field client run a whole session on locally-computed 99-100% demand while
+        /// nothing in the log said so. Cheap: two float compares until something is wrong.</summary>
+        public static void TickDemandHealth()
+        {
+            try
+            {
+                if (!MPClient.IsConnected || MPServer.IsRunning) return;
+
+                var held = _pendingMarketJson;
+                if (held != null && SaveGameManager.Current != null)
+                {
+                    _pendingMarketJson = null;
+                    ApplyMarketSnapshot(held);
+                    return;
+                }
+
+                float now = UnityEngine.Time.unscaledTime;
+                if (now < _nextDemandWatchdogAt) return;
+                _nextDemandWatchdogAt = now + 60f;
+                if (SaveGameManager.Current == null) return;
+
+                // The host sends every 60s of REAL time (round-102h). 180s of silence means the
+                // channel is not delivering, and this client's demand is stale or self-computed.
+                if (!_haveAuthoritativeDemand)
+                {
+                    Plugin.Logger.LogWarning(
+                        "[Demand] no host market data has EVER been applied this session — this client's demand " +
+                        "figures are its own, and a client cannot compute them correctly (its provider counts are " +
+                        "empty, so every product reads ~100%). Expect wrong demand in Market Insider and inflated " +
+                        "customer traffic for this player's shops.");
+                    return;
+                }
+                float age = now - _lastMarketApplyAt;
+                if (age > 180f)
+                    Plugin.Logger.LogWarning(
+                        $"[Demand] no host market update for {age:F0}s (expected every 60s) — demand is going stale. " +
+                        "If the host is paused/in menus this is expected; otherwise the market channel has stopped.");
+            }
+            catch { }
+        }
+
+        /// <summary>True when this registration's business belongs to ANY session
+        /// player — YOU **or** another connected player.  This is NOT "is this mine?"
+        /// (after the rival-translation, businessOwnerRivalId carries the owning
+        /// player's id; this delegates to IsSessionPlayerRivalId).  Its only job is
+        /// shielding EVERY player's shop from the local AI economy, which otherwise
+        /// adopts any replica: cashiers auto-spawn on entry (SetupAiEmployeeStations)
+        /// and the daily rival sim re-prices it (CompetitionHelper) — both
+        /// decompile-confirmed to validate NOTHING beyond RentedByPlayer/non-empty
+        /// owner id.
+        ///
+        /// FOOTGUN — do NOT use this to ask "is this MY shop?":
+        ///   • it is true for EVERY player's shop, not just yours; and
+        ///   • it is FALSE for your own freshly-loaded shop (businessOwnerRivalId is
+        ///     empty until the rival-translation stamps it).
+        /// For "is this the local player's own shop?" use IsReceiversOwnBusiness.</summary>
+        public static bool IsAnyPlayerBusiness(BuildingRegistration? reg)
+        {
+            if (reg == null) return false;
+            if (IsSessionPlayerRivalId(reg.businessOwnerRivalId)) return true;
+            // Merger phase 0 (review 2026-09-10 #1): a FLIPPED partner shop carries an EMPTY live stamp (the pid is parked in
+            // the flip table), so the stamp arm above no longer sees it - it is a player's shop all the same (entrance fees,
+            // cleaning meter, shelf-fill correction all key on this).
+            try { if (MergerFlip.IsFlipped(GameStateReader.AddressKey(reg))) return true; } catch { }
+            // Re-host durability (2026-06-24): the live roster forgets a player who is
+            // disconnected, but the host's ownership LEDGER (restored from the manifest)
+            // still reserves their building to them.  A building reserved to a player —
+            // even one currently absent — is a player's shop and must stay shielded from
+            // the local AI economy, exactly as it is while the owner is online.  Host-only
+            // (clients keep no ledger); correct, since the AI economy runs on the host.
+            return IsLedgerReservedToPlayer(reg);
+        }
+
+        /// <summary>True when this registration's business belongs to a DIFFERENT
+        /// player than the local one — a partner-shop replica.  Unlike
+        /// IsAnyPlayerBusiness this is roster-free: it reads only the PERSISTED
+        /// ownership stamp, so it also works on an MP save opened offline (where
+        /// the roster is empty).  Predicate: businessOwnerRivalId non-empty, not
+        /// the local pid, and the registration is player-rented.  AI-rival
+        /// businesses can't false-match (never RentedByPlayer) and vanilla saves
+        /// carry no stamps at all.  Added 2026-07-16 (employee-mixing report):
+        /// the game's assign-employee-to-business dropdowns list every rented
+        /// registration, which in MP includes the partner's shops.</summary>
+        public static bool IsForeignPlayerBusiness(BuildingRegistration? reg)
+        {
+            if (reg == null) return false;
+            try
+            {
+                string owner = reg.businessOwnerRivalId?.ToString() ?? "";
+                if (string.IsNullOrEmpty(owner) || owner == MPConfig.PlayerId) return false;
+                return reg.RentedByPlayer;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>UI-list variant of IsForeignPlayerBusiness (approved 2026-07-16:
+        /// rivals must not manage each other's businesses): hide a foreign player's
+        /// business from native "my assets" enumerations — UNLESS a merger's
+        /// presentation flip deliberately shares it (MergerFlip: flipped = shown as
+        /// mine in native menus for the merger's shared management).  Inert outside
+        /// mergers (_flipped empty).  Use for DISPLAY/PICKER filtering only — sync
+        /// authority questions stay on MergerFlip.TrulyMine / IsReceiversOwnBusiness.</summary>
+        public static bool HideFromOwnAssetLists(BuildingRegistration? reg)
+        {
+            if (!IsForeignPlayerBusiness(reg)) return false;
+            try { return !MergerFlip.IsFlipped(GameStateReader.AddressKey(reg!)); } catch { return true; }
+        }
+
+        /// <summary>HOST-only: true when this building is reserved in the ownership
+        /// ledger — BuildingOwners (rents/operates) or BuildingRealEstateOwners (bought)
+        /// — to a player: a connected player's pid OR an absent owner's stable id held
+        /// for reconnect.  "host" and empty are excluded (the host's own buildings are
+        /// already native via RentedByPlayer; empty = unowned/AI).</summary>
+        /// <summary>Round-172 — "is this ledger value the HOST'S OWN entry?"  Historically the host
+        /// wrote the literal "host"; since round-159 it writes its real player id — and every consumer
+        /// that special-cased the literal treated the host's own entries as some OTHER player's
+        /// (field: the host's snapshot of its own arbitration-won shop went out flagged
+        /// non-authoritative, so the loser's machine refused the 754 items it was owed).</summary>
+        internal static bool IsHostLedgerId(string v) => v == "host" || v == MPConfig.PlayerId;
+
+        private static bool IsLedgerReservedToPlayer(BuildingRegistration reg)
+        {
+            try
+            {
+                if (!MPServer.IsRunning) return false;
+                string addr = GameStateReader.AddressKey(reg);
+                if (string.IsNullOrEmpty(addr)) return false;
+                if (MPServer.BuildingOwners.TryGetValue(addr, out var o)
+                    && !string.IsNullOrEmpty(o) && !IsHostLedgerId(o)) return true;
+                if (MPServer.BuildingRealEstateOwners.TryGetValue(addr, out var r)
+                    && !string.IsNullOrEmpty(r) && !IsHostLedgerId(r)) return true;
+                return false;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>True for the LOCAL player's OWN business — the correct "is this
+        /// mine?" test (contrast IsAnyPlayerBusiness, which is true for everyone's
+        /// shop and false for your own fresh shop).  TrulyMine = RentedByPlayer MINUS
+        /// the merger flip: a flipped partner shop reads rented for native MENUS, but
+        /// to the SYNC layer it is a replica whose true owner's pushes must apply
+        /// (run-4 inversion, 2026-07-07). Where a business payload is available,
+        /// callers also OR in OwnerPlayerId == MPConfig.PlayerId for positive
+        /// attribution (see ApplyBusinessInfoLocal's receiverOwnsThis).</summary>
+        public static bool IsReceiversOwnBusiness(BuildingRegistration? reg)
+            => MergerFlip.TrulyMine(reg);
+
+        // Round-50b: double-tenancy conflicts logged once per address per load (the record
+        // re-arrives every sync — one line carries the signal, repeats would bury it).
+        private static readonly HashSet<string> _tenancyConflictLogged = new();
+        // BIZTYPE-1: addresses already reported as carrying a business type this machine cannot resolve.
+        private static readonly HashSet<string> _unknownBizTypeLogged = new();
+
+        /// <summary>BIZTYPE-1 (log only, world-ready): every registration THIS machine rents whose
+        /// business type no loaded mod registers — the exact shape the game's own start-up aborts
+        /// on at the next load (CustomerEntriesHelper.Init → ShouldEntriesBeCreated,
+        /// CustomerEntriesHelper.cs:152, dereferences BusinessTypeHelper.GetData UNCHECKED for each
+        /// RentedByPlayer registration, so one unknown type means the cameras never initialise).
+        /// A count of 0 is reported too: its absence would be indistinguishable from the sweep not
+        /// running at all.</summary>
+        public static void LogUnregisteredBusinessTypes(string reason)
+        {
+            try
+            {
+                var regs = SaveGameManager.Current?.BuildingRegistrations;
+                if (regs == null) return;
+                int owned = 0, bad = 0;
+                foreach (var reg in regs)
+                {
+                    if (reg == null) continue;
+                    bool rented = false; try { rented = reg.RentedByPlayer; } catch { }
+                    if (!rented) continue;
+                    owned++;
+                    string type = ""; try { type = reg.businessTypeName ?? ""; } catch { }
+                    if (type.Length == 0) continue;
+                    bool known = true;
+                    try { known = Helpers.BusinessTypeHelper.GetData(type) != null; } catch { known = true; }
+                    if (known) continue;
+                    bad++;
+                    string addr = ""; try { addr = GameStateReader.AddressKey(reg) ?? ""; } catch { }
+                    if (bad <= 40)
+                        Plugin.Logger.LogWarning($"[Startup] owned '{addr}' has unregistered business type '{type}' — the game's start-up would abort on it (BIZTYPE-1).");
+                }
+                Plugin.Logger.LogInfo($"[Startup] business-type check ({reason}): {bad} of {owned} rented registration(s) carry a type this machine cannot resolve (BIZTYPE-1).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Startup] business-type check ({reason}): {ex.Message} (BIZTYPE-1)."); }
+        }
+        public static void ResetTenancyConflictLog() { try { _tenancyConflictLogged.Clear(); _unknownBizTypeLogged.Clear(); _layoutMirrorLogged = 0; _knownNamesCache = null; } catch { } }
+
+        /// <summary>Review hollow-heal #2 / review-mopping #17: is this owner id a PLAYER this
+        /// WORLD has ever known — independent of the LIVE roster (which is empty on a
+        /// continue-alone host)? Shared by the hollow-layout heal and the takeover furnish
+        /// sweep's provenance log, so the two can never disagree about who is a player.</summary>
+        public static bool IsKnownWorldPlayerId(string? ownerId)
+        {
+            if (string.IsNullOrEmpty(ownerId)) return false;
+            try { if (IsSessionPlayerRivalId(ownerId)) return true; } catch { }
+            try { if (KnownWorldPlayerNames().Contains(ownerId!)) return true; } catch { }
+            return false;
+        }
+
+        /// <summary>All player names this world has known: base-lineage manifest slot names
+        /// (auto suffixes stripped — StripToBase, the F10 lesson — with the raw name as
+        /// fallback) + the grant system's manifest-restored name cache. A failed manifest
+        /// read logs its reason (review-mopping #18).</summary>
+        // H-ENTRY-1 r3 (review r2 #1): the manifest read + JSON parse below ran once per business row at the join snapshot
+        // (~885 rows on one main-thread loop). Memoised per session name for 30 s; the grant names are merged live (in-memory).
+        private static HashSet<string>? _knownNamesCache; private static string _knownNamesSession = ""; private static float _knownNamesAt = -1e9f;
+        public static HashSet<string> KnownWorldPlayerNames()
+        {
+            string sessNow = MPSaveCoordinator.ActiveSessionName ?? "";
+            float nowT = UnityEngine.Time.realtimeSinceStartup;
+            if (_knownNamesCache != null && _knownNamesSession == sessNow && nowT - _knownNamesAt < 30f)
+            {
+                var live = new HashSet<string>(_knownNamesCache, StringComparer.Ordinal);
+                try { foreach (var n in GrantSync.AllKnownNames()) live.Add(n); } catch { }
+                return live;
+            }
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            try
+            {
+                string sess = MPSaveCoordinator.ActiveSessionName ?? "";
+                if (!string.IsNullOrEmpty(sess))
+                {
+                    string baseName = "";
+                    try { baseName = MPSaveManager.StripToBase(sess); } catch { }
+                    var m = (!string.IsNullOrEmpty(baseName) ? MPSaveManager.ReadManifest(baseName) : null)
+                            ?? MPSaveManager.ReadManifest(sess);
+                    if (m?.Slots != null)
+                        foreach (var s in m.Slots)
+                        {
+                            if (!string.IsNullOrEmpty(s?.DisplayName)) set.Add(s!.DisplayName);
+                            if (!string.IsNullOrEmpty(s?.CharacterName)) set.Add(s!.CharacterName);
+                        }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] known-player manifest read: {ex.Message}"); }
+            _knownNamesCache = new HashSet<string>(set, StringComparer.Ordinal); _knownNamesSession = sessNow; _knownNamesAt = nowT;   // manifest-derived names only; grants merged below and on every cached return
+            try { foreach (var n in GrantSync.AllKnownNames()) set.Add(n); } catch { }
+            return set;
+        }
+
+        /// <summary>True if this rival-owner id actually belongs to a session MP player (our own id,
+        /// a roster client, or any session player) — i.e. a "rival" that is really another player, NOT a
+        /// game AI rival. Used to shield player-owned shops from AI-economy administration (shutdown /
+        /// re-price / re-value / overtake) while leaving them in the world so competition still applies.
+        /// NOTE: a disconnected player STAYS in ClientPlayerRoster for the host session (their buildings
+        /// are held for reconnect), so this keeps returning true while they're away — the shield does not
+        /// lapse on a drop, only when a host session STARTS (a fresh process or an in-process re-host — MPServer.Start clears it; review r9/r10).</summary>
+        public static bool IsSessionPlayerRivalId(string? owner)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(owner)) return false;
+                if (owner == MPConfig.PlayerId) return true;
+                if (ClientPlayerRoster.ContainsKey(owner!)) return true;
+                return MPRestSync.AllPlayers().Contains(owner);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>GUEST: record the item state we just FORWARDED as already-applied, so the owner's echo of
+        /// our own edit ser-matches (`prev == ser` keep-branch above) and the live objects stay put. Without
+        /// this, every guest placement echoed back as "changed" and destroy+respawned the just-placed
+        /// ItemController — a same-frame click on the dying zombie then NRE'd inside StartPlacementMode with
+        /// the PlacementMode navigation blocker stranded = the guest locked in place (round-14 #3,
+        /// client log :1232+). The echo must match byte-for-byte: both sides build the DTO with the same
+        /// SerializeItemInstance and the diff key is the same JsonConvert of it.</summary>
+        // ── STAGE 1b (design 2026-08): the edit-delta builder and its apply ──────────────────────
+
+        /// <summary>Build the ops a local edit actually made: DIFF the live registration against the
+        /// _lastItemSer baseline — never hand-built op lists (parent stackedItems bookkeeping,
+        /// round-278/F3, lives inside the serialized form; a hand-built list would miss it).
+        /// Advances the baseline to the live state so the next edit diffs incrementally.
+        /// Guardrail 1 (review MAJOR-O: implemented as DESIGNED, no whole-replica fallback): NO
+        /// BASELINE means upserts-only for every live item and ZERO removes — that list is still
+        /// invariant-compliant (absence asserts nothing), unlike the 140 the first cut fell back to,
+        /// which re-opened the full-replica-authority class this design exists to remove.
+        /// Guardrail 2: a >25-remove diff on a 1-3-op action means baseline/registration skew NOT
+        /// caused by this edit — the removes are SUPPRESSED (upserts still convey the edit), the skew
+        /// is logged loudly, and the address is owed a re-sync so this machine reconciles toward the
+        /// world at edit end. Never send a delta the receiver is contracted to refuse.
+        /// knownRemovedId (grab audit P1, ruling 37): an id the CALLER witnessed being removed (the
+        /// RemoveItemInstanceFromBuilding chokepoint names it) — emitted as a remove op even when
+        /// the guardrails would drop it (no baseline → the diff cannot see removals at all;
+        /// cap-suppression → the grab's remove died with the skew's). A NAMED remove is a
+        /// deliberate statement, not an absence inference, so it is invariant-compliant without a
+        /// baseline; without it those two windows left the owner resurrecting the grabbed item
+        /// (audit F1/F2, the permanently-divergent pair). Ignored if the id is still live or the
+        /// ordinary diff already emitted it.
+        /// `reason` on null: "no-changes" (silence — nothing to convey), "no-reg", "threw".</summary>
+        internal static InteriorEditDeltaPayload? BuildLocalEditDelta(string addressKey, out string reason, bool bulkRemovesAllowed = false, string? knownRemovedId = null)
+        {
+            reason = "no-reg";
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return null;
+                var reg = FindRegistration(addressKey);
+                if (reg?.itemInstances == null) return null;
+                bool hadBaseline = _lastItemSer.TryGetValue(addressKey, out var baseline) && baseline != null;
+                var ops    = new List<InteriorItemOp>();
+                var newSer = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var kv in reg.itemInstances)
+                {
+                    if (kv.Value == null) continue;
+                    var dto = InteriorSync.SerializeItemInstance(kv.Value);
+                    if (dto == null || string.IsNullOrEmpty(dto.Id)) continue;
+                    string ser = Newtonsoft.Json.JsonConvert.SerializeObject(dto);
+                    newSer[dto.Id] = ser;
+                    if (!hadBaseline || !baseline!.TryGetValue(dto.Id, out var prev) || prev != ser)
+                        ops.Add(new InteriorItemOp { Kind = "upsert", Id = dto.Id, Item = dto });
+                }
+                if (hadBaseline)
+                {
+                    var removes = new List<InteriorItemOp>();
+                    int soldSkipped = 0;
+                    foreach (var k in baseline!.Keys)
+                    {
+                        if (newSer.ContainsKey(k)) continue;
+                        // H-SELL-3: an item the designer holds as SOLD in a friend's building is removed by the OWNER itself when the
+                        // close-time itemsell verdict lands — never by this delta (a remove here would race the sale into "gone").
+                        if (DesignerSaleRoute.SkipDeltaRemove(addressKey, k)) { soldSkipped++; continue; }
+                        removes.Add(new InteriorItemOp { Kind = "remove", Id = k });
+                    }
+                    if (soldSkipped > 0) Plugin.Logger.LogInfo($"[Patcher] edit delta for '{addressKey}': {soldSkipped} remove(s) left to the owner-confirmed designer sale (H-SELL-3).");
+                    // Stage 2: a DESIGNER CLOSE may legitimately remove a whole session's worth —
+                    // bulkRemovesAllowed lifts the action cap to the 500 sanity bound (the receiver
+                    // mirrors it via the BulkEdit flag). A 1-3-op action forward keeps the 25 cap.
+                    int cap = bulkRemovesAllowed ? 500 : 25;
+                    if (removes.Count > cap)
+                    {
+                        Plugin.Logger.LogWarning($"[Patcher] edit delta for '{addressKey}': baseline skew — {removes.Count} removes (cap {cap}) SUPPRESSED (upserts still sent); owing a re-sync to reconcile this machine toward the world.");
+                        InteriorSync.NoteResyncOwed(addressKey, $"delta baseline skew ({removes.Count} removes suppressed)");
+                    }
+                    else ops.AddRange(removes);
+                }
+                else if (newSer.Count > 0)
+                    Plugin.Logger.LogInfo($"[Patcher] edit delta for '{addressKey}': no baseline — seeding with {ops.Count} upsert(s), zero removes (guardrail 1).");
+                if (!string.IsNullOrEmpty(knownRemovedId) && !newSer.ContainsKey(knownRemovedId!) && !DesignerSaleRoute.SkipDeltaRemove(addressKey, knownRemovedId!))
+                {
+                    bool alreadyEmitted = false;
+                    for (int i = 0; i < ops.Count; i++)
+                        if (ops[i].Kind == "remove" && ops[i].Id == knownRemovedId) { alreadyEmitted = true; break; }
+                    if (!alreadyEmitted)
+                    {
+                        ops.Add(new InteriorItemOp { Kind = "remove", Id = knownRemovedId! });
+                        Plugin.Logger.LogInfo($"[Patcher] edit delta for '{addressKey}': chokepoint-NAMED remove '{knownRemovedId}' added ({(hadBaseline ? "the diff had suppressed it" : "no baseline — the diff could not see it")}); the owner will not resurrect it (audit P1).");
+                    }
+                }
+                _lastItemSer[addressKey] = newSer;
+                if (ops.Count == 0) { reason = "no-changes"; return null; }
+                reason = "ok";
+                return new InteriorEditDeltaPayload { AddressKey = addressKey, Ops = ops, BulkEdit = bulkRemovesAllowed };
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] BuildLocalEditDelta '{addressKey}': {ex.Message}"); reason = "threw"; return null; }
+        }
+
+        /// <summary>STAGE 2: the designer-close delta — the session's item edits (bulk removes
+        /// allowed) PLUS the changed design elements, UPDATE-ONLY by UUID, diffed against
+        /// _lastDesignSer with the same ser-compare discipline as items. No baseline → every design
+        /// travels (update-only is absolute-safe; ~the designs band of one snapshot, once). Null =
+        /// the session changed nothing.</summary>
+        internal static InteriorEditDeltaPayload? BuildDesignerCloseDelta(string addressKey)
+        {
+            try
+            {
+                var p = BuildLocalEditDelta(addressKey, out _, bulkRemovesAllowed: true);
+                var reg = FindRegistration(addressKey);
+                if (reg?.interiorDesigns != null)
+                {
+                    bool hadDBase = _lastDesignSer.TryGetValue(addressKey, out var dBase) && dBase != null;
+                    var newDSer  = new Dictionary<string, string>();
+                    var changed  = new List<InteriorDesignInfo>();
+                    foreach (var d in reg.interiorDesigns)
+                    {
+                        if (d == null) continue;
+                        var dto = InteriorSync.SerializeDesign(d);
+                        string uuid = dto.UUID ?? "";
+                        if (string.IsNullOrEmpty(uuid)) continue;
+                        string ser = Newtonsoft.Json.JsonConvert.SerializeObject(dto);
+                        newDSer[uuid] = ser;
+                        if (!hadDBase || !dBase!.TryGetValue(uuid, out var prev) || prev != ser)
+                            changed.Add(dto);
+                    }
+                    _lastDesignSer[addressKey] = newDSer;
+                    if (changed.Count > 0)
+                    {
+                        p ??= new InteriorEditDeltaPayload { AddressKey = addressKey, BulkEdit = true };
+                        p.Designs = changed;
+                        if (!hadDBase)
+                            Plugin.Logger.LogInfo($"[Patcher] designer-close delta for '{addressKey}': no design baseline — all {changed.Count} design(s) travel (update-only, absolute-safe).");
+                    }
+                }
+                return p;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] BuildDesignerCloseDelta '{addressKey}': {ex.Message}"); return null; }
+        }
+
+        /// <summary>Apply a BuildingInteriorDelta. NEVER discarded (the delta is its edit's only
+        /// carrier — the invariant's guest→owner direction); mid-edit safety is PER-ITEM: any op on
+        /// the id being placed here is skipped (drag rule), an upsert re-creating a held id is
+        /// skipped inside ApplyOneItem (hands rule), and an EXPLICIT remove op overrides the
+        /// pending-placement rule (whole-set ABSENCE never removes a pending id; a named remove is a
+        /// deliberate statement — the design's Stage 1b endgame for the accepted B1 edge).
+        /// Upserts run through Stage 1a's ApplyOneItem — identical semantics to a full snapshot,
+        /// round-38d cargo shield included. Trap 2 honored: no struct version, no S4 baseline, no
+        /// owed-clear. Grant verification happens host-side before this is ever enqueued; callers
+        /// enqueue UNKEYED (trap 1: keyed coalescing loses superseded deltas). MAIN THREAD ONLY.</summary>
+        public static void ApplyInteriorEditDelta(InteriorEditDeltaPayload payload)
+        {
+            try
+            {
+                // Stage 2 review BLOCKER-U: empty means NO ops AND NO designs — a paint-only close
+                // has zero item ops and must still apply its design band.
+                if (payload == null || string.IsNullOrEmpty(payload.AddressKey)
+                    || ((payload.Ops?.Count ?? 0) == 0 && (payload.Designs?.Count ?? 0) == 0)) return;
+                payload.Ops ??= new List<InteriorItemOp>();   // the guard permits ops-less payloads; the loops below must not
+                payload.Designs ??= new List<InteriorDesignInfo>();
+                try
+                {
+                    string myPt = MPSaveCoordinator.ActivePlaythroughId ?? "";
+                    if (!string.IsNullOrEmpty(payload.PlaythroughId) && !string.IsNullOrEmpty(myPt) && payload.PlaythroughId != myPt)
+                    { Plugin.Logger.LogWarning($"[Patcher] interior delta for '{payload.AddressKey}' REFUSED — wrong playthrough lineage."); return; }
+                }
+                catch { }
+                var reg = FindRegistration(payload.AddressKey);
+                if (reg?.itemInstances == null) { Plugin.Logger.LogWarning($"[Patcher] interior delta: no reg for '{payload.AddressKey}'"); return; }
+                // Receiver-side REMOVE CAP (guardrail 2): a compliant sender suppresses before this
+                // can fire; over the cap here means a corrupt or hostile diff. Stage 2: a BulkEdit
+                // (designer close) legitimately carries a session's worth — 500 sanity bound instead
+                // of the 25-op action cap (mirrors the sender).
+                int removeCount = 0;
+                foreach (var op in payload.Ops) if (op != null && op.Kind == "remove") removeCount++;
+                int removeCap = payload.BulkEdit ? 500 : 25;
+                if (removeCount > removeCap)
+                {
+                    Plugin.Logger.LogWarning($"[Patcher] interior delta for '{payload.AddressKey}' REFUSED — {removeCount} removes exceeds the cap ({removeCap}); asking for a full serve instead.");
+                    // Owners are the truth and need no heal; replicas re-fetch via the owed drain.
+                    if (!InteriorSync.OwnsAddressLocally(payload.AddressKey))
+                        InteriorSync.NoteResyncOwed(payload.AddressKey, "over-cap delta refused");
+                    return;
+                }
+                if (!string.IsNullOrEmpty(payload.Layout) || payload.RadioStation != -1 || (payload.RadioVolume > -998f))
+                    Plugin.Logger.LogWarning($"[Patcher] interior delta for '{payload.AddressKey}' carries layout/radio bands — no delta leg sends those (layout is not a designer edit; radio has its own sync) — IGNORED loudly, never silently.");
+
+                // ── Stage 2: design entries, UPDATE-ONLY by UUID ─────────────────────────────────
+                // Never a clear+rebuild (that was M2's defect and the owner-paint-revert trap): each
+                // entry replaces its UUID in place — or adds it if unknown — with the full path's
+                // exact SerializedInteriorDesign construction (materials array NEVER null: the
+                // game's Deserialize does materials.Length unguarded — the black-screen bug).
+                var changedDesignUuids = new HashSet<string>();
+                try
+                {
+                    if (payload.Designs != null && payload.Designs.Count > 0 && reg.interiorDesigns != null)
+                    {
+                        if (!_lastDesignSer.TryGetValue(payload.AddressKey, out var dSer) || dSer == null)
+                            _lastDesignSer[payload.AddressKey] = dSer = new Dictionary<string, string>();
+                        foreach (var d in payload.Designs)
+                        {
+                            if (d == null || string.IsNullOrEmpty(d.UUID)) continue;
+                            int mcount = d.Materials?.Count ?? 0;
+                            var arr = new SerializedInteriorDesign.SerializableInteriorMaterial[mcount];
+                            for (int i = 0; i < mcount; i++)
+                            {
+                                var m = d.Materials[i];
+                                arr[i] = new SerializedInteriorDesign.SerializableInteriorMaterial
+                                {
+                                    MaterialID    = m.MaterialID,
+                                    MaterialIndex = m.MaterialIndex,
+                                    ColorIndex    = m.ColorIndex,
+                                };
+                            }
+                            var sd = new SerializedInteriorDesign { UUID = d.UUID, materials = arr };
+                            int at = reg.interiorDesigns.FindIndex(x => x != null && (x.UUID?.ToString() ?? "") == d.UUID);
+                            if (at >= 0) reg.interiorDesigns[at] = sd;
+                            else reg.interiorDesigns.Add(sd);
+                            string ser = Newtonsoft.Json.JsonConvert.SerializeObject(d);
+                            if (!dSer.TryGetValue(d.UUID, out var prev) || prev != ser) changedDesignUuids.Add(d.UUID);
+                            dSer[d.UUID] = ser;   // baseline merges per UUID — never replaced wholesale
+                        }
+                        // Field 20260831-223144: refresh the native lazy design lookup (see the
+                        // snapshot path) — the in-place replace above leaves it pointing at the OLD
+                        // SerializedInteriorDesign objects otherwise.
+                        try { reg.GenerateInteriorDesignerLookup(); } catch (Exception lx) { Plugin.Logger.LogWarning($"[Patcher] design lookup regen: {lx.Message}"); }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] delta designs apply: {ex.Message}"); }
+
+                if (!_lastItemSer.TryGetValue(payload.AddressKey, out var lastSer) || lastSer == null)
+                    _lastItemSer[payload.AddressKey] = lastSer = new Dictionary<string, string>(StringComparer.Ordinal);
+                bool receiverOwnsThis = false;
+                try { receiverOwnsThis = MergerFlip.TrulyMine(reg); } catch { }
+                string? heldId = null;
+                try { heldId = PlayerHelper.ItemInstanceInHands?.id; } catch { }
+                _pendingLocalPlacements.TryGetValue(payload.AddressKey, out var pendingPlaced);
+                string? dragId = null;
+                try
+                {
+                    if (BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode)
+                        dragId = BigAmbitions.PlacementSystem.PlacementSystem.CurrentPlaceableItemBeingPlaced?.GetItemInstance()?.id;
+                }
+                catch { }
+                var ctx = new ItemApplyCtx
+                {
+                    Reg = reg, AddressKey = payload.AddressKey,
+                    LastSer = lastSer, NewSer = new Dictionary<string, string>(StringComparer.Ordinal),
+                    NewDict = new Dictionary<string, BigAmbitions.Items.ItemInstance>(),
+                    ChangedIds = new HashSet<string>(), MovedIds = new HashSet<string>(), CargoOnlyIds = new HashSet<string>(),
+                    HeldId = heldId, PendingPlaced = pendingPlaced, ReceiverOwnsThis = receiverOwnsThis,
+                };
+                var removedIds = new HashSet<string>();
+                int upserts = 0, removes = 0, dragSkips = 0;
+                foreach (var op in payload.Ops)
+                {
+                    if (op == null || string.IsNullOrEmpty(op.Id)) continue;
+                    if (dragId != null && op.Id == dragId)
+                    {
+                        // Review MAJOR-M: an UPSERT on the dragged id is droppable (Q2 LWW — this
+                        // machine's own confirm re-asserts its version moments later), but a REMOVE
+                        // is not: its information exists nowhere else once dropped, and dropping it
+                        // left the item in two places at once (the sender's hands AND this floor —
+                        // round-10 #3b's duplication, permanent). A named remove is a deliberate
+                        // statement — DEFER it to drag end, where the drain deletes the item and
+                        // re-conveys the removal, so the remove wins over the in-flight move.
+                        if (op.Kind == "remove")
+                        {
+                            if (!_deferredDeltaRemoves.TryGetValue(payload.AddressKey, out var defSet))
+                                _deferredDeltaRemoves[payload.AddressKey] = defSet = new HashSet<string>(StringComparer.Ordinal);
+                            defSet.Add(op.Id);
+                            Plugin.Logger.LogWarning($"[Patcher] delta REMOVE of '{op.Id}' in '{payload.AddressKey}' DEFERRED — it is being moved on this machine right now; executes at drag end (Stage 1b, review MAJOR-M).");
+                        }
+                        else
+                        {
+                            dragSkips++;
+                            Plugin.Logger.LogInfo($"[Patcher] delta upsert on '{op.Id}' in '{payload.AddressKey}' SKIPPED — it is being placed on this machine right now (drag rule); this machine's own confirm forward re-asserts it (Q2 LWW).");
+                        }
+                        continue;
+                    }
+                    if (op.Kind == "remove")
+                    {
+                        // An EXPLICIT remove overrides the pending rule — retire the pending entry too.
+                        if (pendingPlaced != null && pendingPlaced.Remove(op.Id) && pendingPlaced.Count == 0)
+                            _pendingLocalPlacements.Remove(payload.AddressKey);
+                        if (reg.itemInstances.Remove(op.Id)) { removedIds.Add(op.Id); removes++; }
+                        lastSer.Remove(op.Id);
+                        continue;
+                    }
+                    if (op.Kind != "upsert" || op.Item == null || op.Item.Id != op.Id) continue;
+                    ApplyOneItem(ctx, op.Item);   // Stage 1a: the identical per-item semantics
+                    if (ctx.NewDict.TryGetValue(op.Id, out var inst) && inst != null) { reg.itemInstances[op.Id] = inst; upserts++; }
+                    if (ctx.NewSer.TryGetValue(op.Id, out var s)) lastSer[op.Id] = s;   // baseline merges per id — never replaced wholesale
+                }
+                // Review MAJOR-L: the Host→subscriber relay leg CARRIES the minted struct version
+                // (it IS the host's stamped stream) — recording it keeps this machine cargo-sync
+                // coherent without a full re-serve. 0 = any other leg → never recorded (trap 2).
+                if (payload.StructVersion > 0) _lastAppliedStructVersion[payload.AddressKey] = payload.StructVersion;
+                Plugin.Logger.LogInfo($"[Patcher] interior delta applied for '{payload.AddressKey}': upserts={upserts} removes={removes} dragSkips={dragSkips} designs={changedDesignUuids.Count} sv={payload.StructVersion} (changed={ctx.ChangedIds.Count} moved={ctx.MovedIds.Count} cargoOnly={ctx.CargoOnlyIds.Count}).");
+                TryRefreshActiveInteriorIfMatches(payload.AddressKey, ctx.ChangedIds, removedIds,
+                    changedDesignUuids: changedDesignUuids, layoutChanged: false, movedIds: ctx.MovedIds);
+                // D3a (2026-09-19, design Q5 GAP): the refresh above only reaches a building whose ACTIVE
+                // BuildingManager matches this address, which an OUTSIDE viewer of a Hamptons house has
+                // not got — so until now a delta moved the data and nothing on screen. (A granted guest
+                // ON the plot does have one, EnterHamptonsBuilding sets it; fold V3 sends that case here
+                // too, so the house's own object set is rebuilt by exactly one refresher.)
+                TryReloadHamptonsHouseAfterApply(payload.AddressKey, reg, ctx.ChangedIds, removedIds,
+                    ctx.MovedIds, "delta", changedDesignUuids.Count > 0);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ApplyInteriorEditDelta: {ex.Message}"); }
+        }
+
+        public static void NoteLocalItemState(string addressKey, System.Collections.Generic.List<ItemInstanceInfo> items)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey) || items == null) return;
+                var ser = new Dictionary<string, string>();
+                foreach (var i in items)
+                    if (i != null && !string.IsNullOrEmpty(i.Id))
+                        ser[i.Id] = Newtonsoft.Json.JsonConvert.SerializeObject(i);
+                _lastItemSer[addressKey] = ser;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] NoteLocalItemState: {ex.Message}"); }
+        }
+
+        /// <summary>H2: redraw a REPLICATED Hamptons house after its interior apply.
+        /// Owner gate: we skip any registration this machine holds by tenancy or by deed — an owner
+        /// never applies a snapshot of its own house (the interior/cargo authority shield refuses the
+        /// host's relay of our own push), and this guard states that rather than relying on it.
+        /// D3a (2026-09-19): an apply that knows WHICH ids it touched gets the INCREMENTAL redraw
+        /// (RefreshHamptonsItems). The whole-house ReloadHouseCoroutine stays the fallback for exactly
+        /// two cases: an apply with no diff sets at all (a legacy caller), and an apply that changed the
+        /// PAINT or the LAYOUT — BuildingManager.ApplyInteriorDesign runs inside that coroutine and
+        /// nowhere else on this path, so a repaint must still take the whole-house route.
+        /// A house that is not loaded needs nothing: the native one-shot loader reads itemInstances
+        /// itself at the next LOD0.</summary>
+        private static void TryReloadHamptonsHouseAfterApply(string addressKey, BuildingRegistration reg,
+            HashSet<string>? changedIds = null, HashSet<string>? removedIds = null,
+            HashSet<string>? movedIds = null, string source = "snapshot", bool designOrLayoutChanged = false)
+        {
+            try
+            {
+                if (reg?.BuildingCached == null || !reg.BuildingCached.IsHamptonsHouse()) return;
+                bool mine = false;
+                try { mine = reg.RentedByPlayer || reg.BuildingOwnedByPlayer; } catch { }
+                if (mine) return;
+                var cc = InstanceBehavior<CityManager>.Instance?.FindCityBuildingController(reg.BuildingCached.Address)
+                         as CityHamptonsHouseController;
+                var hh = cc?.hamptonsHouse;
+                if (hh == null || !hh.IsHouseLoaded) return;   // not at LOD0 — the one-shot loader will read the fresh data itself
+                int nulls = (changedIds == null ? 1 : 0) + (removedIds == null ? 1 : 0) + (movedIds == null ? 1 : 0);
+                bool noDiff = nulls == 3;
+                // FOLD V8: MIXED nullity is a caller bug, not a diff — "null means no information" is a
+                // whole-set statement, so a partly-null call would silently treat a missing set as empty
+                // and skip real work. Say so and take the safe route.
+                bool mixedNull = nulls > 0 && nulls < 3;
+                if (mixedNull)
+                    Plugin.Logger.LogWarning($"[Hamptons] '{addressKey}' redraw got {nulls} of 3 id sets null — a partly-null diff is a CALLER BUG; taking the whole-house route. Report this.");
+                // FOLD V4: the native loader sets IsHouseLoaded at the START of its load and its
+                // instantiate coroutine yields every 0.5 ms while the player is outside the plot
+                // (HamptonsHouse.cs:351-355, :384-388), so an apply landing inside that window would spawn
+                // ids the coroutine then instantiates AGAIN from its own copied list. The whole-house
+                // route is safe there because ReloadHouseCoroutine stops that coroutine natively (:68-72).
+                bool loadInFlight = HamptonsLoadInFlight(hh);
+                if (noDiff || mixedNull || designOrLayoutChanged || loadInFlight)
+                {
+                    int n = 0; try { n = reg.itemInstances?.Count ?? 0; } catch { }
+                    hh.StartCoroutine(hh.ReloadHouseCoroutine(true));
+                    Plugin.Logger.LogInfo($"[Hamptons] '{addressKey}' interior reloaded after apply ({n} items) — whole-house route: "
+                        + (loadInFlight ? "the native item load is still running, and only the reload stops it."
+                        : noDiff        ? "this apply carried no diff sets."
+                        : mixedNull     ? "this apply carried a partly-null diff."
+                                        : "the paint/layout changed, and only the reload applies those."));
+                    return;
+                }
+                RefreshHamptonsItems(hh, reg, changedIds, removedIds, movedIds,
+                    out int destroyed, out int spawned, out int moved);
+                // The loader's copied list is only read DURING a load; after an incremental redraw it no longer
+                // describes the house, and HamptonsLoadInFlight compares against it - so drop it.
+                try { hh._itemsToInstantiate.Clear(); } catch { }
+                if ((destroyed > 0 || spawned > 0 || moved > 0) && _hamptonsIncrementalLines++ < 30)
+                    Plugin.Logger.LogInfo($"[Hamptons] '{addressKey}' incremental: destroyed={destroyed} spawned={spawned} moved={moved} ({source}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] redraw after apply '{addressKey}': {ex.Message}"); }
+        }
+
+        /// <summary>D3a log budget: 30 lines per session, then silent (this can fire per edit).</summary>
+        private static int _hamptonsIncrementalLines;
+        /// <summary>Fold V3 log budget: 10 lines per session, then silent (fires per apply).</summary>
+        private static int _hamptonsDeclineLines;
+
+        /// <summary>D3a (2026-09-19, design Q5): the INCREMENTAL redraw of a Hamptons house, modelled on
+        /// RefreshItemsForActiveBuilding (child rescue → destroy changed/removed → InstantiateSingleInstance
+        /// for changed + missing → re-link stacked children → move pass) with the substitutions the design
+        /// names: the container is the house's own <c>itemsContainer</c>, the controller list is the house's
+        /// own <c>allItemControllers</c>, every spawn is stamped <c>loadedInHamptonsHouse</c> exactly as
+        /// native does (HamptonsHouse.cs:373), and the pass closes with
+        /// <c>SetUpItemControllersParents(hh.allItemControllers)</c> (:363). The second-floor visibility rule
+        /// is native's own: ToggleSecondFloorItem runs only while the player is inside the plot (:380), and
+        /// an item spawned while the city map is open is hidden and recorded (:375-379) so the map's close
+        /// shows it again.
+        /// Two deliberate differences from the active-building version: NO live-placement cancel (that
+        /// guard exists for a stranded outline in the local player's OWN building, which this path never
+        /// touches — the per-item "in the hands" and "being placed" rules are kept), and no
+        /// ScheduleUpdateAvailableProducers (a residence has no producers and no waiting lines).
+        /// The house's controller list is this house's whole population, so no registration filter is
+        /// needed on the destroy pass.</summary>
+        private static void RefreshHamptonsItems(HamptonsHouse hh, BuildingRegistration reg,
+            HashSet<string>? changedIds, HashSet<string>? removedIds, HashSet<string>? movedIds,
+            out int destroyed, out int spawned, out int moved)
+        {
+            destroyed = 0; spawned = 0; moved = 0;
+            try
+            {
+                var bm = InstanceBehavior<BuildingManager>.Instance;
+                if (bm == null || hh.itemsContainer == null || hh.allItemControllers == null)
+                {
+                    Plugin.Logger.LogWarning($"[Hamptons] incremental redraw of '{GameStateReader.AddressKey(reg)}' skipped — no BuildingManager / itemsContainer yet.");
+                    return;
+                }
+                bool fullRebuild = changedIds == null;
+                float roofY = 0f;
+                try { roofY = BuildingSizeHelper.GetBuildingRoofPosition(hh.buildingSize, 0); } catch { }
+                bool insidePlot = false; try { insidePlot = hh._isPlayerInsidePlot; } catch { }
+                bool mapOpen = false;    try { mapOpen = CityMap.IsOpen; } catch { }
+                var liveById = new Dictionary<string, ItemController>();
+                var killedControllers = new HashSet<ItemController>();
+
+                // FOLD V3: a granted guest can be INSIDE this house and in placement mode, so this path
+                // carries the same live-placement teardown the active-building refresh does — round-37i
+                // (destroy+respawn skips StopPlacingItem, the only pairing of Outline/RemoveOutline, and
+                // strands the parent's disableHighlightInteraction) and round-279 (a bare StopPlacingItem
+                // leaves the PlacementMode navigation blocker held = total interaction wedge). Only when
+                // the local player is inside THIS house: an outside viewer's placement is elsewhere.
+                try
+                {
+                    if (insidePlot && BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode)
+                    {
+                        string placedId = "", parentId = "";
+                        try { placedId = BigAmbitions.PlacementSystem.PlacementSystem.CurrentPlaceableItemBeingPlaced?.GetItemInstance()?.id?.ToString() ?? ""; } catch { }
+                        try { parentId = BigAmbitions.PlacementSystem.PlacementSystem.lastParentItem?.GetItemInstance()?.id?.ToString() ?? ""; } catch { }
+                        // Round-48b: the redraw never touches the actively-placed item (the destroy pass
+                        // defers it), so abort only for the PARENT changing or a full rebuild.
+                        bool touched = fullRebuild
+                            || (!string.IsNullOrEmpty(parentId) && (changedIds!.Contains(parentId) || (removedIds?.Contains(parentId) ?? false)));
+                        if (touched)
+                        {
+                            Plugin.Logger.LogWarning($"[Hamptons] incremental redraw intersects a LIVE placement (placed={placedId} parent={parentId}) — running the FULL native cancel so nothing strands (round-279).");
+                            try
+                            {
+                                Buildings.Indoors.InteriorDesign.PlacementHelper.CancelPlacementMode(true);
+                            }
+                            catch (Exception cex)
+                            {
+                                Plugin.Logger.LogWarning($"[Hamptons] CancelPlacementMode threw ({cex.Message}) — fallback: StopPlacingItem + explicit blocker/time-control/autosave release (round-279).");
+                                try { BigAmbitions.PlacementSystem.PlacementSystem.StopPlacingItem(); } catch { }
+                                try { InstanceBehavior<GameManager>.Instance.playerController.UnsetNavigationBlocker(NavigationBlocker.PlacementMode); } catch { }
+                                try { InstanceBehavior<UI.UIs>.Instance.gameSpeed.DisableTimeControl(false); } catch { }
+                                try { GameManager.preventAutoSave = false; } catch { }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] placement-intersect guard: {ex.Message}"); }
+
+                // ── destroy pass (over a copy: the list is mutated below) ────────────────────────
+                int failed = 0;
+                try
+                {
+                    var current = new List<ItemController>(hh.allItemControllers);
+                    foreach (var ic in current)
+                    {
+                        if (ic == null) continue;
+                        // Stage 0 hands rule (F-2026-08-25-A): never destroy the object that IS the item
+                        // in the local player's hands — REFERENCE identity, not id or address.
+                        try
+                        {
+                            if (ic.ItemInstance != null
+                                && object.ReferenceEquals(ic.ItemInstance, PlayerHelper.ItemInstanceInHands))
+                                continue;
+                        }
+                        catch { }
+                        string id = "";
+                        try { id = ic.ItemInstance?.id ?? ""; } catch { }
+                        bool isChanged = changedIds != null && changedIds.Contains(id);
+                        bool isRemoved = removedIds != null && removedIds.Contains(id);
+                        // Round-48b: NEVER destroy the item actively being placed — changed OR removed.
+                        if ((isChanged || isRemoved) && !fullRebuild && !string.IsNullOrEmpty(id))
+                        {
+                            try
+                            {
+                                if (BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode
+                                    && (BigAmbitions.PlacementSystem.PlacementSystem.CurrentPlaceableItemBeingPlaced?.GetItemInstance()?.id?.ToString() ?? "") == id)
+                                {
+                                    liveById[id] = ic;   // counts as a survivor → the spawn pass skips it
+                                    continue;
+                                }
+                            }
+                            catch { }
+                        }
+                        if (!(fullRebuild || string.IsNullOrEmpty(id) || isChanged || isRemoved))
+                        {
+                            if (!liveById.ContainsKey(id)) liveById[id] = ic;
+                            continue;
+                        }
+                        // Round-278: attached children are Unity transform children and would die with
+                        // the parent AFTER the spawn pass recorded them as survivors. Detach SCENE-side
+                        // only (the native RemoveFromParentPlaceableItem would also erase the parent's
+                        // stackedItems DATA record, which the apply just wrote authoritatively); the
+                        // re-link pass below re-attaches them to the respawned parent.
+                        try
+                        {
+                            if (ic.childItemControllers != null && ic.childItemControllers.Count > 0)
+                            {
+                                var rescue = new List<ItemController>(ic.childItemControllers);
+                                foreach (var kid in rescue)
+                                {
+                                    if (kid == null) continue;
+                                    try
+                                    {
+                                        kid.parentItemController = null;
+                                        kid.parentAttachmentPoint = null;
+                                        kid.transform.SetParent(hh.itemsContainer, true);
+                                    }
+                                    catch { }
+                                }
+                                ic.childItemControllers.Clear();
+                            }
+                        }
+                        catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] child rescue for '{id}': {ex.Message}"); }
+                        killedControllers.Add(ic);
+                        try { hh.allItemControllers.Remove(ic); } catch { }
+                        try { hh._itemsVisible.Remove(ic); } catch { }   // native's city-map hidden set: a destroyed entry would be re-Shown on map close
+                        // SALE-DETACH-1: the in-place policy KEEPS this controller's ItemInstance alive —
+                        // detach its cargo subscriptions before the object goes.
+                        try { DetachCargoCallbacks(ic); } catch { }
+                        // I4 fold (re-check of 7348b28, 2026-09-28): off its parent's childItemControllers too, as the shop refresh
+                        // does since fold F1 (fcff4da/0e660c7; native ItemController.cs:1323, scene side only) - a destroyed child
+                        // left there made OverlayHelper.GetRelevantEntity return it and every hover NRE'd.
+                        try { var par = ic.parentItemController; if (par != null) par.childItemControllers?.Remove(ic); } catch { }
+                        UnityEngine.Object.Destroy(ic.gameObject);
+                        destroyed++;
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] item destroy pass: {ex.Message}"); }
+
+                // ── spawn pass: changed ids + any id with no surviving controller ────────────────
+                try
+                {
+                    if (reg.itemInstances != null)
+                    {
+                        foreach (var kv in reg.itemInstances)
+                        {
+                            var ii = kv.Value;
+                            if (ii == null) continue;
+                            if (!fullRebuild && liveById.ContainsKey(kv.Key)) continue;   // untouched
+                            try
+                            {
+                                var ic = bm.InstantiateSingleInstance(ii, hh.itemsContainer, false);
+                                if (ic == null) { failed++; continue; }
+                                ic.loadedInHamptonsHouse = true;             // native HamptonsHouse.cs:373
+                                hh.allItemControllers.Add(ic);
+                                if (mapOpen) { try { ic.Hide(); hh._itemsVisible.Add(ic); } catch { } }
+                                if (insidePlot) { try { hh.ToggleSecondFloorItem(hh.currentHeightIndex == 1, ic, roofY); } catch { } }
+                                spawned++;
+                            }
+                            catch (Exception ex)
+                            {
+                                failed++;
+                                if (failed <= 3) Plugin.Logger.LogWarning($"[Hamptons] InstantiateSingleInstance id={ii.id}: {ex.Message}");
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] item spawn pass: {ex.Message}"); }
+
+                // ── re-link stacked children to their (possibly just respawned) parents ──────────
+                try
+                {
+                    bool anyStacked = false;
+                    if (reg.itemInstances != null)
+                        foreach (var kv in reg.itemInstances)
+                            if (kv.Value?.stackedItems != null && kv.Value.stackedItems.Count > 0) { anyStacked = true; break; }
+                    if (anyStacked && reg.itemInstances != null && (spawned > 0 || destroyed > 0))
+                    {
+                        var nowById = new Dictionary<string, ItemController>();
+                        foreach (var c in hh.allItemControllers)
+                        {
+                            if (c == null || killedControllers.Contains(c)) continue;
+                            string cid = ""; try { cid = c.ItemInstance?.id ?? ""; } catch { }
+                            if (!string.IsNullOrEmpty(cid)) nowById[cid] = c;
+                        }
+                        int reattached = 0;
+                        foreach (var kv in reg.itemInstances)
+                        {
+                            var pi = kv.Value;
+                            if (pi?.stackedItems == null || pi.stackedItems.Count == 0) continue;
+                            if (!nowById.TryGetValue(kv.Key, out var pic) || pic == null) continue;
+                            foreach (var st in pi.stackedItems)
+                            {
+                                if (st == null || string.IsNullOrEmpty(st.childId)) continue;
+                                if (!nowById.TryGetValue(st.childId, out var kidIc) || kidIc == null) continue;
+                                try
+                                {
+                                    if (kidIc.parentItemController != null) continue;   // already attached
+                                    var pts = pic.AttachmentPoints;
+                                    if (pts == null || st.attachmentIndex < 0 || st.attachmentIndex >= pts.Length) continue;
+                                    kidIc.SetToParentPlaceableItem(pic, pts[st.attachmentIndex]);
+                                    reattached++;
+                                }
+                                catch { }
+                            }
+                        }
+                        // Tripwire: a data id with NO live controller after the spawn pass is an ORPHAN.
+                        int orphans = 0;
+                        foreach (var kv in reg.itemInstances)
+                            if (kv.Value != null && !nowById.ContainsKey(kv.Key)) orphans++;
+                        if (orphans > 0)
+                            Plugin.Logger.LogWarning($"[Hamptons] incremental redraw left {orphans} ORPHAN id(s) (data present, no live object) in '{GameStateReader.AddressKey(reg)}' — report this (reattached={reattached}).");
+                        else if (reattached > 0)
+                            Plugin.Logger.LogInfo($"[Hamptons] re-link pass: {reattached} child(ren) re-attached.");
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] re-link pass: {ex.Message}"); }
+
+                // ── move pass (round-22): a transform-only delta keeps its live GameObject ───────
+                try
+                {
+                    if (movedIds != null && reg.itemInstances != null)
+                        foreach (var id in movedIds)
+                        {
+                            if (!liveById.TryGetValue(id, out var ic) || ic == null) continue;   // no survivor → the spawn pass covered it
+                            if (!reg.itemInstances.TryGetValue(id, out var ni) || ni == null) continue;
+                            try
+                            {
+                                ic.ItemInstance = ni;
+                                ic.transform.position = ni.position;
+                                ic.transform.rotation = ni.Rotation;
+                                // FOLD V7: the pose just changed, so the floor this item belongs to may have
+                                // changed with it — re-run native's own visibility rule, exactly as the spawn
+                                // pass does and only while the player is inside the plot (HamptonsHouse.cs:380).
+                                if (insidePlot) { try { hh.ToggleSecondFloorItem(hh.currentHeightIndex == 1, ic, roofY); } catch { } }
+                                moved++;
+                            }
+                            catch { }
+                        }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] item move pass: {ex.Message}"); }
+
+                // Native closes every load with this (HamptonsHouse.cs:363) — it is what re-parents the
+                // controllers the spawn pass just made.
+                if (destroyed > 0 || spawned > 0 || moved > 0)
+                    try { bm.SetUpItemControllersParents(hh.allItemControllers); }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] SetUpItemControllersParents: {ex.Message}"); }
+                if (failed > 0)
+                    Plugin.Logger.LogWarning($"[Hamptons] incremental redraw of '{GameStateReader.AddressKey(reg)}': {failed} item(s) failed to spawn.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] RefreshHamptonsItems: {ex.Message}"); }
+        }
+
+        /// <summary>D3b: this machine's interior BASELINES for an address are statements about a copy we
+        /// have just discarded — the S4-lite duplicate test, the per-id and per-UUID diff baselines and the
+        /// struct version would all measure a future serve against furniture that is no longer here (an
+        /// identical re-serve would be skipped as "already applied" and the house would stay empty).
+        /// Forgetting them makes the next serve for this address land as news, in full.</summary>
+        /// <summary>D3b (fold V1) — the ONLY way into the vacated-house clear. Callers must be explicit,
+        /// address-naming tenancy-END events from the authority: the client's vacate notify
+        /// (ApplyBuildingVacated), and the host's SaleCompleted reflection (MPServer.HandleSaleCompleted —
+        /// a deed END; CancelSale is NOT one, so HostRemoveFromForSale is deliberately not the hook).
+        /// Never a predicate, never an inference. Read 2026-09-19: neither MakeRegVacant (:6809-6816) nor
+        /// HostReflectPlayerVacate (:6790-6800) nor the client's own vacate writes touch itemInstances, so
+        /// the house is NOT emptied for anyone today — this is what does it.</summary>
+        internal static void ClearHamptonsInteriorOnTenancyEnd(string addressKey, string why)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return;
+                var reg = FindRegistration(addressKey);
+                if (reg?.BuildingCached == null || !reg.BuildingCached.IsHamptonsHouse()) return;
+                HamptonsAccess.ClearVacatedInterior(reg, addressKey, why);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Hamptons] tenancy-end clear '{addressKey}': {ex.Message}"); }
+        }
+
+        internal static void ForgetInteriorBaselines(string addressKey)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return;
+                _lastItemSer.Remove(addressKey);
+                _lastDesignSer.Remove(addressKey);
+                _lastAppliedSig.Remove(addressKey);
+                _lastAppliedLocalTag.Remove(addressKey);
+                _lastAppliedStructVersion.Remove(addressKey);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ForgetInteriorBaselines '{addressKey}': {ex.Message}"); }
+        }
+
+        private static void TryRefreshActiveInteriorIfMatches(string addressKey,
+            HashSet<string>? changedIds = null, HashSet<string>? removedIds = null,
+            HashSet<string>? changedDesignUuids = null, bool layoutChanged = true,
+            HashSet<string>? movedIds = null)
+        {
+            try
+            {
+                // Round-86 (user-approved, MEASURED): this refresh ran UNCONDITIONALLY on every owner-snapshot
+                // apply while the local player stood inside the building — 186-199ms of every ~195ms apply
+                // (two whole-scene FindObjectsOfType scans + an always-scheduled re-staff coroutine + the item
+                // pass), even at changed=0 moved=0 removed=0 (26-apply probe capture, 2026-07-25). Gate every
+                // expensive step on the inputs that justify it. NULL sets keep their historical meaning
+                // ("no diff info → do everything"); only explicitly-EMPTY sets skip work.
+                bool designWork = changedDesignUuids == null || changedDesignUuids.Count > 0;
+                bool itemWork   = (changedIds == null || changedIds.Count > 0)
+                               || (removedIds == null || removedIds.Count > 0)
+                               || (movedIds   == null || movedIds.Count   > 0);
+                if (!layoutChanged && !designWork && !itemWork) return;   // no-op apply → no scene scans at all
+
+                var bms = UnityEngine.Object.FindObjectsOfType(typeof(BuildingManager));
+                if (bms == null || bms.Length == 0) return;
+                BuildingManager? matched = null;
+                for (int i = 0; i < bms.Length; i++)
+                {
+                    var bm = bms[i] as BuildingManager;
+                    if (bm == null) continue;
+                    var activeReg = bm.buildingRegistration;
+                    if (activeReg == null) continue;
+                    if (GameStateReader.AddressKey(activeReg) != addressKey) continue;
+                    matched = bm;
+                    break;
+                }
+                if (matched == null) return;
+                var reg = matched.buildingRegistration;
+                if (reg == null || reg.interiorDesigns == null) return;
+
+                // FOLD V3 (2026-09-19): EnterHamptonsBuilding sets BOTH `building` and
+                // `buildingRegistration` (BuildingManager.cs:647 / :659), so this refresh DOES match for a
+                // granted guest standing on a Hamptons plot — and it respawns through IndoorItemContainer
+                // (which redirects to the house's own itemsContainer, :189-199) WITHOUT adding to
+                // hh.allItemControllers and WITHOUT stamping loadedInHamptonsHouse, after which
+                // RefreshHamptonsItems spawns the very same ids a second time. RULE: for a Hamptons
+                // address exactly ONE refresher runs, and it is the house-correct one.
+                // The LOCAL TENANT/OWNER is the exception and keeps this path: their own house is built by
+                // native EnterHamptonsBuilding → LoadBuilding → LoadItems, this refresh is what keeps that
+                // build current, and the Hamptons redraw declines them by its owner gate.
+                try
+                {
+                    var hampt = reg.BuildingCached;
+                    if (hampt != null && hampt.IsHamptonsHouse() && !(reg.RentedByPlayer || reg.BuildingOwnedByPlayer))
+                    {
+                        if (_hamptonsDeclineLines++ < 10)
+                            Plugin.Logger.LogInfo($"[Hamptons] active-building refresh declined for '{addressKey}' — a Hamptons house this machine does not hold is redrawn by RefreshHamptonsItems alone (fold V3).");
+                        return;
+                    }
+                }
+                catch { }
+
+                // For AI businesses (CoffeeShop, FastFoodRestaurant, etc.),
+                // the items come from the BusinessLayoutSet template named by
+                // reg.Layout — they're NOT in reg.itemInstances.  At first
+                // entry the client's LoadBuilding ran with reg.Layout still
+                // empty (Phase 1b suppression prevented CityGenerator from
+                // setting it), so nothing was template-spawned.  Now that our
+                // snapshot has set reg.Layout, re-call LoadBuilding so the
+                // template spawns its furniture/shelves.  Idempotent for
+                // already-loaded layouts.
+                // DE-DUP (2026-06-23): only re-spawn the layout when it actually changed.  Re-calling
+                // LoadBuilding when the layout is already correct stacks a DUPLICATE set of stations
+                // (the IRS 8-vs-4 / 30-station duplication + malformed duplicates that NRE on staffing).
+                try { if (layoutChanged) matched.LoadBuilding(false); }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] LoadBuilding re-trigger for layout '{reg.Layout}': {ex.Message}"); }
+
+                // MP STAFFING FIX (2026-06-23): native AI staffing (BuildingManager.SetupAiEmployeeStations)
+                // runs on building ENTRY — but for AI businesses the layout is Phase-1b-suppressed on the
+                // client and only just spawned its stations via the re-load ABOVE, AFTER that staffing
+                // already ran.  So the stations are UNSTAFFED on the client (e.g. hairdresser chairs / IRS
+                // booths → a customer joins an unservable queue and the cancel path NREs on the null employee
+                // → hard lock; user 2026-06-23: client hairdresser had 0 staffed vs host's 5).  Re-run the
+                // native staffing now that the stations exist: AssignEmployee self-skips already-staffed
+                // stations (idempotent) and SetupAiEmployeeStations self-skips player-owned shops.
+                // Re-staff the (possibly freshly-spawned) stations — DEFERRED a couple frames so their Start
+                // has run.  Staffing them the SAME frame the re-load spawns them NREs inside the game's
+                // AssignEmployee (uninitialised item data — Braids and Blowouts, 2026-06-23).  Run on the
+                // building's own MonoBehaviour; ReStaffStationsNow is idempotent (skips already-staffed).
+                // Round-86 gated this on layoutChanged as overhead; H-ENTRY-1 r2 lifts the gate (see below).
+                // H-ENTRY-1 r2 (review r1 #4): with the layout mirrored at join, `layoutChanged` is false on the entry snapshot, which also
+                // skipped THIS re-staff — but native entry staffing still reaches SetupAiEmployeeStations on only a minority of client entries
+                // (P-ENTRY-BAIL), so it is no longer gated on the layout flag. It still runs only when an apply reaches this point: the
+                // byte-identical re-entry snapshot is skipped upstream (S4-lite) and the no-op gate above returns when nothing changed — so in
+                // practice the FIRST entry per address per session (or an entry whose interior changed). ReStaffStationsNow is idempotent
+                // and refuses player-run shops (round-33 guard); it runs from edit deltas too, which round-33's blank-stamp case could reach.
+                try { matched.StartCoroutine(ReStaffAfterInit(matched, addressKey)); }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] schedule re-staff for '{addressKey}': {ex.Message}"); }
+
+                // Round-86: the element walk's FindObjectsOfType scan is the expensive half — run it only
+                // when a design actually changed (or after a layout re-load, whose fresh elements may need
+                // their designs applied). The per-element unchanged-skip inside keeps the flicker fix.
+                if (layoutChanged || designWork)
+                {
+                // UUID → SerializedInteriorDesign dict from the fresh data we just wrote.
+                var dict = new System.Collections.Generic.Dictionary<string, SerializedInteriorDesign>();
+                for (int i = 0; i < reg.interiorDesigns.Count; i++)
+                {
+                    var d = reg.interiorDesigns[i];
+                    if (d == null) continue;
+                    string u = d.UUID?.ToString() ?? "";
+                    if (!string.IsNullOrEmpty(u)) dict[u] = d;
+                }
+
+                int deserialized = 0;
+                int matchedUuids = 0;
+                int skippedUnchanged = 0;
+                var elementsObj = UnityEngine.Object.FindObjectsOfType(typeof(InteriorElement));
+                if (elementsObj != null)
+                {
+                    for (int i = 0; i < elementsObj.Length; i++)
+                    {
+                        var el = elementsObj[i] as InteriorElement;
+                        if (el == null) continue;
+                        string uuid = el.UUID?.ToString() ?? "";
+                        if (string.IsNullOrEmpty(uuid)) continue;
+                        if (!dict.TryGetValue(uuid, out var design)) continue;
+                        matchedUuids++;
+                        // Diff: re-Deserializing an UNCHANGED element makes
+                        // doors + their light visibly flicker on every snapshot
+                        // (user, 2026-06-12).  null set = no diff info → all.
+                        if (changedDesignUuids != null && !changedDesignUuids.Contains(uuid))
+                        { skippedUnchanged++; continue; }
+                        try { el.Deserialize(design); deserialized++; }
+                        catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] InteriorElement.Deserialize for UUID '{uuid}': {ex.Message}"); }
+                    }
+                }
+                Plugin.Logger.LogInfo($"[Patcher] Interior refresh for '{addressKey}': deserialized {deserialized}/{matchedUuids} elements (skipped {skippedUnchanged} unchanged, of {dict.Count} designs).");
+                }
+
+                // ── Item refresh (Phase 2b) ─────────────────────────────────
+                // Per-item diff: only touch the ItemControllers whose data
+                // actually changed (or vanished); unchanged shelves keep their
+                // GameObjects — and with them the game's random stock-visual
+                // shuffle (full rebuilds re-rolled it = flicker, 2026-06-12).
+                // Round-86: only when some item changed, moved, or vanished.
+                if (itemWork)
+                    RefreshItemsForActiveBuilding(matched, reg, changedIds, removedIds, movedIds);
+
+                // Round-34 (user: a guest-placed register must warn the OWNER about paper bags exactly like
+                // an owner-placed one): adoption skips the native placement tail, so refresh warning icons +
+                // the without-stock todo tasks for the adopted items on the OWNER's machine. Deferred like
+                // the re-staff so the respawned controllers' Start has run.
+                try
+                {
+                    // Round-86: itemWork gate — OwnerWarningRefreshNow already no-ops on empty ids, but
+                    // scheduling the coroutine every apply was still overhead.
+                    // I3 (2026-09-12): a HELPER standing in the owner's shop needs the same post-apply
+                    // icon pass — adoption/structure changes skip the native placement tail for them too.
+                    bool helperHere = false;
+                    try { helperHere = BusinessHelperRoute.HelperHere(out var ha) && ha == addressKey; } catch { }
+                    if (itemWork && (reg.RentedByPlayer || helperHere))
+                        matched.StartCoroutine(OwnerWarningRefreshAfterInit(matched, addressKey, changedIds, movedIds));
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] schedule owner warning refresh: {ex.Message}"); }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] TryRefreshActiveInteriorIfMatches: {ex.Message}"); }
+        }
+
+        private static System.Collections.IEnumerator OwnerWarningRefreshAfterInit(
+            BuildingManager bm, string addressKey,
+            System.Collections.Generic.HashSet<string>? changed, System.Collections.Generic.HashSet<string>? moved)
+        {
+            yield return null;
+            yield return null;
+            OwnerWarningRefreshNow(bm, addressKey, changed, moved);
+        }
+
+        // H-DELIVDUPE-1 (batch 14): budget for the adopted-item listing below, 40 lines per session.
+        private static int _adoptedTailLogged;
+
+        private static void OwnerWarningRefreshNow(
+            BuildingManager bm, string addressKey,
+            System.Collections.Generic.HashSet<string>? changed, System.Collections.Generic.HashSet<string>? moved)
+        {
+            try
+            {
+                var reg = bm?.buildingRegistration;
+                if (reg == null) return;
+                if (GameStateReader.AddressKey(reg) != addressKey) return;   // owner left this building → skip
+                // I3: the OWNER gets the whole pass; a HELPER standing in the same shop gets the ICONS
+                // only. The rest of this method is owner bookkeeping — OnItemChanged rebinds employees
+                // and capacity, GenerateItemsWithoutStockTasks writes the owner's to-do list, and the
+                // security recompute writes reg.securityLevel — none of which a visitor may author.
+                bool ownerHere  = false;
+                // H-MERGERSTOCK-2 (build read): the machine that BOOKS this shop gets the owner pass - not the raw
+                // flag, which a merger-flipped partner shop also reads True (a member then wrote the owner's to-do
+                // list and security level on its own replica). A stand-in for an absent owner books it.
+                try { ownerHere = MergerFlip.BooksHere(reg); } catch { }
+                bool helperHere = false;
+                if (!ownerHere) { try { helperHere = BusinessHelperRoute.HelperHere(out var ha) && ha == addressKey; } catch { } }
+                if (!ownerHere && !helperHere) return;
+                var ids = new System.Collections.Generic.HashSet<string>();
+                if (changed != null) foreach (var i in changed) ids.Add(i);
+                if (moved   != null) foreach (var i in moved)   ids.Add(i);
+                if (ids.Count == 0) return;
+                try { InstanceBehavior<Player.HUD.ItemWarningIcons.ItemWarningIconManager>.Instance?.UpdateWarningIconByIds(ids); } catch { }
+                if (!ownerHere) return;
+                // The game's own "items changed" hub (designer close funnels here too): available producers,
+                // customer capacity from seating, promotion, employee↔work-station assignments, and the
+                // onBuildingRegistrationChange listeners. Self-gates on owner-inside.
+                try { bm.OnItemChanged(forced: true); } catch { }
+                try { Helpers.BusinessHelper.GenerateItemsWithoutStockTasks(reg); } catch { }
+                // Security devices are the one family the hub skips (native placement covers them in
+                // OnItemPositionUpdated :1387): recompute per-panel coverage + the registration's level.
+                try
+                {
+                    bool anySecurity = false;
+                    foreach (var id in ids)
+                        if (reg.itemInstances != null && reg.itemInstances.TryGetValue(id, out var ii) && ii?.ItemCached != null
+                            && ii.ItemCached.HasTag(BigAmbitions.Tags.TagRef.Itemtag.issecuritypanel))
+                        { try { ii.UpdateSecurityPanelCoverage(); anySecurity = true; } catch { } }
+                    if (anySecurity) try { reg.UpdateSecurityLevel(); } catch { }
+                }
+                catch { }
+                // H-DELIVDUPE-1 (batch 14): NAME the adopted items instead of only counting them. A duplicated
+                // delivery arrives here as a SECOND id holding the same item at the same spot as one the
+                // registration already carries - invisible in a bare count.
+                string adoptedList = "";
+                bool anyDup = false, dupBeyondCap = false;
+                if (_adoptedTailLogged < 40)   // review LOW-6: no scan once the line's budget is spent
+                try
+                {
+                    var parts = new System.Collections.Generic.List<string>();
+                    int shown = 0;
+                    foreach (var id in ids)
+                    {
+                        string nm = "?"; float px = 0f, py = 0f, pz = 0f; bool have = false;
+                        if (reg.itemInstances != null && reg.itemInstances.TryGetValue(id, out var ai) && ai != null)
+                        { nm = ai.itemName ?? "?"; px = ai.position.x; py = ai.position.y; pz = ai.position.z; have = true; }
+                        string dup = "";
+                        if (have && reg.itemInstances != null)
+                            foreach (var kv in reg.itemInstances)
+                            {
+                                var other = kv.Value;
+                                if (kv.Key == id || other == null) continue;
+                                if ((other.itemName ?? "?") != nm) continue;
+                                if (System.Math.Abs(other.position.x - px) <= 0.05f
+                                    && System.Math.Abs(other.position.y - py) <= 0.05f
+                                    && System.Math.Abs(other.position.z - pz) <= 0.05f)
+                                { dup = kv.Key; break; }
+                            }
+                        if (dup.Length > 0) anyDup = true;
+                        if (shown < 6)
+                        {
+                            shown++;
+                            parts.Add(have
+                                ? $"{id} '{nm}' ({px:F2},{py:F2},{pz:F2}){(dup.Length > 0 ? $" POSSIBLE DUPLICATE of {dup}" : "")}"
+                                : $"{id} (no instance)");
+                        }
+                        else if (dup.Length > 0) dupBeyondCap = true;
+                    }
+                    if (ids.Count > shown) parts.Add($"+{ids.Count - shown} more");
+                    if (dupBeyondCap) parts.Add("POSSIBLE DUPLICATE(s) beyond the listed 6");
+                    adoptedList = string.Join(", ", parts);
+                }
+                catch (Exception ex) { adoptedList = $"(listing failed: {ex.Message})"; }
+                if (_adoptedTailLogged < 40)
+                {
+                    _adoptedTailLogged++;
+                    string adoptedMsg = $"[Patcher] owner edit-tail refresh for '{addressKey}': {ids.Count} adopted item(s): {adoptedList}";
+                    if (anyDup) Plugin.Logger.LogWarning(adoptedMsg);
+                    else        Plugin.Logger.LogInfo(adoptedMsg);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] owner warning refresh: {ex.Message}"); }
+        }
+
+        /// <summary>Round-37b: drop the per-item byte-diff baseline for one building so the NEXT interior
+        /// apply replaces EVERY live item object. The "unchanged → keep live object" optimization assumes
+        /// replicas are never mutated locally; when an unrouted path corrupted one anyway (register-bag
+        /// take), the keep-live branch preserved the corruption FOREVER while the owner's bytes stayed
+        /// unchanged. Callers pair this with an interior re-request = forced full heal.</summary>
+        public static void ForgetInteriorBaseline(string addressKey)
+        {
+            try { if (!string.IsNullOrEmpty(addressKey)) _lastItemSer.Remove(addressKey); } catch { }
+            // Round-281: the S4-lite duplicate test MUST be forgotten with it.  This method exists to
+            // force the next snapshot to replace every live item — and the re-requested snapshot is,
+            // by construction, byte-identical to the one already applied (the corruption is LOCAL, the
+            // host's copy never changed).  Leaving the signature behind would make S4-lite skip the
+            // very heal this call was made to trigger.  The struct version goes too: until the healing
+            // snapshot lands, cargo for this address should be re-requested, not applied onto a copy
+            // the caller has just declared untrustworthy.
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return;
+                _lastAppliedSig.Remove(addressKey);
+                _lastAppliedLocalTag.Remove(addressKey);
+                _lastAppliedStructVersion.Remove(addressKey);
+            }
+            catch { }
+        }
+
+        /// <summary>Round-34: pre-fix sessions PERSISTED injected buyer-purchaser flags into saves (the owner
+        /// adopts guest edits through the same interior apply that used to inject on any cargo item, and
+        /// owners save their own buildings) — a flagged item then boots its controller in SHOP mode (owner
+        /// couldn't grab a guest-placed box or manage their storage shelf). One pass at scene-ready heals
+        /// the loaded world: purchaser stays only on retail DISPLAY types (PointOfSale | ShowcaseShelf —
+        /// the game's stock-carrier set) on buildings the local player does NOT own. The apply-time
+        /// whitelist prevents re-pollution; native saves never carry enabled purchaser flags (owners
+        /// manage, not buy), so everything cleared here is ours.</summary>
+        public static void SweepPurchaserPollution(string reason)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                int healed = 0;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    var items = reg?.itemInstances;
+                    if (items == null) continue;
+                    foreach (var kv in items)
+                    {
+                        var ii = kv.Value;
+                        try
+                        {
+                            if (ii?.playerItemPurchaserSettings == null || !ii.playerItemPurchaserSettings.enabled) continue;
+                            bool display = ii.ItemCached != null
+                                && (ii.ItemCached.type & (BigAmbitions.Items.ItemType.PointOfSale | BigAmbitions.Items.ItemType.ShowcaseShelf)) != 0;
+                            if (!display || reg.RentedByPlayer) { ii.playerItemPurchaserSettings.enabled = false; healed++; }
+                        }
+                        catch { }
+                    }
+                }
+                if (healed > 0) Plugin.Logger.LogInfo($"[Patcher] purchaser-pollution sweep ({reason}): healed {healed} item(s).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] purchaser sweep: {ex.Message}"); }
+        }
+
+        // Deferred re-staff: wait a couple frames so freshly-spawned stations' Start has initialised them
+        // (item data, employeeType) before staffing.  Staffing the same frame the re-load spawns them NREs
+        // inside the game's AssignEmployee (Braids and Blowouts: all 7 stations failed, 2026-06-23).
+        private static System.Collections.IEnumerator ReStaffAfterInit(BuildingManager bm, string addressKey)
+        {
+            yield return null;
+            yield return null;
+            ReStaffStationsNow(bm, addressKey);
+        }
+
+        // Staff every unstaffed customer-serve station in the building individually (robust — one bad
+        // station can't abort the rest), reusing the game's public AssignAiToEmployeeStation.  Idempotent
+        // (skips already-staffed); self-skips player shops are handled upstream.  Logs the real cause + stack
+        // per failure so a genuine (non-timing) NRE is still localizable.
+        private static void ReStaffStationsNow(BuildingManager bm, string addressKey)
+        {
+            try
+            {
+                if (bm == null || bm.buildingRegistration == null) return;
+                if (GameStateReader.AddressKey(bm.buildingRegistration) != addressKey) return;   // player left this building → skip
+                // Round-33: NEVER AI-staff a SESSION-PLAYER business. This pass exists for AI businesses whose
+                // layout-suppressed stations spawn late; AssignAiToEmployeeStation has NO player-shop self-skip
+                // (that lives in SetupAiEmployeeStations, which this per-station loop bypasses) — so a helper
+                // placing a register forwarded the interior and the apply spawned a ghost AI cashier in the
+                // player shop on BOTH machines (user + logs 2026-07-04: "AI-staffed 1 station(s)").
+                try { if (bm.buildingRegistration.RentedByPlayer || IsAnyPlayerBusiness(bm.buildingRegistration)) return; } catch { }
+                var stations = new System.Collections.Generic.List<EmployeeStationController>(
+                    // 1.0 port (sweep-2 #3): the raw field is WRONG inside Hamptons houses — the game's own
+                    // property redirects to hamptonsHouse.itemsContainer there. Read what the game reads.
+                    bm.IndoorItemContainer.GetComponentsInChildren<EmployeeStationController>(true));
+                if (bm.currentLayout != null)
+                    stations.AddRange(bm.currentLayout.GetComponentsInChildren<EmployeeStationController>(true));
+                int staffed = 0, skipped = 0, failed = 0;
+                foreach (var st in stations)
+                {
+                    try
+                    {
+                        if (st == null || st.employee != null) { skipped++; continue; }                 // already staffed
+                        if (st.parentItemController is BusinessEmployeeController) { skipped++; continue; } // game routes these via the worker roster
+                        if (st.GetType().Name == "ComputerController") { skipped++; continue; }           // IKA-style, not customer-serve
+                        if (st.playerItemPurchaserSettings != null && st.playerItemPurchaserSettings.enabled) { skipped++; continue; } // purchaser shelf, not a serve station
+                        bm.AssignAiToEmployeeStation(st);
+                        staffed++;
+                    }
+                    catch (Exception sx)
+                    {
+                        failed++;
+                        Plugin.Logger.LogWarning($"[Patcher] AI re-staff of {st?.GetType().Name} failed: {sx.Message}");
+                    }
+                }
+                if (staffed > 0 || failed > 0)
+                    Plugin.Logger.LogInfo($"[Patcher] AI-staffed {staffed} station(s) for '{addressKey}'" + (failed > 0 ? $" ({failed} failed)" : "") + ".");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] re-staff loop for '{addressKey}': {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Reconciles ItemController GameObjects in the active building with
+        /// reg.itemInstances — PER-ITEM: destroy controllers for changed/removed
+        /// ids, spawn for changed ids and ids with no live controller (self-heal),
+        /// leave everything else alone so shelf stock visuals keep their shuffle.
+        /// changedIds/removedIds == null means no diff info → full rebuild
+        /// (first apply / legacy callers).
+        ///
+        /// IMPORTANT: skipped when reg.itemInstances is empty.  AI businesses
+        /// (CoffeeShop, FastFoodRestaurant, etc.) spawn their items from the
+        /// `BusinessLayoutSet` template at LoadBuilding time — those template-
+        /// spawned items are NOT in reg.itemInstances.  If we wipe them and
+        /// replace with an empty dict, the building visibly goes empty.  When
+        /// host's snapshot reports zero items we trust the layout-driven
+        /// spawn and don't touch the scene.
+        /// </summary>
+        private static void RefreshItemsForActiveBuilding(BuildingManager bm, BuildingRegistration reg,
+            HashSet<string>? changedIds = null, HashSet<string>? removedIds = null,
+            HashSet<string>? movedIds = null)
+        {
+            try
+            {
+                // Skip refresh entirely when host has no per-instance items —
+                // see XML doc above for why.
+                int dictCount = reg.itemInstances?.Count ?? 0;
+                if (dictCount == 0)
+                {
+                    Plugin.Logger.LogInfo($"[Patcher] Items refresh skipped (empty itemInstances; layout-spawned items left intact).");
+                    return;
+                }
+                bool fullRebuild = changedIds == null;
+
+                // Round-37i (dead shelf hover, probe-chain-proven): our destroy+respawn interrupting a LIVE
+                // placement skips PlacementSystem.StopPlacingItem (:622-647) — the ONLY place that pairs the
+                // parent item's Outline() with RemoveOutline(). The stranded parent (e.g. the shelf a box was
+                // being placed onto) keeps disableHighlightInteraction=TRUE: hover check never runs again,
+                // right-click (visible-gated) still works — the user's exact asymmetry. Complete the native
+                // lifecycle BEFORE destroying, only when the refresh actually touches the placed item or its
+                // outlined parent (or on a full rebuild, which touches everything).
+                try
+                {
+                    if (BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode)
+                    {
+                        string placedId = "", parentId = "";
+                        try { placedId = BigAmbitions.PlacementSystem.PlacementSystem.CurrentPlaceableItemBeingPlaced?.GetItemInstance()?.id?.ToString() ?? ""; } catch { }
+                        try { parentId = BigAmbitions.PlacementSystem.PlacementSystem.lastParentItem?.GetItemInstance()?.id?.ToString() ?? ""; } catch { }
+                        // Round-48b (live test 2026-07-21): the refresh NEVER touches the
+                        // actively-placed item — changed OR removed.  An unconfirmed
+                        // placement exists only on THIS machine, so the owner's diff
+                        // marks it "removed" (never-heard-of-it ≠ owner-deleted-it) and
+                        // the old abort+destroy vaporized the item mid-place (value
+                        // lost).  The destroy pass defers it in all cases; if the owner
+                        // GENUINELY deleted the same id, the guest's forward re-adds it
+                        // (guest-edit authority, last-writer-wins).  Abort only for the
+                        // PARENT changing (outline strand) or a full rebuild.
+                        bool touched = fullRebuild
+                            || (!string.IsNullOrEmpty(parentId) && (changedIds!.Contains(parentId) || (removedIds?.Contains(parentId) ?? false)));
+                        if (touched)
+                        {
+                            // Round-279 (field 20260818-223659): the bare StopPlacingItem this used to
+                            // call is only HALF the native cancel — the PlacementMode blocker's ONLY
+                            // release lives at the end of CancelPlacementMode's camera coroutine
+                            // (PlacementHelper:249-262), and a held blocker kills EVERY entity click,
+                            // WASD, click-to-move and the building exit (total interaction wedge; the
+                            // reporter's only escape was quit-to-menu).  Run the full native cancel;
+                            // on a throw, fall back to the half-teardown PLUS the state releases the
+                            // full cancel would have done.
+                            Plugin.Logger.LogWarning($"[Patcher] interior refresh intersects a LIVE placement (placed={placedId} parent={parentId}) — running the FULL native cancel so nothing strands (round-279, was bare StopPlacingItem in round-37i).");
+                            try
+                            {
+                                Buildings.Indoors.InteriorDesign.PlacementHelper.CancelPlacementMode(true);
+                            }
+                            catch (Exception cex)
+                            {
+                                Plugin.Logger.LogWarning($"[Patcher] CancelPlacementMode threw ({cex.Message}) — fallback: StopPlacingItem + explicit blocker/time-control/autosave release (round-279).");
+                                try { BigAmbitions.PlacementSystem.PlacementSystem.StopPlacingItem(); } catch { }
+                                try { InstanceBehavior<GameManager>.Instance.playerController.UnsetNavigationBlocker(NavigationBlocker.PlacementMode); } catch { }
+                                try { InstanceBehavior<UI.UIs>.Instance.gameSpeed.DisableTimeControl(false); } catch { }
+                                try { GameManager.preventAutoSave = false; } catch { }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] placement-intersect guard: {ex.Message}"); }
+
+                // Live controllers of THIS building, by instance id.
+                var liveById = new Dictionary<string, ItemController>();
+                var killedControllers = new HashSet<ItemController>();   // round-278: Destroy is frame-deferred — the re-link rescan must skip the dying
+                int destroyed = 0;
+                try
+                {
+                    var existing = UnityEngine.Object.FindObjectsOfType(typeof(ItemController));
+                    if (existing != null)
+                    {
+                        // Fold F3 (2026-09-27): the kill SET is collected first and marked dying as a whole before the
+                        // first release, so a native line pick during a release never lands on a line this refresh kills later.
+                        var killList = new List<(ItemController ic, string id, string why)>();
+                        for (int i = 0; i < existing.Length; i++)
+                        {
+                            var ic = existing[i] as ItemController;
+                            if (ic == null) continue;
+                            // Be conservative: only touch ItemControllers whose registration
+                            // matches the current building (avoid wiping inventory items etc.).
+                            try
+                            {
+                                var icReg = ItemHelper.GetBuildingRegistration(ic.ItemInstance);
+                                if (icReg != reg) continue;
+                            }
+                            catch { continue; }
+                            // Stage 0 guard (F-2026-08-25-A, user-approved 2026-08-25): NEVER destroy the
+                            // object that IS the item in the local player's hands.  REFERENCE identity, not
+                            // id or address: the native AddItemInstanceToBuilding stamps AddressCached
+                            // BEFORE its dict.Add can throw, so a failed re-add re-marks the HELD instance
+                            // as this building's and the id-matched sweep below destroyed the hand-slot
+                            // visual (destroyed=4, peer :3707).  Guarding the harm directly also covers the
+                            // poisoning-free route (grabbing a stacked child leaves AddressCached set).
+                            // Deliberate tradeoff: any controller SHARING the held instance (a leaked
+                            // placement preview after a native throw) is protected too — a lingering
+                            // visible ghost beats destroying the player's hands, and Stage 0's hands rule
+                            // removes the only known way those leaks occur.
+                            try
+                            {
+                                if (ic.ItemInstance != null
+                                    && object.ReferenceEquals(ic.ItemInstance, PlayerHelper.ItemInstanceInHands))
+                                    continue;
+                            }
+                            catch { }
+                            string id = "";
+                            try { id = ic.ItemInstance?.id ?? ""; } catch { }
+                            bool isChanged = changedIds != null && changedIds.Contains(id);
+                            bool isRemoved = removedIds != null && removedIds.Contains(id);
+                            // Round-48b: NEVER destroy the item actively being placed —
+                            // changed OR removed (live test 2026-07-21: an unconfirmed
+                            // placement is unknown to the owner, so the diff calls it
+                            // "removed" and the old rule vaporized it mid-place).  Its
+                            // controller keeps the old instance for one cycle; placement
+                            // completes; the guest forward re-converges the state.
+                            if ((isChanged || isRemoved) && !fullRebuild && !string.IsNullOrEmpty(id))
+                            {
+                                try
+                                {
+                                    if (BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode
+                                        && (BigAmbitions.PlacementSystem.PlacementSystem.CurrentPlaceableItemBeingPlaced?.GetItemInstance()?.id?.ToString() ?? "") == id)
+                                    {
+                                        Plugin.Logger.LogInfo($"[Patcher] refresh DEFERRED for '{id}' — actively being placed; change applies on a later refresh (round-48).");
+                                        liveById[id] = ic;   // counts as survivor → spawn pass skips it
+                                        continue;
+                                    }
+                                }
+                                catch { }
+                            }
+                            bool kill = fullRebuild
+                                        || string.IsNullOrEmpty(id)
+                                        || isChanged
+                                        || isRemoved;
+                            if (kill)
+                            {
+                                killList.Add((ic, id, fullRebuild ? "full" : isRemoved ? "removed" : string.IsNullOrEmpty(id) ? "no-id" : "changed"));
+                            }
+                            else if (!string.IsNullOrEmpty(id) && !liveById.ContainsKey(id))
+                            {
+                                liveById[id] = ic;
+                            }
+                        }
+                        CustomerSeatPins.MarkKillSet(killList.ConvertAll(k => k.ic));
+                        foreach (var kRow in killList)
+                        {
+                            var ic = kRow.ic; string id = kRow.id; string kWhy = kRow.why;
+                            // H-REFRESHSEAT-1 (2026-09-27): customers seated at / walking to / queuing at this item
+                            // leave (or change line) the game's own way BEFORE the destroy - else ResetItemsInTable
+                            // NREs on the dead seat transform and the diner hangs. Must precede the
+                            // allItemControllers removal below (the seat -> table lookup walks that list).
+                            CustomerSeatPins.ReleaseHoldersOf(ic, id, kWhy);
+                            // Round-278/F1 (field 20260818-222130): attached children are Unity
+                            // transform children — Destroy(parent) takes them down at frame end,
+                            // AFTER the spawn pass already recorded them as live survivors, so
+                            // they died with no respawn (the invisible-till bug; the stranded
+                            // EmployeeStationController NRE was its aftershock).  Detach them
+                            // SCENE-side only: the native RemoveFromParentPlaceableItem also
+                            // erases the parent's stackedItems DATA record (ItemController:
+                            // 1290-1293) which the apply just wrote authoritatively — so this
+                            // is a manual detach that leaves all data untouched.  The re-link
+                            // pass below re-attaches them to the respawned parent.
+                            try
+                            {
+                                if (ic.childItemControllers != null && ic.childItemControllers.Count > 0)
+                                {
+                                    var rescue = new List<ItemController>(ic.childItemControllers);
+                                    int rescued = 0;
+                                    foreach (var kid in rescue)
+                                    {
+                                        if (kid == null) continue;
+                                        try
+                                        {
+                                            kid.parentItemController = null;
+                                            kid.parentAttachmentPoint = null;
+                                            kid.transform.SetParent(bm.IndoorItemContainer, true);   // 1.0 port: property — Hamptons redirect
+                                            rescued++;
+                                        }
+                                        catch { }
+                                    }
+                                    ic.childItemControllers.Clear();
+                                    if (rescued > 0)
+                                        Plugin.Logger.LogInfo($"[Patcher] destroy of '{id}' would take {rescued} attached child(ren) with it — detached to the container first; the re-link pass re-attaches them (round-278).");
+                                }
+                            }
+                            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] child rescue for '{id}': {ex.Message}"); }
+                            killedControllers.Add(ic);
+                            // Sweep-3 crash fix (2026-08-29): same reason as the conveyed-grab site —
+                            // a destroyed controller left in allItemControllers feeds 1.0's unguarded
+                            // sweeps. (This loop iterates a FindObjectsOfType array, so removing from
+                            // the manager's list here is safe.)
+                            try { InstanceBehavior<BuildingManager>.Instance?.allItemControllers?.Remove(ic); } catch { }
+                            // SALE-DETACH-1: the in-place policy KEEPS this controller's
+                            // ItemInstance alive — detach its subscriptions first.
+                            int det1 = DetachCargoCallbacks(ic);
+                            if (det1 > 0 && _cargoDetachLines++ < 40)
+                                Plugin.Logger.LogInfo($"[Patcher] controller '{id}' ('{ic.ItemInstance?.itemName}') destroyed with its instance kept: {det1} cargo callback(s) detached (SALE-DETACH-1).");
+                            // Fold F1 (2026-09-27): off its parent's childItemControllers too, as the native removal does
+                            // (ItemController.cs:1323; scene side only, stackedItems data untouched) - a destroyed child left
+                            // there made OverlayHelper.GetRelevantEntity return it and every hover NRE'd.
+                            try { var par = ic.parentItemController; if (par != null) par.childItemControllers?.Remove(ic); } catch { }
+                            UnityEngine.Object.Destroy(ic.gameObject);
+                            destroyed++;
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] item destroy pass: {ex.Message}"); }
+                // H-REFRESHSEAT-1 review folds R1/R2: the kill loop's queuers move only now, once this refresh's whole kill
+                // set is known - never onto a line destroyed in the same refresh (still before the spawn pass, same frame).
+                CustomerSeatPins.FlushRelease();
+                if (destroyed > 0) CustomerSeatPins.ResetLineCache(fullRebuild ? "full" : "refresh");   // review pass 2: no pick of a destroyed line
+
+                // Spawn: changed ids + any id with no surviving controller.
+                int spawned = 0;
+                int failed = 0;
+                try
+                {
+                    if (reg.itemInstances != null)
+                    {
+                        foreach (var kv in reg.itemInstances)
+                        {
+                            var ii = kv.Value;
+                            if (ii == null) continue;
+                            if (!fullRebuild && liveById.ContainsKey(kv.Key)) continue;   // untouched
+                            try { bm.InstantiateSingleInstance(ii, null, false); spawned++; }   // 1.0: (instance, container, onlyVisual)
+                            catch (Exception ex) { failed++; if (failed <= 3) Plugin.Logger.LogWarning($"[Patcher] InstantiateSingleInstance id={ii.id}: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] item spawn pass: {ex.Message}"); }
+
+                // Round-278/F4 + tripwire: re-attach stacked children to their (possibly just
+                // respawned) parents.  Natively this re-link runs ONLY in LoadItems() at building
+                // entry (BuildingManager:665-688), so a mod-spawned child sat flat — and did not
+                // follow a moving parent — until re-entry.  One targeted rescan of this building's
+                // controllers, on the same rare event-driven path as the passes above; the dying
+                // controllers from the destroy pass are excluded (Destroy is frame-deferred, so a
+                // killed parent and its respawn coexist this frame under the same id).
+                try
+                {
+                    bool anyStacked = false;
+                    if (reg.itemInstances != null)
+                        foreach (var kv in reg.itemInstances)
+                            if (kv.Value?.stackedItems != null && kv.Value.stackedItems.Count > 0) { anyStacked = true; break; }
+                    if (anyStacked && (spawned > 0 || destroyed > 0))
+                    {
+                        var nowById = new Dictionary<string, ItemController>();
+                        var all = UnityEngine.Object.FindObjectsOfType(typeof(ItemController));
+                        if (all != null)
+                            for (int i = 0; i < all.Length; i++)
+                            {
+                                var c = all[i] as ItemController;
+                                if (c == null || killedControllers.Contains(c)) continue;
+                                try { if (ItemHelper.GetBuildingRegistration(c.ItemInstance) != reg) continue; } catch { continue; }
+                                string cid = ""; try { cid = c.ItemInstance?.id ?? ""; } catch { }
+                                if (!string.IsNullOrEmpty(cid)) nowById[cid] = c;
+                            }
+                        int reattached = 0;
+                        foreach (var kv in reg.itemInstances)
+                        {
+                            var pi = kv.Value;
+                            if (pi?.stackedItems == null || pi.stackedItems.Count == 0) continue;
+                            if (!nowById.TryGetValue(kv.Key, out var pic) || pic == null) continue;
+                            foreach (var st in pi.stackedItems)
+                            {
+                                if (st == null || string.IsNullOrEmpty(st.childId)) continue;
+                                if (!nowById.TryGetValue(st.childId, out var kidIc) || kidIc == null) continue;
+                                try
+                                {
+                                    if (kidIc.parentItemController != null) continue;   // already attached — data converges on later applies
+                                    var pts = pic.AttachmentPoints;
+                                    if (pts == null || st.attachmentIndex < 0 || st.attachmentIndex >= pts.Length) continue;
+                                    kidIc.SetToParentPlaceableItem(pic, pts[st.attachmentIndex]);
+                                    reattached++;
+                                }
+                                catch { }
+                            }
+                        }
+                        // Tripwire: a data id with NO live controller after the spawn pass is an
+                        // ORPHAN — the exact signature of the collateral class this round fixes.
+                        int orphans = 0;
+                        foreach (var kv in reg.itemInstances)
+                            if (kv.Value != null && !nowById.ContainsKey(kv.Key)) orphans++;
+                        if (orphans > 0)
+                            Plugin.Logger.LogWarning($"[Patcher] item refresh left {orphans} ORPHAN id(s) (data present, no live object) in '{GameStateReader.AddressKey(reg)}' — the collateral class round-278 fixes; report this (reattached={reattached}).");
+                        else if (reattached > 0)
+                            Plugin.Logger.LogInfo($"[Patcher] re-link pass: {reattached} child(ren) re-attached (round-278).");
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] re-link pass: {ex.Message}"); }
+
+                // MOVE pass (round-22): transform-only deltas keep their live GameObject — re-bind it to the
+                // fresh instance and move it to the owner-authoritative pose. No destroy/respawn → no zombie
+                // window for the guest's next click on a just-placed item.
+                int moved = 0;
+                try
+                {
+                    if (movedIds != null && reg.itemInstances != null)
+                        foreach (var id in movedIds)
+                        {
+                            if (!liveById.TryGetValue(id, out var ic) || ic == null) continue;   // no survivor → spawn pass covered it
+                            if (!reg.itemInstances.TryGetValue(id, out var ni) || ni == null) continue;
+                            try
+                            {
+                                ic.ItemInstance = ni;
+                                ic.transform.position = ni.position;
+                                ic.transform.rotation = ni.Rotation;
+                                moved++;
+                            }
+                            catch { }
+                        }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] item move pass: {ex.Message}"); }
+
+                // Task-28 fix 5: a destroyed/respawned station leaves WaitingLinesHelper's line
+                // cache stale — it only rebuilds when EMPTY, and only interior load or the
+                // producers refresh clears it (read-verified: WaitingLinesHelper.cs:24-33) — so
+                // customers would ignore a respawned till until this machine re-entered the
+                // building.  Nudge the game's own refresh: the exact call native fires at
+                // placement end (onPlacementModeEnd → ScheduleUpdateAvailableProducers →
+                // GetItemControllers + WaitingLinesHelper.Init).  Runs a frame later, after the
+                // deferred Destroys have made the old controllers Unity-null.
+                if (destroyed > 0 || spawned > 0)
+                    try { bm.ScheduleUpdateAvailableProducers(); } catch { }
+
+                Plugin.Logger.LogInfo($"[Patcher] Items refresh: destroyed={destroyed} spawned={spawned} moved={moved} kept={liveById.Count} failed={failed} (dict size {dictCount}{(fullRebuild ? ", FULL rebuild" : "")}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] RefreshItemsForActiveBuilding: {ex.Message}"); }
+        }
+
+        /// <summary>Install a session player's REAL per-day series as the
+        /// RivalState behind their synthetic row: SelectedRivalUI plots
+        /// RivalState.weeklyIncomeHistory / numberOfBusinessesHistory, and
+        /// FillRivalState only backfills MISSING days (with random noise — the
+        /// game faking AI graphs) — pre-installed truth plots verbatim.
+        /// Runtime-only: StripSyntheticRivalStates removes these at the save
+        /// boundary.</summary>
+        public static void InstallPlayerRivalStateHistory(string id)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(id)) return;
+                if (!ClientRivalStats.TryGetValue(id, out var stat)) return;
+
+                // r2/R4: a pid that ANCHORS a foreign merged company carries that COMPANY's single
+                // leaderboard row, so its chart must be the COMPANY's - the ELEMENTWISE SUM over the
+                // known members' series, aligned by .Day (a Day present in any member's series appears
+                // once; members lacking it add 0). A plain pid keeps the per-player series.
+                // ACCEPTED: the PORTRAIT stays the anchor's - SelectedRivalUI resolves it from
+                // data.rivalId (decompile :101/:131), and only a real session pid survives the
+                // OnRivalDefeat guard and the save-time synthetic-state strip.
+                var incPts = new List<Tuple<int, float>>();
+                var bizPts = new List<Tuple<int, int>>();
+                var company = MPPatches.MergerRivalsFold.ForeignCompanyAnchoredBy(id);
+                if (company != null)
+                {
+                    var incSum = new System.Collections.Generic.Dictionary<int, float>();
+                    var bizSum = new System.Collections.Generic.Dictionary<int, int>();
+                    foreach (var pid in company.MemberPidsOrdered ?? new List<string>())
+                    {
+                        if (string.IsNullOrEmpty(pid)) continue;
+                        if (!ClientRivalStats.TryGetValue(pid, out var ms) || ms == null) continue;
+                        if (ms.IncomeHistory != null)
+                            foreach (var pt in ms.IncomeHistory)
+                                if (pt != null) { incSum.TryGetValue(pt.Day, out var v); incSum[pt.Day] = v + pt.Value; }
+                        if (ms.BizCountHistory != null)
+                            foreach (var pt in ms.BizCountHistory)
+                                if (pt != null) { bizSum.TryGetValue(pt.Day, out var v); bizSum[pt.Day] = v + pt.Value; }
+                    }
+                    var days = new List<int>(incSum.Keys); days.Sort();
+                    foreach (var d in days) incPts.Add(new Tuple<int, float>(d, incSum[d]));
+                    var bdays = new List<int>(bizSum.Keys); bdays.Sort();
+                    foreach (var d in bdays) bizPts.Add(new Tuple<int, int>(d, bizSum[d]));
+                }
+                else
+                {
+                    if (stat.IncomeHistory != null)
+                        foreach (var pnt in stat.IncomeHistory)
+                            if (pnt != null) incPts.Add(new Tuple<int, float>(pnt.Day, pnt.Value));
+                    if (stat.BizCountHistory != null)
+                        foreach (var pnt in stat.BizCountHistory)
+                            if (pnt != null) bizPts.Add(new Tuple<int, int>(pnt.Day, pnt.Value));
+                }
+                bool hasInc = incPts.Count > 0;
+                bool hasBiz = bizPts.Count > 0;
+                if (!hasInc && !hasBiz && company == null) return;   // r6: a company anchor falls through so an empty sum still replaces a stale per-player chart
+                var states = SaveGameManager.Current?.rivalStates;
+                if (states == null) return;
+
+                BigAmbitions.Rivals.RivalState? st = null;
+                foreach (var s in states)
+                    if (s != null && s.rivalId == id) { st = s; break; }
+                if (st == null)
+                {
+                    st = new BigAmbitions.Rivals.RivalState { rivalId = id };
+                    states.Add(st);
+                }
+                if (hasInc || company != null) st.weeklyIncomeHistory = incPts;   // r7: same rule as the business series - a company anchor's empty sum replaces a stale per-player chart
+                // B3: for a COMPANY anchor the summed series is the whole truth - assign it even when it is
+                // empty, or a per-player series installed on this pid before it anchored a company survives
+                // as the company's chart. A plain pid keeps the old 'only when I have points' rule.
+                if (hasBiz || company != null) st.numberOfBusinessesHistory = bizPts;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] InstallPlayerRivalStateHistory '{id}': {ex.Message}"); }
+        }
+
+        /// <summary>Remove RivalState entries the rivals UI auto-created for
+        /// SESSION-PLAYER ids (SelectedRivalUI.FillRivalState fills missing
+        /// histories for anything it displays — synthetic player rows included).
+        /// Players are not rivals; left in, these serialize into the .hsg and
+        /// accumulate across sessions (0.11 UI map, save-contamination risk).
+        /// Called at the save boundary like StripGhostVehicles.</summary>
+        public static int StripSyntheticRivalStates(string when)
+        {
+            int removed = 0;
+            try
+            {
+                var list = SaveGameManager.Current?.rivalStates;
+                if (list == null) return 0;
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    string rid = list[i]?.rivalId ?? "";
+                    if (string.IsNullOrEmpty(rid)) continue;
+                    bool player = rid == MPConfig.PlayerId || ClientPlayerRoster.ContainsKey(rid);
+                    try { if (!player) player = MPRestSync.AllPlayers().Contains(rid); } catch { }
+                    if (!player) continue;
+                    list.RemoveAt(i);
+                    removed++;
+                }
+                if (removed > 0)
+                    Plugin.Logger.LogInfo($"[Patcher] stripped {removed} synthetic player RivalState(s) from save data ({when}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] rivalState strip: {ex.Message}"); }
+            return removed;
+        }
+
+        /// <summary>Remove leaked ghost vehicles from the save data.  Ghost ids
+        /// are 'BAMP_' + original (the test rig's own REAL vehicles are
+        /// 'BAMP_TESTRIG_*'; ghost-of-ghost is 'BAMP_BAMP…').  Ghosts enter
+        /// gi.VehicleInstances via CreateAndSpawnVehicle registration and
+        /// snowball one duplicate per save/load cycle (run-17 evidence: extra
+        /// carts/flatbeds frozen at stale cargo states).  Called at every save
+        /// (PerformLocalSave) and at world-ready.</summary>
+        public static int StripGhostVehicles(string when)
+        {
+            int removed = 0;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                var list = gi?.VehicleInstances;
+                if (list == null) return 0;
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    string id = list[i]?.id ?? "";
+                    bool ghost = id.Contains("BAMP_BAMP")
+                                 || (id.StartsWith("BAMP_") && !id.StartsWith("BAMP_TESTRIG"));
+                    if (!ghost) continue;
+                    list.RemoveAt(i);
+                    removed++;
+                    Plugin.Logger.LogInfo($"[Vehicle] ghost stripped from save data ({when}): '{id}'.");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Vehicle] ghost strip: {ex.Message}"); }
+            return removed;
+        }
+
+        /// <summary>Field 20260830-175635 (user-approved): HOSTING FROM A CLIENT MIRROR EXPOSES
+        /// HOLLOW AI SHOPS. A client's world data gets a business's interior Layout only for
+        /// shops that client physically visited (the 885-business snapshot carries name/type but
+        /// no layout; the interior snapshot writes it on entry). When that player later HOSTS the
+        /// world (handoff / continue-without-host), every unvisited AI business is a bare shell —
+        /// Layout null ⇒ no interior ⇒ no stations ⇒ no staff/food ("food-delivery pickups are
+        /// empty"). Natively Layout is assigned exactly ONCE, at rival business creation
+        /// (CompetitionHelper.StartNewCompetitorBusiness:710) — an existing business never heals.
+        ///
+        /// The heal is exact, not approximate: each AI business NAME maps to ONE AiBusinessDefault
+        /// asset carrying ONE layout (the creation-time randomness is in choosing the brand, and
+        /// the name survives in every mirror), so GetBusinessDefault(BusinessName).buildingLayout
+        /// reconstructs the very layout the original world had. Same source the game's own EA05
+        /// save-compat fixer uses. Host-only, once per world-ready; session players' businesses
+        /// are explicitly excluded (a mirror marks them with a translated rival id, and their
+        /// interiors are design-based, fed by their owner's machine — never layout-based).</summary>
+        public static void HealHollowAiLayouts(string when)
+        {
+            if (!MPServer.IsRunning) return;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                // Review #9 + review-mopping #19: warm the defaults cache under its own guard
+                // and CHECK the result — an Addressables failure or an empty label aborts the
+                // sweep BEFORE any partial healing, with a named reason.
+                AiBusinessDefault[]? defs = null;
+                try { defs = Helpers.CompetitionHelper.GetAllBusinessDefaults(); }
+                catch (Exception wex) { Plugin.Logger.LogWarning($"[Patcher] hollow-AI-layout heal: business defaults unavailable ({wex.Message}) — sweep skipped."); return; }
+                if (defs == null || defs.Length == 0)
+                {
+                    Plugin.Logger.LogWarning("[Patcher] hollow-AI-layout heal: business-defaults cache came back EMPTY — sweep skipped (modded/partial install?).");
+                    return;
+                }
+                // Review #1/#2 + review-mopping #17/#18: the roster-based IsAnyPlayerBusiness
+                // legs are empty on a continue-alone host, and a mirror stamps PLAYER names
+                // into businessOwnerRivalId — the shared known-world-player set covers it, and
+                // an EMPTY set is warned loudly (it reads identically to "no player shops"
+                // otherwise, leaving the protection silently absent).
+                var knownPlayers = KnownWorldPlayerNames();
+                if (knownPlayers.Count == 0)
+                    Plugin.Logger.LogWarning("[Patcher] hollow-AI-layout heal: ZERO known player names resolved — the player-shop exclusion is running blind this load (manifest unreadable or empty?).");
+
+                int healed = 0, misses = 0, playerSkipped = 0; string missExample = "";
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    try   // review #9: one bad registration must never abandon the sweep
+                    {
+                        if (reg == null) continue;
+                        if (!string.IsNullOrEmpty(reg.Layout)) continue;
+                        string biz = reg.businessTypeName ?? "";
+                        if (biz.Length == 0 || biz == "ba:businesstype_empty") continue;
+                        // Review #6: factories are layout-less AND nameless by design — not a miss.
+                        if (string.IsNullOrEmpty(reg.BusinessName)) continue;
+                        if (reg.RentedByPlayer || IsAnyPlayerBusiness(reg)) continue;
+                        if (reg.AvailableForRent) continue;   // review #8: on the rental market — do not deepen a contradictory state
+                        string owner = reg.businessOwnerRivalId ?? "";
+                        if (owner.Length == 0) continue;      // ownerless oddity — not an AI shop
+                        // Review #1/#2: a session player's shop must be untouchable even with an
+                        // empty roster — a mis-stamp here arms MPTakeover's per-join furnish, which
+                        // would force-push AI furniture over the owner's real interior.
+                        if (knownPlayers.Contains(owner)) { playerSkipped++; continue; }
+                        // Review #1: a registration holding real items is not hollow — never risk
+                        // stacking a layout on furniture.
+                        int items = 0; try { items = reg.itemInstances?.Count ?? 0; } catch { }
+                        if (items > 0) continue;
+                        var def = Helpers.CompetitionHelper.GetBusinessDefault(reg.BusinessName);
+                        // Review #7: the matched default must belong to THIS business type —
+                        // the EA010 legacy rename can cross-link names across types.
+                        if (def == null || string.IsNullOrEmpty(def.buildingLayout) || def.businessTypeName != biz)
+                        {
+                            misses++;
+                            if (missExample.Length == 0) missExample = $"'{reg.BusinessName}' ({biz})";
+                            continue;
+                        }
+                        // Review #3: stamp ONLY a layout that exists for this building's size —
+                        // a bad stamp does not degrade to an empty shop, it EJECTS the player on
+                        // entry (same guard the takeover furnish uses, MPTakeover:333).
+                        object? set = null;
+                        try
+                        {
+                            set = BusinessLayoutSets.BusinessLayoutSetHelper.GetOrLoadBusinessLayoutSet(
+                                biz, new Blueprints.BuildingSizeInfo(reg.BuildingCached), def.buildingLayout.ToLower(), warnIfNotFound: false);
+                        }
+                        catch { }
+                        if (set == null)
+                        {
+                            misses++;
+                            if (missExample.Length == 0) missExample = $"'{reg.BusinessName}' ({biz} — no layout set for this building size)";
+                            continue;
+                        }
+                        reg.Layout = def.buildingLayout;
+                        healed++;
+                        if (healed <= 5)
+                            Plugin.Logger.LogInfo($"[Patcher] hollow AI business healed: '{GameStateReader.AddressKey(reg)}' '{reg.BusinessName}' ({biz}) ← layout '{def.buildingLayout}'.");
+                    }
+                    catch { }
+                }
+                if (healed > 0 || misses > 0 || playerSkipped > 0)
+                    Plugin.Logger.LogInfo($"[Patcher] hollow-AI-layout heal ({when}): {healed} healed{(healed > 5 ? " (first 5 detailed)" : "")}, {misses} left as-is (no usable default{(misses > 0 ? $"; e.g. {missExample}" : "")}), {playerSkipped} skipped as known-player-owned ({knownPlayers.Count} known name(s)). A non-zero heal count means this world was hosted from a client mirror at some point.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] hollow-AI-layout heal: {ex.Message}"); }
+        }
+
+        /// <summary>Round-68 — heal a STALE ActiveVehicleId at world-ready (already-poisoned saves in
+        /// the field: live artifact 2026-07-24, host save carried ActiveVehicleId="BAMP_&lt;flatbed&gt;" —
+        /// the client's ghost-proxy id, persisted by a pre-fix save).  Consequences until healed:
+        /// IsUsingVehicle=true with GetCurrentVehicle()=null → HasPaidForAllItems (PlayerHelper:110)
+        /// NREs → ExitZoneDespawner dies on every exit attempt (trapped in the building), vehicle CTAs
+        /// NRE, the hand-truck station refuses to spawn, AND the possession check discards the owner's
+        /// position packets for the matching ghost (frozen "not syncing" cart).  At world-ready nobody
+        /// is using anything yet, so a BAMP_ id or an id with no matching VehicleInstance is pure
+        /// poison — clear it.  (PerformLocalSave strips ghost ids at the save boundary going forward;
+        /// this covers every save written before that fix.)</summary>
+        public static void HealStaleActiveVehicleId()
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                string active = gi?.ActiveVehicleId ?? "";
+                if (active.Length == 0) return;
+                bool ghost = active.StartsWith("BAMP_") && !active.StartsWith("BAMP_TESTRIG");
+                bool resolvable = false;
+                if (!ghost && gi!.VehicleInstances != null)
+                    foreach (var v in gi.VehicleInstances)
+                        if (v != null && v.id == active) { resolvable = true; break; }
+                if (!ghost && resolvable) return;   // legitimately saved while driving an own vehicle
+                gi!.ActiveVehicleId = null;
+                Plugin.Logger.LogWarning($"[Vehicle] stale ActiveVehicleId '{active}' cleared at world-ready — "
+                    + $"{(ghost ? "ghost-proxy id (save-cycle leak)" : "no matching vehicle in the save")}; "
+                    + "exit-zone NRE / frozen-ghost heal (round-68).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Vehicle] ActiveVehicleId heal: {ex.Message}"); }
+        }
+
+        private static float _nextVehIdCheckAt;
+        private static int   _vehIdHeals;
+
+        /// <summary>Round-109 SAFETY NET — the same poison HealStaleActiveVehicleId cures, but caught
+        /// MID-SESSION.  Field 2026-07-26 (host 'Dawnspear', 0.1.14): the host picked up another player's
+        /// ghost hand cart; the native VehicleController.EnterVehicle wrote the REMOTE vehicle's id into
+        /// ActiveVehicleId (VehicleController.cs:291).  That id resolves nowhere locally, so
+        /// PlayerHelper.IsUsingVehicle (a bare "field is non-empty" test) was TRUE while
+        /// VehicleHelper.GetCurrentVehicle() returned NULL, and PlayerHelper.HasPaidForAllItems NRE'd on
+        /// EVERY mouse-hover CTA evaluation — 36 logged crashes, no CTAs, no overlays: "I'm locked and i
+        /// can't interact with nothing in my business".  Round-68 documents this signature exactly but
+        /// runs only at world-ready, so a poisoning that happened while playing persisted until reload.
+        ///
+        /// RESOLVABILITY IS TESTED THE WAY THE GAME TESTS IT — GetCurrentVehicle() != null — and NOT by
+        /// searching VehicleInstances the way the world-ready heal does.  That difference is load-bearing:
+        /// the car-borrow path (VehicleManager.TryDriveGhost) deliberately seeds VehicleHelper.VehiclesCache
+        /// with a proxy id that is kept OUT of VehicleInstances to dodge tickets/tax.  Reusing the
+        /// world-ready test here would have judged a legitimately borrowed car "unresolvable" and ejected
+        /// the borrower mid-drive.  Testing the game's own resolution means we heal exactly the states that
+        /// would crash and nothing else.
+        ///
+        /// This is a NET, not the repair: it un-sticks the player about a second after a poisoning instead
+        /// of leaving them locked until reload, and its log line names the id so the next report identifies
+        /// whatever route poisoned it.  Known cost: the vehicle leaves their hands, because the game no
+        /// longer counts it as theirs.  Cheap enough to run unbracketed — one dictionary lookup per second.
+        /// The parity fix (give the cart path the cache seed the car path already has) is NOT built.</summary>
+        public static void TickActiveVehicleIdHealth()
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.InMpGame) return;   // sticky gate: survives reconnect
+                // Round-188: a SUCCESSFULLY-null resolve mid-load is not poison either — vehicle
+                // instances may simply not be materialized yet; healing then would strip the
+                // player's active vehicle on every load.  Same authority as every other gate.
+                if (!MPWorldReady.IsSettled) return;
+                if (UnityEngine.Time.unscaledTime < _nextVehIdCheckAt) return;
+                _nextVehIdCheckAt = UnityEngine.Time.unscaledTime + 1f;
+
+                var gi = SaveGameManager.Current;
+                string active = gi?.ActiveVehicleId ?? "";
+                if (active.Length == 0) return;   // not using anything — nothing to heal
+
+                bool resolvable;
+                try { resolvable = Helpers.VehicleHelper.GetCurrentVehicle() != null; }
+                catch (Exception rex)
+                {
+                    // A throwing lookup is NOT proof of poison (VehicleInstances can be null mid-load).
+                    // Say so and leave the field alone rather than ejecting someone on a bad read.
+                    Plugin.Logger.LogWarning($"[Vehicle] ActiveVehicleId resolve threw for '{active}' — left as-is: {rex.Message}");
+                    return;
+                }
+                if (resolvable) return;
+
+                gi!.ActiveVehicleId = null;
+                _vehIdHeals++;
+                Plugin.Logger.LogWarning($"[Vehicle] MID-SESSION stale ActiveVehicleId '{active}' cleared (#{_vehIdHeals}) — "
+                    + "it resolved to no local vehicle, which NREs every hover CTA (PlayerHelper.HasPaidForAllItems) "
+                    + "and traps the player in the building. Likeliest route: possessing another player's ghost vehicle.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Vehicle] ActiveVehicleId mid-session heal: {ex.Message}"); }
+        }
+
+        /// <summary>Per-session teardown for the mid-session vehicle-id net (round-106 lesson: these are
+        /// process-lifetime statics).  Both are benign across sessions — a past due-time just fires one
+        /// early check, and the counter only numbers log lines — but resetting keeps the log readable.</summary>
+        public static void ResetVehicleIdHealth()
+        {
+            _nextVehIdCheckAt = 0f;
+            _vehIdHeals       = 0;
+        }
+
+        /// <summary>
+        /// Slice 2 (2026-06-12): a cross-player sale consumes REAL stock.  Runs
+        /// on the HOST (interior authority) on the main thread: walks the shop's
+        /// item instances and decrements the sold amounts; empty cargo entries
+        /// are removed.  The interior diff hash covers cargo Amount, so the
+        /// change re-broadcasts to every machine automatically.  NOTE: the
+        /// owner's local shelf VISUAL (box models) may lag until the next
+        /// interior refresh — data and sync are correct immediately.
+        /// </summary>
+        // Recheck-remedies B-1 (approved 2026-09-01): the SHORT alarm is EVIDENCE-BASED, not typing-
+        // based. Whether an item is a shelf good lives in asset data we cannot read; instead we
+        // remember, per building, every item name that has ever had cargo here (any slot, any
+        // amount, incl. 0 — a sold-out slot the loop removes still counts). Services, tickets and
+        // fees never have cargo → never alarm; a real good that has been on a shelf alarms even
+        // after it sold out entirely. The log line is UNCONDITIONAL (the previous gate hid a real
+        // oversell of an unknown-typed item).
+        private static readonly System.Collections.Generic.Dictionary<string, System.Collections.Generic.HashSet<string>> _knownStockedItems = new();
+
+        public static string ApplySaleStockDecrement(string addressKey, System.Collections.Generic.List<SaleItem>? items, string buyerId)
+        {
+            var shortfall = new System.Text.StringBuilder();
+            try
+            {
+                if (items == null || items.Count == 0 || string.IsNullOrEmpty(addressKey)) return "";
+                var reg = FindRegistration(addressKey);
+                if (reg?.itemInstances == null)
+                {
+                    Plugin.Logger.LogWarning($"[Stock] no registration/items for '{addressKey}' — sale not decremented.");
+                    return "";
+                }
+                foreach (var s in items)
+                {
+                    if (s == null || s.Amount <= 0) continue;
+                    // Review-family #6 + recheck A-1 (decoupled): the DECREMENT runs for every
+                    // line — an unknown/service item simply finds no cargo, which is harmless,
+                    // and a consumable that IS stocked (hair-care product) decrements no matter
+                    // how its asset data types it. Only the SHORT *alarm* is typing-gated:
+                    // services/tickets/fees are not shelf goods, so "found none" is expected
+                    // there, not a shortfall. The typing bit lives in asset data we cannot read
+                    // from source (ItemType is [Flags], RetailProduct=2), so the alarm errs
+                    // quiet for unknowns while the subtraction stays unconditional.
+                    if (!_knownStockedItems.TryGetValue(addressKey, out var known)) _knownStockedItems[addressKey] = known = new System.Collections.Generic.HashSet<string>(System.StringComparer.Ordinal);
+                    bool seenCargo = false;
+                    int remaining = s.Amount;
+                    foreach (var kv in reg.itemInstances)
+                    {
+                        var cargo = kv.Value?.cargoInstances;
+                        if (cargo == null) continue;
+                        for (int i = cargo.Count - 1; i >= 0; i--)
+                        {
+                            var c = cargo[i];
+                            if (c == null || c.itemName != s.ItemName) continue;
+                            seenCargo = true;                       // evidence: this building stocks this item
+                            if (remaining <= 0) continue;
+                            int dec = System.Math.Min(c.amount, remaining);
+                            c.amount -= dec;
+                            remaining -= dec;
+                            if (c.amount <= 0) cargo.RemoveAt(i);
+                        }
+                    }
+                    if (seenCargo) known.Add(s.ItemName);
+                    int sold = s.Amount - remaining;
+                    bool alarm = remaining > 0 && known.Contains(s.ItemName);   // evidence-based: ever stocked here
+                    Plugin.Logger.LogInfo(
+                        $"[Stock] '{addressKey}': -{sold} {s.ItemName} (sold to {buyerId})" +
+                        (alarm ? $" — SHORT by {remaining} (stock didn't cover the sale)."
+                               : (remaining > 0 ? $" — {remaining} not on any shelf here (never stocked: service/ticket/fee, or unknown item) — no alarm." : ".")));
+                    if (alarm)
+                        shortfall.Append($"{s.ItemName} x{remaining}, ");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Stock] decrement '{addressKey}': {ex.Message}"); }
+            return shortfall.ToString().TrimEnd(' ', ',');
+        }
+
+        /// <summary>
+        /// Constructs a new IL2CPP ItemInstance from a network-side DTO and
+        /// populates all the fields we serialize.  Cargo + stacked + colors +
+        /// purchaser-settings are rebuilt as fresh IL2CPP objects.
+        /// </summary>
+        // ── Move-vs-change identity (round-22) ────────────────────────────────
+        // What an item IS, minus where it sits: two sigs equal ⇒ the delta is transform/location-only ⇒ the
+        // live GameObject is moved in place instead of destroy+respawned (the new instance is adopted into
+        // reg and the controller in BOTH paths, so excluding volatile metadata here only trades respawns for
+        // moves — never loses data). Any mismatch (cargo, state, attachments…) keeps the respawn path.
+        private static string IdentitySig(ItemInstanceInfo i)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new System.Text.StringBuilder();
+            sb.Append(i.ItemName ?? "").Append('|').Append(i.ParentId ?? "").Append('|')
+              .Append(i.LinkedItemName ?? "").Append('|').Append(i.IsSecured).Append('|')
+              .Append(i.StateIndex).Append('|').Append(i.Alias ?? "").Append('|')
+              .Append(i.CustomValue ?? "").Append('|').Append(i.WorldSpaceTextValue ?? "").Append('|')
+              .Append(i.PriceOnPurchase.ToString(inv));
+            // Round-99c (probe-proven): item PAINT is identity. Without it, a color-only delta
+            // classified as transform-only and the colored reconstruction was DISCARDED — grey
+            // furniture on first entry, repaints invisible. In core ⇒ paint change ⇒ respawn ⇒
+            // the native spawn paint path applies it. Both overloads MUST append identically.
+            if (i.CustomColors != null)
+                foreach (var cc in i.CustomColors)
+                    if (cc != null) sb.Append('|').Append(cc.Channel).Append(':').Append(cc.ColorPacked);
+            sb.Append('#');
+            AppendCargoSig(sb, i.CargoInstances);
+            sb.Append('#');
+            if (i.StackedItems != null)
+                foreach (var s in i.StackedItems)
+                    if (s != null) sb.Append(s.ChildId ?? "").Append(':').Append(s.ChildItemName ?? "").Append(':')
+                                     .Append(s.AttachmentIndex).Append(';');
+            return sb.ToString();
+        }
+
+        // Round-281: the cargo half of IdentitySig, lifted out verbatim.  It was already two mirrored
+        // copies (wire DTO / live instance) that MUST append identically or a cargo delta silently
+        // reclassifies as "different item" and respawns; the cargo-sync channel needed the same
+        // comparison to decide which items actually changed, and a THIRD copy of a rule that has to
+        // agree with two others is how these bugs are born.  Both overloads stay right here, adjacent,
+        // so a field added to one is visibly missing from the other.
+        private static void AppendCargoSig(System.Text.StringBuilder sb, List<CargoInstanceInfo>? cargo, bool includePrice = true)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            if (cargo == null) return;
+            foreach (var c in cargo)
+                if (c != null) sb.Append(c.ItemName ?? "").Append(':').Append(c.Amount).Append(':')
+                                 .Append(c.Paid).Append(':').Append(includePrice ? c.PricePerUnit.ToString(inv) : "-").Append(':')
+                                 .Append(c.CustomColors?.Count ?? 0).Append(':')
+                                 .Append(c.NestedCargoInstances?.Count ?? 0).Append(';');
+        }
+
+        private static void AppendCargoSig(System.Text.StringBuilder sb, BigAmbitions.Items.ItemInstance ii, bool includePrice = true)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            if (ii?.cargoInstances == null) return;
+            foreach (var c in ii.cargoInstances)
+                if (c != null) sb.Append(c.itemName ?? "").Append(':').Append(c.amount).Append(':')
+                                 .Append(c.paid).Append(':').Append(includePrice ? c.pricePerUnit.ToString(inv) : "-").Append(':')
+                                 .Append(c.customColors?.Count ?? 0).Append(':')
+                                 .Append(c.nestedCargoInstances?.Count ?? 0).Append(';');
+        }
+
+        /// <summary>Round-281: "does this item's cargo differ from what the wire says?"  Built from the
+        /// two overloads above, so it can never disagree with the full-snapshot path's own cargo test.
+        /// Round-281b (verifier finding, read-confirmed): PRICE IS EXCLUDED here — FillCargoInstances
+        /// deliberately re-stamped PricePerUnit from the local price table (by-design divergence, the
+        /// same reason the audit hash excludes it), so a live-vs-wire compare that includes price marked
+        /// every table-priced item "changed" on EVERY sync: 9 phantom entries per sync in the soak,
+        /// native cargo callbacks fired for all of them, and S4-lite's baseline invalidated each time.
+        /// PRICE-PER-UNIT-DIVERGE-1: the re-stamp is gone (cargo keeps the sender's cost), so the reason is
+        /// historical and price is compared again (review F3 of c7ccf25): a price-only change (a restock at another
+        /// cost) is a real change and goes out with the cargo sync instead of waiting for the next full snapshot.</summary>
+        private static bool CargoDiffers(BigAmbitions.Items.ItemInstance live, List<CargoInstanceInfo>? incoming)
+        {
+            var a = new System.Text.StringBuilder(); AppendCargoSig(a, live);
+            var b = new System.Text.StringBuilder(); AppendCargoSig(b, incoming);
+            return !string.Equals(a.ToString(), b.ToString(), StringComparison.Ordinal);
+        }
+
+        private static string IdentitySig(BigAmbitions.Items.ItemInstance ii)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new System.Text.StringBuilder();
+            sb.Append(ii.itemName ?? "").Append('|').Append(ii.parentId?.ToString() ?? "").Append('|')
+              .Append(ii.linkedItemName ?? "").Append('|').Append(ii.isSecured).Append('|')
+              .Append(ii.stateIndex).Append('|').Append(ii.alias?.ToString() ?? "").Append('|')
+              .Append(ii.customValue?.ToString() ?? "").Append('|').Append(ii.worldSpaceTextValue?.ToString() ?? "").Append('|')
+              .Append(ii.priceOnPurchase.ToString(inv));
+            // Round-99c: paint is identity — MUST mirror the DTO overload exactly.
+            if (ii.customColors != null)
+                foreach (var cc in ii.customColors)
+                    if (cc != null) sb.Append('|').Append((int)cc.channel).Append(':').Append(cc.color.color);
+            sb.Append('#');
+            AppendCargoSig(sb, ii);
+            sb.Append('#');
+            if (ii.stackedItems != null)
+                foreach (var s in ii.stackedItems)
+                    if (s != null) sb.Append(s.childId?.ToString() ?? "").Append(':').Append(s.childItemName ?? "").Append(':')
+                                     .Append(s.attachmentIndex).Append(';');
+            return sb.ToString();
+        }
+
+        /// <summary>Rebuild one item's cargo list from the wire, IN PLACE on the target instance.
+        /// Round-281 extracted this out of DeserializeItemInstance so the two channels that write cargo
+        /// — the full snapshot and the cargo sync — share one definition.  Two copies of this would be
+        /// two places to remember the price rule and the round-99 null-colour traps, and the
+        /// cheap channel is exactly where a forgotten one would hide.
+        /// `addressForPrices` is the shop's address key (snapshot path: the item's own street address; cargo
+        /// path: the payload's AddressKey). Since PRICE-PER-UNIT-DIVERGE-1 it no longer re-prices anything —
+        /// the cargo keeps the sender's price-per-unit (the owner's cost); kept for the call sites.</summary>
+        private static void FillCargoInstances(BigAmbitions.Items.ItemInstance ii, List<CargoInstanceInfo>? cargo, string addressForPrices)
+        {
+            if (ii?.cargoInstances == null || cargo == null) return;
+            ii.cargoInstances.Clear();
+            foreach (var c in cargo)
+            {
+                if (c == null) continue;
+                // PRICE-PER-UNIT-DIVERGE-1 C1 (owner decision 53, 2026-09-29): pricePerUnit is the owner's PURCHASE
+                // COST (sale cost reports, sell / close-out value, tax repossession, theft cost and returns all read
+                // it), so every machine keeps it exactly as sent. It used to be re-stamped here with the store's
+                // RETAIL price for display (user rule 2026-06-12: basket $18 while the charge was $22), and since the
+                // absence hand-back that retail copy overwrote the returning owner's real cost. The basket rule now
+                // lives where goods leave a shelf (MPPatches Patch_ShowcaseGrab_RetailPrice). Only a non-finite value
+                // is repaired, by the game's own FixPricePerUnitNan rule (wholesale price, else default market price).
+                float price = c.PricePerUnit;
+                if (float.IsNaN(price) || float.IsInfinity(price))
+                {
+                    price = 0f;
+                    try
+                    {
+                        var itN = BigAmbitions.Items.ItemsGetter.GetByName(c.ItemName);
+                        if (itN != null) { price = itN.GetWholesalePrice(); if (price == 0f) price = itN.DefaultMarketPrice; }
+                    }
+                    catch { price = 0f; }
+                }
+                var ci = new BigAmbitions.Items.CargoInstance(
+                    c.ItemName,
+                    c.Amount,
+                    price,
+                    c.Paid);
+                // Round-99: the 4-arg CargoInstance ctor sets customColors = NULL —
+                // same dead-guard class as the item colors elsewhere; assign instead.
+                if (c.CustomColors != null && c.CustomColors.Count > 0)
+                {
+                    ci.customColors = new List<BigAmbitions.Items.CustomColor>();
+                    foreach (var cc in c.CustomColors)
+                        ci.customColors.Add(new BigAmbitions.Items.CustomColor { channel = (BigAmbitions.Items.CustomColorChannel)cc.Channel, color = new SerializableColor(cc.ColorPacked) });
+                }
+                if (ci.nestedCargoInstances != null && c.NestedCargoInstances != null)
+                {
+                    ci.nestedCargoInstances.Clear();
+                    int namelessNested = 0;   // NULLNAME-1
+                    foreach (var n in c.NestedCargoInstances)
+                    {
+                        // NULLNAME-1 (bundle 20260918-013040): a nested entry with no name is poison —
+                        // vanilla CargoItemUi.SetUp keys a Dictionary on it and throws. SKIP it rather
+                        // than write it: an unnamed entry names no item, so nothing is lost by dropping it.
+                        if (n == null || string.IsNullOrEmpty(n.ItemName)) { namelessNested++; continue; }
+                        var nci = new BigAmbitions.Items.NestedCargoInstance
+                        {
+                            itemName     = n.ItemName,
+                            amount       = n.Amount,
+                            pricePerUnit = n.PricePerUnit,
+                        };
+                        // Round-99: NestedCargoInstance.customColors defaults NULL — same dead guard; assign.
+                        if (n.CustomColors != null && n.CustomColors.Count > 0)
+                        {
+                            nci.customColors = new List<BigAmbitions.Items.CustomColor>();
+                            foreach (var cc in n.CustomColors)
+                                nci.customColors.Add(new BigAmbitions.Items.CustomColor { channel = (BigAmbitions.Items.CustomColorChannel)cc.Channel, color = new SerializableColor(cc.ColorPacked) });
+                        }
+                        ci.nestedCargoInstances.Add(nci);
+                    }
+                    if (namelessNested > 0 && _namelessWireLogged++ < 20)
+                        Plugin.Logger.LogInfo($"[Cargo] skipped a nameless nested entry from the wire (NULLNAME-1) ×{namelessNested}");
+                }
+                ii.cargoInstances.Add(ci);
+            }
+        }
+
+        private static BigAmbitions.Items.ItemInstance? DeserializeItemInstance(ItemInstanceInfo i)
+        {
+            try
+            {
+                // Task-28 fix 1: a factory workstation is an ItemInstance SUBCLASS carrying its
+                // recipe/priority/limit config — constructing the base type here TYPE-ERASED the
+                // workstation on every respawn (config lost, BizMan Factory casts fail, and the
+                // degraded copy could persist in this machine's save).  WorkstationType non-null
+                // on the wire ⇔ the sender's instance was a FactoryWorkstationInstance.
+                BigAmbitions.Items.ItemInstance ii;
+                if (i.WorkstationType != null)
+                {
+                    var fw = new FactoryWorkstationInstance(i.ItemName)
+                    {
+                        selectedRecipeId = i.SelectedRecipeId ?? "",
+                        priority         = i.WsPriority,
+                        produceUpTo      = i.ProduceUpTo,
+                        produceUpToValue = i.ProduceUpToValue,
+                    };
+                    // the ctor derives workstationType from the item name — only override with a real value
+                    if (!string.IsNullOrEmpty(i.WorkstationType)) fw.workstationType = i.WorkstationType;
+                    ii = fw;
+                }
+                else ii = new BigAmbitions.Items.ItemInstance(i.ItemName);
+                ii.id                  = i.Id;
+                ii.itemName            = i.ItemName;
+                ii.position            = new SerializableVector3 { x = i.Px, y = i.Py, z = i.Pz };
+                // Task-28 fix 4: the quaternion 'rotation' is obsolete since EA 0.11 (native migrates
+                // it away at load, and its property getter MUTATES on read) — never write it back;
+                // yRotation is the one live rotation.
+                ii.yRotation           = i.YRotation;
+                ii.parentId            = i.ParentId;
+                ii.streetName          = i.StreetName;
+                ii.streetNumber        = i.StreetNumber;
+                ii.linkedItemName      = i.LinkedItemName;
+                ii.isSecured           = i.IsSecured;
+                ii.worldSpaceTextValue = i.WorldSpaceTextValue;
+                ii.stateIndex          = i.StateIndex;
+                ii.alias               = i.Alias;
+                ii.customValue         = i.CustomValue;
+                ii.priceOnPurchase     = i.PriceOnPurchase;
+
+                // Stacked items
+                if (ii.stackedItems != null && i.StackedItems != null)
+                {
+                    ii.stackedItems.Clear();
+                    foreach (var s in i.StackedItems)
+                    {
+                        ii.stackedItems.Add(new AttachableChild
+                        {
+                            childId         = s.ChildId,
+                            childItemName   = s.ChildItemName,
+                            attachmentIndex = s.AttachmentIndex,
+                        });
+                    }
+                }
+
+                // Cargo — round-281: the body moved into FillCargoInstances so the cargo-sync
+                // channel builds cargo through the SAME code, not a second copy of it.
+                FillCargoInstances(ii, i.CargoInstances, $"{i.StreetNumber} {i.StreetName}");
+
+                // Dirt spots — round-99: same dead-guard class as the colors (native field
+                // has no initializer → the old `ii.dirtSpotsThatAffects != null` never fired).
+                if (i.DirtSpotsThatAffects != null && i.DirtSpotsThatAffects.Count > 0)
+                {
+                    ii.dirtSpotsThatAffects = new List<int>();
+                    foreach (var d in i.DirtSpotsThatAffects) ii.dirtSpotsThatAffects.Add(d);
+                }
+
+                // Custom positions (multi-element items, e.g. cinema seating) — round-99: same dead guard.
+                if (i.CustomPositions != null && i.CustomPositions.Count > 0)
+                {
+                    ii.customPositions = new List<SerializableVector3>();
+                    foreach (var p in i.CustomPositions)
+                        ii.customPositions.Add(new SerializableVector3 { x = p.X, y = p.Y, z = p.Z });
+                    // Round-137: never let the truncated-queue signature onto this machine, wherever it came from.
+                    MPRegisterSync.RepairTruncatedQueue(ii.customPositions);
+                    // Round-143: refuse ORIGIN-POISONED queue data (head anchor >10m from the item = the
+                    // staging artifact) - dropped, so the line rebuilds at the item's true position.
+                    if (MPRegisterSync.IsPoisonedQueue(ii.customPositions, ii.position))
+                    {
+                        Plugin.Logger.LogWarning($"[QueueSync] incoming queue data for '{i.ItemName}' was anchored far from the item (staging artifact) - dropped; the line rebuilds at the true position.");
+                        ii.customPositions = null;
+                    }
+                }
+
+                // Top-level custom colors — round-99: the native ItemInstance ctor leaves
+                // customColors NULL, so the old `ii.customColors != null` guard was dead code
+                // and every wire color was silently dropped (field: "clients see the object
+                // but not the color"). ASSIGN the list; the replica's ItemController applies
+                // it natively at spawn (it reads ItemInstance.customColors on init).
+                if (i.CustomColors != null && i.CustomColors.Count > 0)
+                {
+                    ii.customColors = new List<BigAmbitions.Items.CustomColor>();
+                    foreach (var cc in i.CustomColors)
+                        ii.customColors.Add(new BigAmbitions.Items.CustomColor { channel = (BigAmbitions.Items.CustomColorChannel)cc.Channel, color = new SerializableColor(cc.ColorPacked) });
+                }
+
+                // Purchaser settings
+                if (i.PurchaserSettings != null)
+                {
+                    ii.playerItemPurchaserSettings = new BigAmbitions.Items.PlayerItemPurchaserSettings
+                    {
+                        name         = i.PurchaserSettings.Name,
+                        enabled      = i.PurchaserSettings.Enabled,
+                        itemName     = i.PurchaserSettings.ItemName,
+                        itemQuantity = i.PurchaserSettings.ItemQuantity,
+                    };
+                }
+
+                return ii;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[Patcher] DeserializeItemInstance id={i.Id}: {ex.Message}");
+                return null;
+            }
+        }
+
+        // ── Business sync (Phase 1) ───────────────────────────────────────────
+
+        // ── Field 20260829-222154: fresh-join ordering race ──────────────────
+        // The first 0.2.1 field report: a joining player's business snapshot (885 rows) arrived
+        // while their world still had ZERO registrations (generation not finished), applied 0/885
+        // as a silent per-row no-op, and the vacuous verify below printed "100% ✓". The player
+        // walked an empty city until the audit self-heal re-sent minutes later. A snapshot that
+        // arrives before the world exists is HELD here (latest wins) and re-applied from
+        // TickHeldBusinessSnapshot (MPCanvasUI.Update) once MPWorldReady says the world settled —
+        // the same gate + retry contract every other join-time action already follows.
+        private static BusinessSnapshotPayload? _heldBizSnapshot;
+        private static readonly List<BusinessInfo> _heldBizDeltas = new();   // review S1: deltas held with it, replayed AFTER
+        private static int _snapshotApplyDepth;      // H-AICAT-1 (review 2026-09-10 #5): >0 while a snapshot applies - product-list writes are counted, not logged one by one
+        private static int _aiProductsInSnapshot;    // count of product lists written by the current snapshot apply
+
+        internal static void TickHeldBusinessSnapshot()
+        {
+            var held = _heldBizSnapshot;
+            if (held == null)
+            {
+                // Deltas can be held with NO snapshot pending (world merely unsettled) — drain them
+                // at settle so they are never stranded (review S1).
+                if (_heldBizDeltas.Count > 0 && MPWorldReady.AssertSettledFor("held-business-deltas"))
+                    DrainHeldBizDeltas();
+                return;
+            }
+            if (!MPWorldReady.AssertSettledFor("held-business-snapshot")) return;
+            _heldBizSnapshot = null;
+            Plugin.Logger.LogInfo($"[Patcher] world settled — applying the HELD business snapshot ({held.Businesses.Count} buildings).");
+            ApplyBusinessSnapshot(held);   // re-enters; the gate passes now (re-holds if readiness flickers)
+        }
+
+        /// <summary>Review S1: replay held business changes in arrival order. MAIN THREAD only.</summary>
+        private static void DrainHeldBizDeltas()
+        {
+            if (_heldBizDeltas.Count == 0) return;
+            var drain = new List<BusinessInfo>(_heldBizDeltas);
+            _heldBizDeltas.Clear();
+            int applied = 0;
+            foreach (var info in drain)
+                try { if (info != null && ApplyBusinessInfoLocal(info)) applied++; } catch { }
+            _mapFilterDirtyAt = UnityEngine.Time.unscaledTime;
+            Plugin.Logger.LogInfo($"[Patcher] {applied}/{drain.Count} held business change(s) replayed after the snapshot.");
+        }
+
+        /// <summary>Session teardown: a snapshot/deltas held from session A must never apply into session B.</summary>
+        internal static void ResetHeldBusinessSnapshot() { _heldBizSnapshot = null; _heldBizDeltas.Clear(); }
+
+        public static void ApplyBusinessSnapshot(BusinessSnapshotPayload payload)
+        {
+            MPLoadProfiler.Mark($"CLIENT ApplyBusinessSnapshot QUEUED ({payload.Businesses.Count} buildings)");
+            RunOnMainThread(() =>
+            {
+                // Field 20260829-222154 (checked HERE, on the main thread, at apply time): an
+                // unsettled world means every row below would no-op against nothing. Hold instead.
+                if (!MPWorldReady.IsSettled)
+                {
+                    _heldBizSnapshot = payload;
+                    int regsNow = -1; try { regsNow = SaveGameManager.Current?.BuildingRegistrations?.Count ?? -1; } catch { }
+                    Plugin.Logger.LogWarning($"[Patcher] business snapshot ({payload.Businesses.Count} buildings) HELD — "
+                        + $"world not settled yet (regs={regsNow}, quiesce={MPClient.IsJoinQuiescing}). It applies when the world is ready.");
+                    return;
+                }
+                long _profT0 = MPLoadProfiler.NowMs;
+                // ── BEFORE-apply per-type count (Phase 1b investigation) ────
+                LogClientTypeBreakdown("ApplyBusinessSnapshot.BEFORE");
+
+                // ── Verification: confirm baseline is clean ─────────────────
+                // With CityGenerator suppression in place, every BuildingRegistration
+                // on client should be in default state (no business, no rivals,
+                // not rented).  Walk the list and count any that aren't — these
+                // are the "extras" that survived our wipe in earlier iterations.
+                // Log them so we know the suppression is taking effect.
+                VerifyCleanBaseline(payload);
+
+                int applied = 0;
+                _aiProductsInSnapshot = 0; _snapshotApplyDepth++;   // H-AICAT-1: per-record product-list lines are summarised for a snapshot
+                try
+                {
+                    foreach (var info in payload.Businesses)
+                    {
+                        if (ApplyBusinessInfoLocal(info)) applied++;
+                    }
+                }
+                finally { _snapshotApplyDepth--; }
+                Plugin.Logger.LogInfo($"[Patcher] Business snapshot applied: {applied}/{payload.Businesses.Count} buildings; AI product lists written: {_aiProductsInSnapshot} (H-AICAT-1).");
+
+                // ── Buy marketplace (gi.buildingsForSale) ───────────────────
+                // Wipe the client's local list and rebuild from host's payload.
+                // With Patch_RealEstateHelper_RunDaily_SkipOnClient active, the
+                // client's list shouldn't be growing on its own — but wiping
+                // first guarantees a clean mirror.
+                ApplyBuildingsForSale(payload.BuildingsForSale);
+
+                // ── AFTER-apply per-type count (Phase 1b investigation) ─────
+                LogClientTypeBreakdown("ApplyBusinessSnapshot.AFTER");
+
+                // ── POST-apply verification: client must now match host ─────
+                VerifyMatchesPayload(payload);
+
+                // ── Refresh map filter overlay ──────────────────────────────
+                // Mirrors what the game does natively after rent / sale / daily
+                // real-estate ticks.  Without this the data is correct but the
+                // colored map highlights stay frozen until the user toggles a
+                // filter manually.
+                RefreshMapFilters();
+                MPLoadProfiler.Span($"CLIENT ApplyBusinessSnapshot APPLIED ({applied}/{payload.Businesses.Count})", _profT0);
+
+                // Frozen-until-synced: the business table is the bulk of the world
+                // state.  Mark it applied so the overlay-freeze gate knows the world
+                // sync is done.  We only tell the host we're world-ready once we are
+                // BOTH synced (here) AND our loading overlay has cleared (= frozen).
+                // If we're already frozen, send now; otherwise the overlay gate sends
+                // it the moment our overlay clears (covers the apply-before-freeze
+                // ordering).
+                MPClient.WorldSyncApplied = true;
+                MPClient.TickWorldReadyGate();   // round-205: readiness now also waits for the parked-car receipt
+                // FOLD r1 R3 (Hamptons D1): this is the event that says "this client is in a synced
+                // world" — including after a reconnect into the same scene, where the one-shot LOD0
+                // callbacks have long since fired. Re-takes the ambient subscriptions the link loss
+                // dropped; a no-op when none are owed.
+                try { HamptonsAccess.OnWorldSyncApplied(); } catch { }
+                TimeSync.NotifyWorldSyncApplied();   // fires a release the gate deferred (hot-join world-sync gate)
+                // Round-50 (approved): SECOND world-health census, event-triggered — the +30s line
+                // races slow-link snapshot delivery (field 2026-07-21-204010: "DEGRADED" printed
+                // before the world had arrived). This one runs 10s after the snapshot actually
+                // applied (top-up time), so reports carry a post-sync verdict that means something.
+                // Round-56b (first 0.1.13 field report, Westi): arm only on a SUBSTANTIVE apply —
+                // a NEW-GAME join's first snapshot is the empty pre-generation one, and arming on
+                // it printed an all-zeros census that never re-sampled. 50 businesses ≈ any real
+                // world push; the empty snapshot carries none.
+                if (payload.Businesses != null && payload.Businesses.Count >= 50)
+                    MPCanvasUI.ArmPostSyncWorldHealth();
+            });
+        }
+
+        /// <summary>
+        /// Finds the active CityMapFilters MonoBehaviour and triggers a full
+        /// filter refresh — the same call the game makes natively after any
+        /// state change that could affect map highlights (rent, sell, daily
+        /// real-estate update).  We suppress those events on client, so we
+        /// invoke this manually after our snapshot apply.  No-op if the
+        /// component isn't in the scene yet.
+        /// </summary>
+        private static void RefreshMapFilters()
+        {
+            try
+            {
+                var all = UnityEngine.Object.FindObjectsOfType(typeof(CityMapFilters));
+                if (all == null || all.Length == 0) return;
+                for (int i = 0; i < all.Length; i++)
+                {
+                    var f = all[i] as CityMapFilters;
+                    if (f == null) continue;
+                    try { f.ApplyFilters(); }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] CityMapFilters.ApplyFilters: {ex.Message}"); }
+                }
+                Plugin.Logger.LogInfo($"[Patcher] Map filters refreshed ({all.Length} CityMapFilters instance(s)).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] RefreshMapFilters: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Replaces gi.buildingsForSale with the host's authoritative list.
+        /// Each entry resolves AddressKey → local BuildingRegistration; we
+        /// instantiate a new BuildingForSale per entry with the host's
+        /// price/sqm/acceptOfferRate fields.
+        /// </summary>
+        /// <summary>v9 (T6): the standalone BuildingsForSale message lands here too —
+        /// marshalled, same replace-the-list routine the snapshot path uses.</summary>
+        public static void ApplyBuildingsForSaleMsg(System.Collections.Generic.List<BuildingForSaleInfo> infos)
+        {
+            if (infos == null) return;
+            RunOnMainThread(() => ApplyBuildingsForSale(infos));
+        }
+
+        private static void ApplyBuildingsForSale(System.Collections.Generic.List<BuildingForSaleInfo> infos)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) return;
+                var lst = gi.buildingsForSale;
+                if (lst == null) { Plugin.Logger.LogWarning("[Patcher] gi.buildingsForSale is null."); return; }
+
+                int wipedCount = lst.Count;
+                lst.Clear();
+
+                int added = 0;
+                int skipped = 0;
+                foreach (var info in infos)
+                {
+                    if (string.IsNullOrEmpty(info.AddressKey)) { skipped++; continue; }
+                    var reg = FindRegistration(info.AddressKey);
+                    if (reg == null) { skipped++; continue; }
+                    try
+                    {
+                        var bfs = new BuildingForSale
+                        {
+                            address          = reg.Address,
+                            buildingPrice    = info.BuildingPrice,
+                            squareMeters     = info.SquareMeters,
+                            acceptOfferRate  = info.AcceptOfferRate,
+                        };
+                        lst.Add(bfs);
+                        added++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.Logger.LogWarning($"[Patcher] ApplyBuildingsForSale entry {info.AddressKey}: {ex.Message}");
+                        skipped++;
+                    }
+                }
+                Plugin.Logger.LogInfo($"[Patcher] BuildingsForSale: wiped={wipedCount} added={added} skipped={skipped} (host sent {infos.Count}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ApplyBuildingsForSale: {ex.Message}"); }
+        }
+
+        /// <summary>HOST / MAIN THREAD: remove a building from the authoritative for-sale
+        /// market after a player bought it.  BusinessSync.CheckBuildingsForSaleChange then
+        /// broadcasts the shorter list, so the building leaves every player's market.</summary>
+        public static void HostRemoveFromForSale(string addressKey)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.buildingsForSale == null) return;
+                int removed = gi.buildingsForSale.RemoveAll(x => GameStateReader.AddressKey(x.address) == addressKey);
+                if (removed > 0) Plugin.Logger.LogInfo($"[Patcher/Host] {addressKey} removed from for-sale market (bought).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher/Host] HostRemoveFromForSale: {ex.Message}"); }
+        }
+
+        /// <summary>MAIN THREAD: read the for-sale market entry for an address into a
+        /// transferable BuildingForSaleInfo (the seller's chosen price/sqm/acceptRate),
+        /// or null if the address isn't currently listed.</summary>
+        public static BuildingForSaleInfo? GetForSaleInfo(string addressKey)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.buildingsForSale == null) return null;
+                foreach (var bfs in gi.buildingsForSale)
+                {
+                    if (GameStateReader.AddressKey(bfs.address) != addressKey) continue;
+                    return new BuildingForSaleInfo
+                    {
+                        AddressKey      = addressKey,
+                        BuildingPrice   = bfs.buildingPrice,
+                        SquareMeters    = bfs.squareMeters,
+                        AcceptOfferRate = bfs.acceptOfferRate,
+                    };
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] GetForSaleInfo: {ex.Message}"); }
+            return null;
+        }
+
+        /// <summary>HOST / MAIN THREAD: add (or refresh) a building in the authoritative
+        /// for-sale market from a client's listing, preserving the seller's price.  The
+        /// for-sale poll then broadcasts it so every player sees the listing.</summary>
+        public static void HostAddToForSale(BuildingForSaleInfo info)
+        {
+            try
+            {
+                if (info == null || string.IsNullOrEmpty(info.AddressKey)) return;
+                var gi = SaveGameManager.Current;
+                if (gi?.buildingsForSale == null) return;
+                var reg = FindRegistration(info.AddressKey);
+                if (reg == null) { Plugin.Logger.LogWarning($"[Patcher/Host] list-for-sale: no reg for {info.AddressKey}."); return; }
+                gi.buildingsForSale.RemoveAll(x => GameStateReader.AddressKey(x.address) == info.AddressKey);   // replace any prior listing
+                gi.buildingsForSale.Add(new BuildingForSale
+                {
+                    address         = reg.Address,
+                    buildingPrice   = info.BuildingPrice,
+                    squareMeters    = info.SquareMeters,
+                    acceptOfferRate = info.AcceptOfferRate,
+                });
+                Plugin.Logger.LogInfo($"[Patcher/Host] {info.AddressKey} listed for sale @ {info.BuildingPrice:F0}.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher/Host] HostAddToForSale: {ex.Message}"); }
+        }
+
+        /// <summary>MAIN THREAD: the address keys of all currently-for-sale buildings the
+        /// local player OWNS — the set SimulateCompetitorBuyingPlayerBuildings may sell
+        /// this tick.  Captured before that method runs so the postfix can tell which
+        /// actually sold.</summary>
+        public static System.Collections.Generic.List<string> SnapshotOwnedForSale()
+        {
+            var result = new System.Collections.Generic.List<string>();
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.buildingsForSale == null) return result;
+                foreach (var bfs in gi.buildingsForSale)
+                {
+                    string key = GameStateReader.AddressKey(bfs.address);
+                    var reg = FindRegistration(key);
+                    if (reg != null && reg.BuildingOwnedByPlayer) result.Add(key);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] SnapshotOwnedForSale: {ex.Message}"); }
+            return result;
+        }
+
+        /// <summary>MAIN THREAD: of the previously-owned-for-sale addresses, those the
+        /// local player no longer owns — i.e. the AI just bought them.</summary>
+        public static System.Collections.Generic.List<string> DetectSold(System.Collections.Generic.List<string> before)
+        {
+            var sold = new System.Collections.Generic.List<string>();
+            try
+            {
+                if (before == null) return sold;
+                foreach (var key in before)
+                {
+                    var reg = FindRegistration(key);
+                    if (reg == null || !reg.BuildingOwnedByPlayer) sold.Add(key);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] DetectSold: {ex.Message}"); }
+            return sold;
+        }
+
+        /// <summary>MAIN THREAD: the host denied our optimistic buy (someone else already
+        /// owns it) — undo it: drop the real-estate entry and refund what we paid.  The
+        /// host's for-sale broadcast restores the building to our market.</summary>
+        /// <summary>CLIENT (round-50): reverse the OPTIMISTIC local rent after the host denied it —
+        /// the missing half of the deny path (HandleRentDeny was a log-only TODO: the client kept a
+        /// rent the host never granted AND the money it paid, silently). Mirrors the native
+        /// terminate-lease state writes and refunds the DEPOSIT (the payload's LastDeposit — the
+        /// native terminate refunds exactly the deposit too; a first-day rent charge, if the native
+        /// contract took one, is not reconstructable here and stays lost — logged). MAIN THREAD.</summary>
+        public static void RollbackRent(string addressKey, float lastDeposit)
+        {
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    var reg = FindRegistration(addressKey);
+                    int removedItems = 0;
+                    if (reg != null && reg.RentedByPlayer)
+                    {
+                        reg.RentedByPlayer   = false;
+                        reg.AvailableForRent = true;
+                        reg.BusinessName     = null;
+                        reg.businessTypeName = "ba:businesstype_empty";
+                        try { reg.RentPerDay = 0f; reg.lastDeposit = 0f; } catch { }
+
+                        // Round-260 (field 20260810-232704: 4 denials → 5 stacked delivery
+                        // spots): the optimistic rent ran the FULL native flow, and
+                        // RentBuilding itself materializes the empty layout's starter items
+                        // (InsertBusinessLayoutSet → delivery spot + hand-truck spawner) into
+                        // reg.itemInstances. A field-level revert that skips them leaks one
+                        // set per denial — the "optimistic native flow, partial rollback"
+                        // class (07-bug-classes.md).
+                        try
+                        {
+                            var keys = new System.Collections.Generic.List<string>();
+                            foreach (var kv in reg.itemInstances)
+                            {
+                                string n = kv.Value?.itemName?.ToString() ?? "";
+                                if (n == "ba:itemname_deliveryspot" || n == "ba:itemname_handtruckspawner") keys.Add(kv.Key);
+                            }
+                            foreach (var k in keys) if (reg.itemInstances.Remove(k)) removedItems++;
+                        }
+                        catch (Exception exItems) { Plugin.Logger.LogWarning($"[Patcher] rent-rollback starter-item removal: {exItems.Message}"); }
+
+                        try { GlobalEvents.onBuildingRegistrationChange?.Invoke(reg.Address); } catch { }
+                        try { InstanceBehavior<UI.UIs>.Instance?.mapFilters?.ApplyFilters(); } catch { }
+                    }
+                    if (lastDeposit > 0f)
+                    {
+                        try { SaveGameManager.Current.Money += lastDeposit; } catch { }
+                        // DESIGNER-MONEY-1 (M2): direct wallet write — keep an open designer session in step.
+                        DesignerBalanceKeeper.OnExternalMoneyChange(lastDeposit, "rent-rollback refund");
+                        // The optimistic rent's charge went through native ChangeMoney (forwarded to
+                        // the shared ledger) — the refund must follow or the reconcile erases it.
+                        MergerWallet.ForwardExternal(lastDeposit, "rent-rollback refund");
+                    }
+                    PassengerHud.Toast("The host denied that rental — the building isn't available. Deposit refunded.", 6f);
+                    Plugin.Logger.LogInfo($"[Patcher] Rolled back rent of {addressKey} (deposit {lastDeposit:F0} refunded; starter items removed: {removedItems}, round-260).");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] RollbackRent: {ex.Message}"); }
+            });
+        }
+
+        public static void RollbackBuy(string addressKey)
+        {
+            RunOnMainThread(() =>
+            {
+                try
+                {
+                    var gi = SaveGameManager.Current;
+                    if (gi?.realEstate == null) return;
+                    float refund = 0f;
+                    foreach (var re in gi.realEstate)
+                        if (GameStateReader.AddressKey(re.address) == addressKey) refund += (float)re.purchasePrice;   // 1.0: double now
+                    int removed = gi.realEstate.RemoveAll(x => GameStateReader.AddressKey(x.address) == addressKey);
+                    if (removed > 0)
+                    {
+                        if (refund > 0f)
+                        {
+                            try { gi.Money += refund; } catch { }
+                            // DESIGNER-MONEY-1 (M2): direct wallet write — keep an open designer session in step.
+                            DesignerBalanceKeeper.OnExternalMoneyChange(refund, "buy-rollback refund");
+                            // Slice 4: the denied buy's CHARGE went through native ChangeMoney (forwarded
+                            // to the shared ledger) — the refund must follow or the reconcile erases it.
+                            MergerWallet.ForwardExternal(refund, "buy-rollback refund");
+                        }
+                        Plugin.Logger.LogInfo($"[Patcher] Rolled back buy of {addressKey} (refunded {refund:F0}).");
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] RollbackBuy: {ex.Message}"); }
+            });
+        }
+
+        /// <summary>
+        /// Walks gi.BuildingRegistrations and counts registrations whose state
+        /// is NOT in the default "freshly-loaded, nothing assigned" baseline.
+        /// With CityGenerator suppression active, this count should be near-zero.
+        /// Non-zero means some generator path snuck through and the wipe is
+        /// incomplete — those buildings will end up as the "extras" the user sees.
+        /// </summary>
+        private static void VerifyCleanBaseline(BusinessSnapshotPayload payload)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) return;
+
+                int total          = 0;
+                int withBiz        = 0;   // BusinessTypeName != Empty
+                int withRivalOwn   = 0;   // buildingOwnerRivalId set
+                int withRivalBiz   = 0;   // businessOwnerRivalId set
+                int playerRented   = 0;
+                int availForRent   = 0;
+                var dirtyExamples  = new System.Collections.Generic.List<string>();
+
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    total++;
+                    bool dirty = false;
+                    try { if (reg.businessTypeName != "ba:businesstype_empty")                    { withBiz++;      dirty = true; } } catch { }
+                    try { if (!string.IsNullOrEmpty(reg.buildingOwnerRivalId))   { withRivalOwn++; dirty = true; } } catch { }
+                    try { if (!string.IsNullOrEmpty(reg.businessOwnerRivalId))   { withRivalBiz++; dirty = true; } } catch { }
+                    try { if (reg.RentedByPlayer)                                { playerRented++; dirty = true; } } catch { }
+                    try { if (reg.AvailableForRent)                              { availForRent++;               } } catch { }
+                    if (dirty && dirtyExamples.Count < 5)
+                    {
+                        try { dirtyExamples.Add(GameStateReader.AddressKey(reg)); } catch { }
+                    }
+                }
+
+                int dirtyTotal = withBiz + withRivalOwn + withRivalBiz + playerRented;
+                string sample = dirtyExamples.Count > 0 ? $" examples=[{string.Join(", ", dirtyExamples)}]" : "";
+                Plugin.Logger.LogInfo($"[Patcher] Baseline check (BEFORE apply): total={total} dirty={dirtyTotal} " +
+                    $"(withBiz={withBiz} rivalOwn={withRivalOwn} rivalBiz={withRivalBiz} playerRented={playerRented} avail={availForRent}){sample}");
+
+                // Rejoin scoping (2026-07-09, RED ROC report review): the suppression question is only
+                // meaningful on the FIRST world load of this app run — CityGenerator ran under
+                // suppression, so a dirty baseline there is a genuine escape. Any LATER load (rejoin
+                // after host loss, reload) re-enters an already-populated world where prior state is
+                // EXPECTED; the report showed 6 false alarms in one evening (~1 per rejoin), each
+                // ~1340 regs = the whole previously-loaded city. The snapshot overwrites either way.
+                if (dirtyTotal > 0 && !_baselineCheckedBefore)
+                    Plugin.Logger.LogWarning($"[Patcher] Baseline NOT clean — {dirtyTotal} reg(s) had state before host's snapshot wrote them.  CityGenerator suppression may be incomplete.");
+                else if (dirtyTotal > 0)
+                    Plugin.Logger.LogInfo($"[Patcher] Baseline has prior state ({dirtyTotal} reg(s)) — rejoin/reload into a previously loaded world; expected, snapshot overwrites.");
+                else
+                    Plugin.Logger.LogInfo("[Patcher] Baseline is 100% clean ✓");
+                _baselineCheckedBefore = true;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] VerifyCleanBaseline: {ex.Message}"); }
+        }
+
+        private static bool _baselineCheckedBefore;
+
+        /// <summary>
+        /// After applying the snapshot, walk every registration and confirm
+        /// its BusinessTypeName matches what the host sent for the same address.
+        /// Logs any mismatch — should be empty if the apply was complete.
+        /// </summary>
+        private static void VerifyMatchesPayload(BusinessSnapshotPayload payload)
+        {
+            try
+            {
+                var hostByAddr = new System.Collections.Generic.Dictionary<string, BusinessInfo>(payload.Businesses.Count);
+                foreach (var info in payload.Businesses)
+                    if (!string.IsNullOrEmpty(info.AddressKey)) hostByAddr[info.AddressKey] = info;
+
+                var gi = SaveGameManager.Current;
+                if (gi == null) return;
+
+                int matched = 0, mismatchBiz = 0, missingOnClient = 0;
+                var mismatchExamples = new System.Collections.Generic.List<string>();
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    string addr = GameStateReader.AddressKey(reg);
+                    if (string.IsNullOrEmpty(addr)) continue;
+                    if (!hostByAddr.TryGetValue(addr, out var info)) { missingOnClient++; continue; }
+                    string clientBiz; try { clientBiz = reg.businessTypeName ?? ""; } catch { clientBiz = "?"; }
+                    if (clientBiz == info.BusinessTypeName) matched++;
+                    else
+                    {
+                        mismatchBiz++;
+                        if (mismatchExamples.Count < 5)
+                            mismatchExamples.Add($"{addr} host={info.BusinessTypeName} client={clientBiz}");
+                    }
+                }
+
+                string sample = mismatchExamples.Count > 0 ? $" examples=[{string.Join(" | ", mismatchExamples)}]" : "";
+                Plugin.Logger.LogInfo($"[Patcher] Match check (AFTER apply): matched={matched} mismatchBiz={mismatchBiz} addrNotInPayload={missingOnClient}{sample}");
+
+                // Field 20260829-222154: the old predicate passed VACUOUSLY on an empty world —
+                // zero registrations compared means zero mismatches, and "100% ✓" printed while
+                // 0/885 rows had actually landed. Success requires having COMPARED something.
+                if (matched > 0 && mismatchBiz == 0 && missingOnClient == 0)
+                    Plugin.Logger.LogInfo($"[Patcher] Client now mirrors host's snapshot 100% ✓ ({matched} registration(s) verified)");
+                else if (matched == 0 && mismatchBiz == 0 && missingOnClient == 0)
+                    Plugin.Logger.LogWarning("[Patcher] Post-apply verify compared ZERO registrations — the local world is empty; "
+                        + "nothing was verified and nothing was applied. (The snapshot should have been HELD; if this prints, the hold gate leaked.)");
+                else
+                    Plugin.Logger.LogWarning($"[Patcher] Post-apply state does NOT match host — {mismatchBiz} mismatch(es), {missingOnClient} not-in-payload.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] VerifyMatchesPayload: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Walks gi.BuildingRegistrations on the client and prints the full
+        /// per-BuildingType TypeStats breakdown — Phase 1b diagnostic for the
+        /// residential/warehouse for-rent discrepancy.
+        /// </summary>
+        private static void LogClientTypeBreakdown(string label)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) { Plugin.Logger.LogInfo($"[Patcher] {label}: (no GameInstance)"); return; }
+                var stats = new BusinessSync.TypeStats();
+                int totalRegs = 0;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    totalRegs++;
+                    stats.AccumulateFromReg(reg);
+                }
+                stats.Log(label, totalRegs);
+                BusinessSync.LogForSaleAndRealEstate(label, gi);
+                BusinessSync.LogSceneCBCCounts(label);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] {label} count failed: {ex.Message}"); }
+        }
+
+        /// <summary>v9 review MIN-2: the map's colored filters only refreshed on FULL snapshot
+        /// applies — now that the WorldReady resend and the daily heal ship batches of
+        /// BusinessChange instead, refresh after those too. Trailing-edge debounce (each apply
+        /// pushes the window) so an 80-delta burst costs ONE scene-sweep refresh, after the
+        /// LAST delta — a leading throttle would refresh on the first and leave 79 stale.
+        /// Ticked from MPCanvasUI.Update.</summary>
+        private static float _mapFilterDirtyAt = -1f;
+
+        internal static void TickMapFilterDebounce()
+        {
+            if (_mapFilterDirtyAt < 0f) return;
+            if (UnityEngine.Time.unscaledTime - _mapFilterDirtyAt < 1f) return;   // still bursting — wait for quiet
+            _mapFilterDirtyAt = -1f;
+            RefreshMapFilters();
+        }
+
+        public static void ApplyBusinessChange(BusinessInfo info)
+        {
+            RunOnMainThread(() =>
+            {
+                // Review S1 (2026-08-29): a delta that applies DURING the settle window gets
+                // overwritten by the OLDER held snapshot when it lands. Hold deltas under the same
+                // conditions and replay them AFTER the snapshot, in arrival order. (Residual,
+                // accepted: a delta older than a SUPERSEDING second snapshot re-applies after it —
+                // its content is almost always already inside that snapshot; the audit covers.)
+                if (!MPWorldReady.IsSettled || _heldBizSnapshot != null)
+                {
+                    _heldBizDeltas.Add(info);
+                    Plugin.Logger.LogInfo($"[Patcher] business change for '{info.AddressKey}' HELD behind the pending snapshot ({_heldBizDeltas.Count} queued).");
+                    return;
+                }
+                if (ApplyBusinessInfoLocal(info))
+                {
+                    Plugin.Logger.LogInfo($"[Patcher] Business change applied: {info.AddressKey} = '{info.BusinessName}'");
+                    _mapFilterDirtyAt = UnityEngine.Time.unscaledTime;
+                }
+            });
+        }
+
+        /// <summary>HOST: apply a business a CLIENT built/changed (in a building it owns)
+        /// to the host's own world, so the host sees it.  ApplyBusinessInfoLocal is
+        /// identity-relative, so OwnerPlayerId != host resolves to that player as the
+        /// building's owner (buildingOwnerRivalId).  The host's BusinessSync.Tick then
+        /// detects the changed reg and relays it to the other clients.  MAIN THREAD.</summary>
+        /// <summary>Round-184 fix 3: how long after a player joins their near-empty wholesale
+        /// pushes are treated as the stale/fresh-save signature rather than as truth.</summary>
+        internal const int ResurrectionWindowMs = 10 * 60 * 1000;
+
+        public static void ApplyClientBusinessChange(BusinessInfo info)
+        {
+            if (info == null) return;
+            RunOnMainThread(() =>
+            {
+                var reg = FindRegistration(info.AddressKey);
+                // Round-50b: the HOST'S OWN ACTIVE SHOP is never overwritable by a remote claim.
+                // A stale manifest-carried ledger entry can vouch for the sender (field:
+                // 57-fifthavenue, 2026-07-21-204010 — both saves claimed the address), letting
+                // the SenderOwns gate pass a push that would clobber the host's own business.
+                // TrulyMine excludes merger-flipped partner shops (their pushes stay legit).
+                if (reg != null && reg.RentedByPlayer && MergerFlip.TrulyMine(reg))
+                {
+                    Plugin.Logger.LogWarning($"[Conflict] DOUBLE TENANCY at '{info.AddressKey}': the host actively rents it " +
+                        $"(local name='{reg.BusinessName}') but '{info.OwnerPlayerId}' pushed a business change (name='{info.BusinessName}') — " +
+                        "refused; the world-ready ledger sweep drops the stale reservation on the next host load.");
+                    return;
+                }
+                // Round-184 fix 3 (business leg): an EMPTY business record from a recently-joined
+                // sender may not blank a live one — same stale/fresh-save signature as the
+                // interior leg (rig-proven: Testbiz1's name → '' within seconds of the rejoin).
+                // Push our record back so the owner's machine re-learns its own business.
+                try
+                {
+                    bool incomingEmpty = string.IsNullOrEmpty(info.BusinessName)
+                        && (string.IsNullOrEmpty(info.BusinessTypeName)
+                            || info.BusinessTypeName.EndsWith("_empty", StringComparison.Ordinal));
+                    string curName = ""; try { curName = reg?.BusinessName?.ToString() ?? ""; } catch { }
+                    if (incomingEmpty && curName.Length > 0
+                        && !string.IsNullOrEmpty(info.OwnerPlayerId)
+                        && MPServer.JoinedAtByPid.TryGetValue(info.OwnerPlayerId, out var jMs)
+                        && unchecked(Environment.TickCount - jMs) < ResurrectionWindowMs)
+                    {
+                        Plugin.Logger.LogWarning($"[Patcher/Host] business change REFUSED for '{info.AddressKey}': recently-joined '{info.OwnerPlayerId}' pushed an EMPTY record over live business '{curName}' — stale/fresh-save signature (round-184); pushing ours back.");
+                        try { if (reg != null) BusinessSync.PushBusinessNow(reg, "resurrection-guard heal (round-184)"); } catch { }
+                        return;
+                    }
+                }
+                catch { }
+                bool signObjNull = reg == null || reg.signAppearanceSettings == null;
+                if (ApplyBusinessInfoLocal(info))
+                    Plugin.Logger.LogInfo($"[Patcher/Host] Client business applied: {info.AddressKey} = '{info.BusinessName}' sign=type{info.SignType} (owner '{info.OwnerPlayerId}', signObjNull={signObjNull}).");
+                else
+                    Plugin.Logger.LogWarning($"[Patcher/Host] Client business NOT applied (no reg?): {info.AddressKey}");
+            });
+        }
+
+        // H-RIVALPARITY-1 part B: the AI-price apply clears the price caches at most once per frame (a join
+        // snapshot applies ~300 tables in one go); the log line is capped.
+        private static int _aiPriceCacheClearFrame = -1;
+        private static int _aiPriceCacheClears;
+        private static void ClearAiPriceCachesOncePerFrame()
+        {
+            try
+            {
+                int f = UnityEngine.Time.frameCount;
+                if (f == _aiPriceCacheClearFrame) return;
+                _aiPriceCacheClearFrame = f;
+                ItemHelper.ClearPriceCaches();
+                if (++_aiPriceCacheClears <= 5 || _aiPriceCacheClears % 100 == 0)
+                    Plugin.Logger.LogInfo($"[Patcher] AI retail prices changed on the host's word - price caches cleared (#{_aiPriceCacheClears}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] AI price cache clear: {ex.Message}"); }
+        }
+
+        // Round-247: capped counter for the own-tenancy runner-stamp guard's log line.
+        private static int _ownRunnerGuardLogged;
+        private static int _layoutMirrorLogged;   // H-ENTRY-1: stale-layout clear lines, capped per load (reset in ResetTenancyConflictLog)
+
+        private static bool ApplyBusinessInfoLocal(BusinessInfo info)
+        {
+            try
+            {
+                var reg = FindRegistration(info.AddressKey);
+                if (reg == null) return false;
+                // H-MERGERMOP-1 / H-MERGERSTOCK-1 (batch 14): the business TYPE as it stands BEFORE this apply.
+                // On the host it is a late input to the per-player access sets (BuildBuildingAccessFor's IsBiz
+                // reads it) and this method used to notify nobody - see the tail below.
+                string priorTypeName = "";
+                try { priorTypeName = reg.businessTypeName ?? ""; } catch { }
+
+                // Is this the RECEIVER'S OWN business?  The owner is the authority for their own shop's
+                // name / description / sign / logo / hours — the host holds only a (possibly stale or blank)
+                // replica and must NOT overwrite those here.  RentedByPlayer is the reliable "mine" flag (the
+                // game sets it for buildings THIS player rents); OwnerPlayerId==self is the host's positive
+                // attribution.  Other players' shops + AI businesses are NOT "mine" → the host's relay applies
+                // normally.  (NOTE: IsAnyPlayerBusiness is the WRONG test here — it's true for ANY player's
+                // shop and false for your OWN freshly-loaded shop, because it keys on the empty businessOwnerRivalId.)
+                // H-MERGEROWNFLIP-1 step 7: the rental LEDGER naming me also makes it mine. A member whose own shop had
+                // been wrongly flipped read TrulyMine false, and a stale record naming someone else then overwrote its
+                // business (the Xulturium loss, bundle 20260923-222227).
+                bool receiverOwnsThis = false;
+                try
+                {
+                    receiverOwnsThis = IsReceiversOwnBusiness(reg)
+                                     || MergerFlip.LedgerSaysMine(info.AddressKey ?? "")
+                                     || (!string.IsNullOrEmpty(info.OwnerPlayerId) && info.OwnerPlayerId == MPConfig.PlayerId)
+                                     // Rent-vs-deed split (2026-07-07): OwnerPlayerId is tenancy-only now;
+                                     // a building I BOUGHT (deed) is mine even with no business in it.
+                                     || (!string.IsNullOrEmpty(info.DeedOwnerPlayerId) && info.DeedOwnerPlayerId == MPConfig.PlayerId);
+                }
+                catch { }
+
+                // Round-50b DOUBLE-TENANCY DETECTOR (runs on WHICHEVER machine applies the
+                // contradiction — bug reports come from either side): this machine's game actively
+                // rents the building, yet the incoming record is not attributed here — the apply
+                // below will treat it as a foreign shop and overwrite name/sign/schedule. Field
+                // case 57-fifthavenue (2026-07-21-204010): the client's own shop was repeatedly
+                // renamed by the host's record whenever attribution flapped. Once per address.
+                // H-MERGEROWNFLIP-1 step 7: TrulyMine, not the raw flag - a merger-flipped PARTNER shop reads
+                // rented too and raised a false alarm on every one of them (host 5371, 4841 in that bundle).
+                try
+                {
+                    if (MergerFlip.TrulyMine(reg) && !receiverOwnsThis && _tenancyConflictLogged.Add(info.AddressKey ?? ""))
+                        Plugin.Logger.LogWarning($"[Conflict] DOUBLE TENANCY at '{info.AddressKey}': this machine actively rents it " +
+                            $"(local name='{reg.BusinessName}') but the incoming record says name='{info.BusinessName}' " +
+                            $"owner='{info.OwnerPlayerId}' deed='{info.DeedOwnerPlayerId}' — two saves claim this address.");
+                }
+                catch { }
+
+                // Owner-authoritative open/closed truth: store verbatim (keyed by address) so the host can
+                // relay a client's value through its own Tick (ReadInfo reads it back) and the IsBusinessOpen
+                // patch can use it for shops we don't run. 0 = unknown → leave any prior known value intact.
+                try { if (info.OwnerOpenState != 0) BusinessSync.OwnerOpenByAddress[info.AddressKey] = info.OwnerOpenState; } catch { }
+
+                // Tier A (name/type/closed) + rental-marketplace state.  Owner-authored / host-AI-economy view —
+                // skip entirely for the receiver's OWN shop so a stale/blank host replica can't overwrite it.
+                if (!receiverOwnsThis)
+                {
+                    // Tier A — name, type, closed.
+                    // 1.0 PORT (sweep-2 S4): BuildingContext now CACHES BusinessType, refreshed only by
+                    // GlobalEvents.onBuildingRegistrationChange (BuildingManager.cs:292 →
+                    // RegenerateFieldsOnRegistrationChange). A bare businessTypeName write leaves a
+                    // receiver standing inside the building on the OLD type until re-entry — same
+                    // "field written, nothing notified" class as ROUND-122 below. Detect the change
+                    // here, notify below.
+                    // BIZTYPE-1: a business type that no mod loaded HERE registers is not a
+                    // display problem — it is fatal at the NEXT start-up. CustomerEntriesHelper.Init
+                    // → ShouldEntriesBeCreated (CustomerEntriesHelper.cs:152) dereferences
+                    // BusinessTypeHelper.GetData(name) UNCHECKED for every RentedByPlayer
+                    // registration, so one unknown name aborts GameManager.Awake and the cameras
+                    // never initialise: a black-screen session. Copying a peer's name verbatim is
+                    // how that name gets here, and a later merger flip / takeover can mark the same
+                    // address RentedByPlayer locally. So: keep the LOCAL type, apply everything
+                    // else, and say so once per address.
+                    string incomingType = info.BusinessTypeName ?? "";
+                    bool typeKnownHere  = true;
+                    if (incomingType.Length > 0)
+                    {
+                        // The by-NAME dictionary lookup (BusinessTypeHelper.cs:112-119), not the
+                        // registration overload — the registration still holds the OLD name here.
+                        try { typeKnownHere = Helpers.BusinessTypeHelper.GetData(incomingType) != null; }
+                        catch { typeKnownHere = true; }   // the lookup itself failing is not evidence the type is unknown
+                    }
+                    bool typeChanged = typeKnownHere
+                                    && !string.Equals(reg.businessTypeName ?? "", info.BusinessTypeName ?? "", StringComparison.Ordinal);
+                    reg.BusinessName        = info.BusinessName;
+                    if (typeKnownHere) reg.businessTypeName = info.BusinessTypeName;
+                    else if (_unknownBizTypeLogged.Add(info.AddressKey ?? "") && _unknownBizTypeLogged.Count <= 40)
+                        Plugin.Logger.LogWarning($"[BusinessSync] '{info.AddressKey}': type '{incomingType}' from '{info.OwnerPlayerId}' is not registered on this machine (a content mod the peer has and we lack) — local type kept (BIZTYPE-1).");
+                    // H-ENTRY-1 (bundle 20260905-170233): a CLIENT mirrors the host's layout-template name. The game nulls it when a
+                    // business ends (BuildingRegistration.Reset) and writes a new one when an AI shop opens; on a client that shutdown
+                    // is suppressed and this record used to carry no Layout, so a dead business's template outlived it and LoadBuilding
+                    // looked it up for the NEW type → "Layout: X wasn't found. Loading city" → back at the door (325 stale names in one
+                    // save). Rule (round 2, review r1): CLIENTS ONLY — on the host an incoming CLIENT record is not layout-authoritative,
+                    // and the host's own replica of a just-bought shop keeps its blueprint as the retry marker for
+                    // MPTakeover.HostHealUnfurnishedShopsFor. A player-run shop's replica must hold null (its interior is its own furniture;
+                    // LoadBuilding skips the template lookup only for null, since the replica is not IsPlayerOwnedBusiness here). Otherwise
+                    // mirror exactly, null included — HealHollowAiLayouts is host-only, so a client has nothing of its own worth keeping.
+                    try
+                    {
+                        if (!MPServer.IsRunning)
+                        {
+                            string? hostLayout = string.IsNullOrEmpty(info.Layout) ? null : info.Layout;
+                            bool playerRun     = info.RentedByPlayer || IsKnownWorldPlayerId(info.BusinessOwnerRivalId);
+                            string? target     = playerRun ? null : hostLayout;
+                            string? current    = reg.Layout;   // RAW: the game's skip is `Layout == null`, so an empty string must be healed to null too (review r2 #2)
+                            if (!string.Equals(current, target, StringComparison.Ordinal))
+                            {
+                                if (target == null)
+                                {
+                                    if (_layoutMirrorLogged++ < 40) Plugin.Logger.LogInfo($"[Patcher] stale layout '{current}' cleared at '{info.AddressKey}' (host: {(hostLayout ?? "none")}{(playerRun ? ", player-run" : "")}; type {(typeChanged ? "changed" : "unchanged")} → {info.BusinessTypeName}) (H-ENTRY-1).");
+                                    else if (_layoutMirrorLogged == 41) Plugin.Logger.LogInfo("[Patcher] further stale-layout clears not logged this load (H-ENTRY-1).");
+                                }
+                                reg.Layout = target;   // takes are silent — they are the normal mirror
+                            }
+                        }
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] layout mirror at '{info.AddressKey}': {ex.Message}"); }
+                    // ROUND-122: the open/closed flag needs the game NOTIFIED, not just the field written.
+                    // BuildingRegistration.TemporarilyClose does far more than assign: it fires
+                    // "ba:gameevent_changedbusinessopenstate" and GlobalEvents.onBuildingRegistrationChange
+                    // (which is what refreshes the in-shop panel and anything keyed to open state), and it
+                    // rebuilds the shopper schedule via CustomerEntriesHelper.UpdateCustomerEntriesForPlayerBusiness.
+                    // Writing the bare field left the receiver holding the right value with nothing reacting to
+                    // it — which is exactly the "the toggle didn't convey" report, and no amount of pushing it
+                    // FASTER would have fixed it.
+                    //
+                    // We deliberately do NOT call the native method: it also runs PayLicensingFees when opening,
+                    // which would charge THIS machine for a shop it does not own, and raises a todo task for
+                    // someone else's business.  So: assign, then fire only the notify/rebuild half.
+                    bool closedChanged = reg.temporarilyClosed != info.TemporarilyClosed;
+                    reg.temporarilyClosed   = info.TemporarilyClosed;
+                    if (closedChanged)
+                    {
+                        try { GameEvent.Invoke("ba:gameevent_changedbusinessopenstate"); } catch { }
+                        try { GlobalEvents.onBuildingRegistrationChange?.Invoke(reg.Address); } catch { }
+                        try { AI.Customers.CustomerEntries.CustomerEntriesHelper.UpdateCustomerEntriesForPlayerBusiness(reg, TimeHelper.GetDayOfWeek()); } catch { }
+                        Plugin.Logger.LogInfo($"[Patcher] '{info.AddressKey}' is now {(info.TemporarilyClosed ? "CLOSED" : "OPEN")} — "
+                            + "notified the game (open-state event + registration change + shopper schedule rebuild).");
+                        try { SharedShopVisibility.RefreshOpenStateIfPageOpen(info.AddressKey); } catch { }   // an open BizMan page follows the switch at once
+                    }
+                    else if (typeChanged)
+                    {
+                        // 1.0 PORT (sweep-2 S4): the closed-flip block above already rings this bell;
+                        // ring it for a type-only change too, so the cached BuildingContext.BusinessType
+                        // regenerates and the shopper schedule matches the new type. The open-state
+                        // GameEvent is deliberately NOT fired — open/closed did not change.
+                        try { GlobalEvents.onBuildingRegistrationChange?.Invoke(reg.Address); } catch { }
+                        try { AI.Customers.CustomerEntries.CustomerEntriesHelper.UpdateCustomerEntriesForPlayerBusiness(reg, TimeHelper.GetDayOfWeek()); } catch { }
+                        Plugin.Logger.LogInfo($"[Patcher] '{info.AddressKey}' business TYPE changed → registration-change event + shopper schedule rebuild (1.0 caches BusinessType on BuildingContext).");
+                    }
+                    // Producer guard (RED ROC 2026-07-13): writing the type directly bypasses
+                    // native setup, whose ResetBuildingSpecific sizes Warehouse.vehicleSlots —
+                    // a replica typed here with 0 slots becomes a BROKEN factory the moment a
+                    // player later rents it (truck assignment indexes the short list and
+                    // throws; the corruption persists in the save).  Size the slots natively
+                    // whenever the list is short; the load-time integrity sweep backstops.
+                    try
+                    {
+                        if (reg is Entities.Warehouse wh)
+                        {
+                            int want = 0;
+                            try { want = Buildings.BuildingSizeHelper.GetData(Helpers.BuildingHelper.GetBuilding(wh.Address))?.numberOfVehicleSlots ?? 0; } catch { }
+                            if (want > 0 && (wh.vehicleSlots == null || wh.vehicleSlots.Count < want)) wh.ResetVehicleSlots();
+                        }
+                    }
+                    catch { }
+
+                    // Rental marketplace state (Phase 1b).  Overrides client's
+                    // local AI-economy decisions.  If host considers this building
+                    // vacant + rentable but client's AI has filled it, these
+                    // writes flip the client's view back to "for rent."
+                    reg.AvailableForRent    = info.AvailableForRent;
+                    reg.RentPerDay          = info.RentPerDay;
+                    reg.lastDeposit         = info.LastDeposit;
+                }
+
+                // Round-204b: stash the host's takeover valuation for the client-side
+                // valuation shield (display + local pre-check; host stays the referee).
+                // Round-255: a publish WITHOUT a valuation (business no longer AI-run)
+                // must also clear the stale entry, or the display override would keep
+                // quoting the last AI-era price for it.
+                try
+                {
+                    if (info.AiValuation > 0f) BusinessSync.AiValuationByAddress[info.AddressKey] = info.AiValuation;
+                    else BusinessSync.AiValuationByAddress.TryRemove(info.AddressKey, out _);
+                }
+                catch { }
+
+                // AI-business retail prices (host-authoritative; the client's
+                // rival sim is suppressed so its tables stay empty otherwise).
+                // Player shops never carry Prices here — MPPriceSync owns them.
+                try
+                {
+                    if (reg.retailPrices != null && !IsAnyPlayerBusiness(reg))
+                    {
+                        if (info.Prices != null && info.Prices.Count > 0)
+                        {
+                            // H-RIVALPARITY-1 part B (design (d)): a CHANGED table (a rival's war cut or its end re-price)
+                            // clears the price caches, as the game's own ActivatePriceReduction / HandleDefenseStateEnd do on
+                            // the host - else the client's cached lowest market price keeps the old value until the daily clear.
+                            bool pricesChanged = reg.retailPrices.Count != info.Prices.Count;
+                            for (int pi = 0; !pricesChanged && pi < info.Prices.Count; pi++)
+                            {
+                                var have = reg.retailPrices[pi];
+                                var want = info.Prices[pi];
+                                if (have == null || want == null || have.itemName != want.ItemName || have.price != want.Price) pricesChanged = true;
+                            }
+                            reg.retailPrices.Clear();
+                            foreach (var rp in info.Prices)
+                                reg.retailPrices.Add(new RetailPrice { itemName = rp.ItemName, price = rp.Price });
+                            if (pricesChanged) ClearAiPriceCachesOncePerFrame();
+                        }
+                        // Round-291: a building the host reports EMPTY must lose its price table
+                        // here too. Native ShutdownBusiness (BusinessHelper.cs:863) empties the
+                        // table when a business closes; the publish carries no Prices for an empty
+                        // list (BusinessSync ReadInfo) and this apply used to read "nothing sent"
+                        // as "keep mine" — so every other machine kept the dead shop's prices,
+                        // saved them into its own .hsg, and the biz audit diverged forever
+                        // (TESTBATCH-0813: 11 regs, measured in both .hsg files 2026-08-21).
+                        // Narrowed to the EMPTY type so a transient empty list on a live AI shop
+                        // (prices not yet materialized) can never blank a shop players buy from,
+                        // and never the receiver's own/rented building (optimistic-rent window).
+                        // Same class as round-255's valuation clear — 07-bug-classes "ABSENT
+                        // PAYLOAD FIELD READ AS UNCHANGED".
+                        else if (reg.retailPrices.Count > 0 && !reg.RentedByPlayer && !receiverOwnsThis
+                                 && (string.IsNullOrEmpty(info.BusinessTypeName) || info.BusinessTypeName == "ba:businesstype_empty"))
+                        {
+                            int n = reg.retailPrices.Count;
+                            reg.retailPrices.Clear();
+                            try { reg.storedRetailPrices?.Clear(); } catch { }
+                            Plugin.Logger.LogInfo($"[Patcher] '{info.AddressKey}' is empty on the host — cleared {n} stale retail price(s) left by a closed business (round-291).");
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] AI prices apply '{info.AddressKey}': {ex.Message}"); }
+
+                // H-AICAT-1 (2026-09-10): the AI shop's PRODUCT LIST, host-authoritative - a client cannot derive it
+                // (the layout catalog never loads there), so without this every AI shop on a client sells nothing:
+                // no shoppers spawn in it, BizMan shows rivals selling nothing, and the "who else sells this"
+                // counts behind the client's own pricing collapse. Same guards as the prices above: never a
+                // player's business, never the receiver's own building. An EMPTY list on the wire is "no opinion"
+                // (an AI list is written once at creation; a transient empty must not blank a shop). Written only
+                // when it differs, so the join snapshot's ~300 writes happen once and the sweeps stay silent.
+                try
+                {
+                    if (info.Products != null && info.Products.Count > 0 && !reg.RentedByPlayer && !receiverOwnsThis
+                        && !IsAnyPlayerBusiness(reg))
+                    {
+                        var cur = reg.cachedAvailableProducts;
+                        bool same = cur != null && cur.Count == info.Products.Count;
+                        if (same) for (int i = 0; i < cur!.Count; i++) if (cur[i] != info.Products[i]) { same = false; break; }
+                        if (!same)
+                        {
+                            reg.cachedAvailableProducts = new List<string>(info.Products);
+                            if (_snapshotApplyDepth > 0) _aiProductsInSnapshot++;   // one summary line per snapshot (~300 shops at a join)
+                            else Plugin.Logger.LogInfo($"[Patcher] AI products applied for '{info.AddressKey}': {info.Products.Count} item(s) (H-AICAT-1).");
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] AI products apply '{info.AddressKey}': {ex.Message}"); }
+
+                // Tier B — description + sign + logo (owner-authored).  Skip for the receiver's OWN shop.
+                if (!receiverOwnsThis)
+                {
+                    reg.BusinessDescription = info.BusinessDescription;
+
+                    if (reg.signAppearanceSettings != null)
+                    {
+                        reg.signAppearanceSettings.signType         = (SignType)info.SignType;
+                        reg.signAppearanceSettings.signLight        = new SerializableColor(info.SignLightPacked);
+                        reg.signAppearanceSettings.lamp             = new SerializableColor(info.LampPacked);
+                    }
+                    SignFx.SetRemote(info.AddressKey, info.SignFx);   // SIGN-FX-1
+                    if (reg.logoSettings != null)
+                    {
+                        reg.logoSettings.logoShape       = info.LogoShape;
+                        reg.logoSettings.font            = (FontFace)info.LogoFont;
+                        reg.logoSettings.logoColor       = new SerializableColor(info.LogoColorPacked);
+                        reg.logoSettings.fontColor       = new SerializableColor(info.FontColorPacked);
+                        reg.logoSettings.backgroundColor = new SerializableColor(info.BackgroundColorPacked);
+                    }
+                }
+
+                // Operating hours (Phase 1c) — without these, suppression on
+                // client leaves scheduleDays empty and every business looks
+                // closed.  Take the host's version, reconciled onto the replica's own day objects.
+                try
+                {
+                    // The owner's OWN shop hours live in their save — never overwrite them from the host's
+                    // (possibly stale/blank) replica.  AI + other players' shops take the host's relayed hours.
+                    // Shared-shop management (Business PERMISSION feature, 2026-08-21) and MERGED shops (phase 0,
+                    // 2026-09-10): a shop this player may manage through a grant — or helps run through a merger —
+                    // is reconciled PER DAY by SharedShopSchedule (true = handled); every other shop — own, AI —
+                    // takes the in-place reconcile below.
+                    if (reg.scheduleDays != null && info.Schedule != null && info.Schedule.Count > 0 && !receiverOwnsThis
+                        && SharedShopSchedule.TryApplyOwnerTruth(reg, info.Schedule, info.AddressKey, "heartbeat"))
+                    { }
+                    else if (reg.scheduleDays != null && info.Schedule != null && info.Schedule.Count > 0
+                        && !receiverOwnsThis)
+                    {
+                        // SCHEDULE-2 (2026-09-17): reconcile the replica's days IN PLACE - never Clear() the
+                        // outer list.  An open BizMan Schedule tab holds REFERENCES to these ScheduleDay objects:
+                        // ScheduleHelper.RegenerateSimulatedScheduleDays (:169) re-finds the page's day with
+                        // FindIndex(x => x == CurrentScheduleDay) and then indexes SimulatedScheduleDays with the
+                        // result (:186), so swapping the day objects under an open tab left that index at -1 and
+                        // threw on both machines.  Update each existing day's contents and keep the object.
+                        // Review M3: never under the player's hand or a running auto-fill (the same guard
+                        // TryApplyOwnerTruth has at SharedShopSchedule.cs:589) - the next heartbeat carries it.
+                        if (SharedShopSchedule.ScheduleBusy(reg)) { }
+                        else
+                        {
+                        foreach (var d in info.Schedule)
+                        {
+                            if (d == null) continue;
+                            int day = d.Day;
+                            if (day < 1 || day > 7) continue;
+                            var sd = SharedShopSchedule.FindDay(reg, day);
+                            if (sd == null)
+                            {
+                                if (reg.scheduleDays.Count >= 7) continue;   // never grow past the game's seven
+                                // A replica still filling in: insert at the Monday..Sunday position - the game
+                                // addresses days by list index (ScheduleHelper.GetScheduleDay(i) => ScheduleDays[i-1]).
+                                sd = new ScheduleDay { day = (BigAmbitions.DayNightCycle.DayOfWeekOrdered)day };
+                                int at = 0;
+                                while (at < reg.scheduleDays.Count && reg.scheduleDays[at] != null
+                                       && (int)reg.scheduleDays[at].day < day) at++;
+                                reg.scheduleDays.Insert(at, sd);
+                            }
+                            SharedShopSchedule.ReplaceDay(sd, d, keepSynthetic: false);   // this shop is not shop-shared: no local duty stand-ins to keep
+                        }
+                        // The page anchors on a day OBJECT and on the day buttons; after a content refresh run the
+                        // tab's own redraw so both match what is now in the list (SCHEDULE-2).
+                        if (SharedShopSchedule.IsScheduleTabOpenFor(reg)) SharedShopSchedule.RedrawScheduleTab(reg);
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] schedule apply for {info.AddressKey}: {ex.Message}"); }
+
+                // ── Ownership (Phase 1d Wave 1) ─────────────────────────────
+                // Sync the rival-id strings verbatim — for AI-owned buildings
+                // this immediately fixes the "undefined" / wrong-rival display
+                // because the same AI rival IDs exist on both sides.  For
+                // PLAYER-owned buildings (host bought it), host's value here
+                // will likely be either empty or a player-id string; we log
+                // it so the test data tells us what to translate.
+                // RentedByPlayer is TRANSLATED, not copied: the host's RentedByPlayer means the HOST rents it,
+                // which is meaningless on the client.  The client's own tenancy is derived from OwnerPlayerId
+                // (the host's positive per-player attribution) and otherwise PRESERVED (never blind-cleared).
+                string priorBuildingOwner = reg.buildingOwnerRivalId?.ToString() ?? "";
+                string priorBusinessOwner = reg.businessOwnerRivalId?.ToString() ?? "";
+                bool   priorRented        = reg.RentedByPlayer;
+                try
+                {
+                    // Default: mirror host's rival-id fields verbatim — EXCEPT a player id in the
+                    // DEED field (buildingOwnerRivalId), which is contamination from the pre-split
+                    // plumbing (renters were written there — the "rival page says he OWNS it" bug):
+                    // never re-apply it; keep what we had (the AI landlord, or empty).
+                    string newBuildingOwner = info.BuildingOwnerRivalId ?? "";
+                    if (IsSessionPlayerId(newBuildingOwner) && newBuildingOwner != (info.DeedOwnerPlayerId ?? ""))
+                        newBuildingOwner = priorBuildingOwner != null && !IsSessionPlayerId(priorBuildingOwner) ? priorBuildingOwner : "";
+                    string newBusinessOwner = info.BusinessOwnerRivalId ?? "";
+                    // Tenancy: PRESERVE what the client already had unless the host POSITIVELY attributes the
+                    // building to a specific player.  The old default of `false` clobbered the client's own
+                    // tenancy whenever the host's OwnerPlayerId was momentarily empty (ownership-sync gap at
+                    // join / reclaim miss) — silently losing the building, persisted on the next autosave.
+                    bool   newRented        = priorRented;
+
+                    // Rent-vs-deed split (2026-07-07). OwnerPlayerId = TENANCY: the receiver being the
+                    // tenant restores RentedByPlayer (the HQ-brick guard, 2026-06-19 — do NOT weaken);
+                    // anyone else displays the tenant as the business RUNNER (businessOwnerRivalId) —
+                    // NEVER as the building's deed owner. That deed write was the community bug: "friend
+                    // rented a building, rival page shows he OWNS it" — and it also clobbered the AI
+                    // landlord, which worldgen never re-assigns.
+                    if (!string.IsNullOrEmpty(info.OwnerPlayerId))
+                    {
+                        // I am the tenant → no rival "runs" this business: CLEAR the runner
+                        // field rather than keeping the verbatim copy from above, which for my
+                        // own shop is the HOST's translated view — MY OWN player id.  Writing
+                        // that onto my reg changed the publish signature every echo → the
+                        // 2026-07-13 report's endless rebroadcast loop for the client's shop
+                        // (and the map-POI churn perceived as "map icons moving").
+                        if (info.OwnerPlayerId == MPConfig.PlayerId) { newRented = true; newBusinessOwner = ""; }
+                        else                                         newBusinessOwner = info.OwnerPlayerId;
+                        // newRented stays = priorRented for other players' buildings: whether the LOCAL
+                        // player RUNS a business here is the client's OWN authority; a host delta must
+                        // never take it away (the HQ brick, 2026-06-19).
+                    }
+                    // DeedOwnerPlayerId = the player who BOUGHT the building — the one attribution that
+                    // belongs in buildingOwnerRivalId. My own deed: my save is the truth, keep it.
+                    if (!string.IsNullOrEmpty(info.DeedOwnerPlayerId))
+                    {
+                        if (info.DeedOwnerPlayerId == MPConfig.PlayerId) newBuildingOwner = priorBuildingOwner ?? "";
+                        else                                             newBuildingOwner = info.DeedOwnerPlayerId;
+                    }
+                    if (!string.IsNullOrEmpty(info.BusinessOwnerPlayerId)
+                        && info.BusinessOwnerPlayerId != MPConfig.PlayerId)
+                    {
+                        newBusinessOwner = info.BusinessOwnerPlayerId;
+                    }
+                    // ROUND-247 fix A (field 20260806-160214 'BANGER'): a reg the LOCAL player
+                    // natively rents is THIS save's authority — no runner stamp may land on it
+                    // unless the host POSITIVELY attributes the tenancy to another player (the
+                    // branches above; that contested case is arbitration's domain).  The host's
+                    // world had rolled back past the client's rental: its UN-attributed record
+                    // (owner='') still carried the AI occupant's rival id, and the verbatim
+                    // mirror stamped the client's OWN shop foreign — IsForeignPlayerBusiness
+                    // then hid it from every list and the class-6 sweep unassigned its 12
+                    // employees.  Same doctrine as the rented-flag guard above, extended from
+                    // the FLAG to the STAMP.  Writing '' (not priorBusinessOwner) also heals a
+                    // scar an earlier version already persisted: my own shop has no rival
+                    // runner, by definition.
+                    bool attributedToOther =
+                           (!string.IsNullOrEmpty(info.OwnerPlayerId)         && info.OwnerPlayerId         != MPConfig.PlayerId)
+                        || (!string.IsNullOrEmpty(info.BusinessOwnerPlayerId) && info.BusinessOwnerPlayerId != MPConfig.PlayerId);
+                    if (!attributedToOther && !string.IsNullOrEmpty(newBusinessOwner))
+                    {
+                        bool mineNow = false; try { mineNow = MergerFlip.TrulyMine(reg); } catch { }
+                        if (mineNow)
+                        {
+                            if (newBusinessOwner != priorBusinessOwner && _ownRunnerGuardLogged++ < 8)
+                                Plugin.Logger.LogInfo($"[Patcher] runner stamp '{newBusinessOwner}' REFUSED on own tenancy '{info.AddressKey}' — host record is un-attributed (round-247).");
+                            newBusinessOwner = "";
+                        }
+                    }
+                    // INVARIANT (echo-loop family, 2026-07-13): my own pid must NEVER land in
+                    // my runner field — my tenancy is RentedByPlayer, not a rival entry.  The
+                    // attributed case above clears it; this covers a degraded/stale delta that
+                    // carries my pid WITHOUT attribution (the malformed shape the rival-poor /
+                    // contamination family produces), which would re-open the rebroadcast loop.
+                    if (newBusinessOwner == MPConfig.PlayerId) newBusinessOwner = "";
+
+                    // Merger phase 0 (2026-09-10, map §21.1): on a FLIPPED partner shop the runner stamp is PARKED in the
+                    // flip table (restored exactly at flip OFF) and the live field stays empty - otherwise this heartbeat
+                    // re-stamp made IsForeignPlayerBusiness true and every helper guard re-engaged on a merged shop.
+                    // RentedByPlayer keeps the flip's true (newRented is priorRented for another player's building).
+                    // r2 (review #7): park only an ATTRIBUTED stamp - an un-attributed host record (round-247 shape) must not
+                    // poison the parked partner pid with an AI id; the live field stays empty on a flipped reg either way.
+                    bool flipped = false; try { flipped = MergerFlip.IsFlipped(info.AddressKey); } catch { }
+                    if (flipped && attributedToOther) { try { MergerFlip.ParkRunnerIfFlipped(info.AddressKey, newBusinessOwner); } catch { } }
+                    reg.buildingOwnerRivalId = newBuildingOwner;
+                    reg.businessOwnerRivalId = flipped ? "" : newBusinessOwner;
+                    reg.RentedByPlayer       = flipped ? true : newRented;
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ownership apply for {info.AddressKey}: {ex.Message}"); }
+
+                // Diagnostic: log only when ownership actually CHANGES. Round-50 operand fix
+                // (2026-07-21-204010): the old check compared the host's RAW fields against the
+                // client's TRANSLATED state — for every host-owned shop those always differ (raw
+                // rented=True/biz='' vs the client's stamped 'hostpid'/False), so it printed a fake
+                // "transition" on every sync: the phantom ownership oscillation. Compare what we
+                // actually WROTE against what we had; keep the raw host record for context.
+                if ((reg.buildingOwnerRivalId?.ToString() ?? "") != priorBuildingOwner
+                    || (reg.businessOwnerRivalId?.ToString() ?? "") != priorBusinessOwner
+                    || reg.RentedByPlayer != priorRented)
+                {
+                    Plugin.Logger.LogInfo($"[Patcher] Ownership for {info.AddressKey}: applied[bldg='{reg.buildingOwnerRivalId}' biz='{reg.businessOwnerRivalId}' rented={reg.RentedByPlayer}] was[bldg='{priorBuildingOwner}' biz='{priorBusinessOwner}' rented={priorRented}] host-raw[bldg='{info.BuildingOwnerRivalId}' biz='{info.BusinessOwnerRivalId}' rented={info.RentedByPlayer} owner='{info.OwnerPlayerId}'].");
+                }
+
+                // H-MERGERMOP-1 / H-MERGERSTOCK-1 (batch 14): a client's shop gets its business TYPE on the HOST
+                // only through this method, and its runner/tenancy stamp is written just above. Both are inputs
+                // the host's per-player access sets are computed from, and nothing used to re-run them - a merged
+                // partner's shop stayed "not a business" to BuildBuildingAccessFor, so the helper set stayed empty
+                // and every mop/stock gate reading GrantSync.IsHelperBusiness was shut until an unrelated rent.
+                // Fires only on a REAL change (never on a bare name/sign/hours push). The refresh itself pushes to
+                // everyone; AccessSets.Tick (H-MERGERSTOCK-2) is the backstop for inputs no event reports.
+                try
+                {
+                    if (MPServer.IsRunning
+                        && (!string.Equals(reg.businessTypeName ?? "", priorTypeName, StringComparison.Ordinal)
+                            || (reg.businessOwnerRivalId?.ToString() ?? "") != priorBusinessOwner
+                            || reg.RentedByPlayer != priorRented))
+                        MPServer.RefreshBuildingAccess("business-info");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] access refresh for {info.AddressKey}: {ex.Message}"); }
+
+                // HQ DIAGNOSTIC (2026-06-19, release-safe): a client's own HQ can be bricked if a host delta
+                // clears its RentedByPlayer (→ receiverOwnsThis false → schedule overwritten → "never open" +
+                // can't schedule workers). Log every HQ apply so an affected report shows whether ownership +
+                // schedule held. Fires only for HQ (rare); the fix above should keep rentedNow=rentedPrior and
+                // receiverOwns=true for an owned HQ. Remove once confirmed fixed in the wild.
+                try
+                {
+                    if (reg.businessTypeName == "ba:businesstype_headquarters"
+                        || info.BusinessTypeName == "ba:businesstype_headquarters")
+                    {
+                        // THE BRICK TRIGGER (2026-06-25): the host delta carries an EMPTY OwnerPlayerId for an
+                        // HQ this client RENTS. That is the exact upstream condition that bricked HQs before the
+                        // 2026-06-19 guard (old default newRented=false → receiverOwns=false → schedule wiped).
+                        // The guard now PRESERVES tenancy, so there may be NO visible brick — but this is the
+                        // moment to capture. Log it loudly + distinctly so a bug report pins the exact apply
+                        // (and the surrounding host deltas) even on a near-miss, regardless of the guard saving it.
+                        if (priorRented && string.IsNullOrEmpty(info.OwnerPlayerId))
+                            Plugin.Logger.LogWarning($"[HQDiag] *** BRICK TRIGGER *** host delta has EMPTY OwnerPlayerId for owned HQ '{info.AddressKey}' — guard preserved tenancy (rentedNow={reg.RentedByPlayer}). bizOwnerPlayer='{info.BusinessOwnerPlayerId}' bldgRival='{info.BuildingOwnerRivalId}' bizRival='{info.BusinessOwnerRivalId}' infoSched={(info.Schedule?.Count ?? -1)} regSched={(reg.scheduleDays?.Count ?? -1)} tempClosed={reg.temporarilyClosed}");
+
+                        Plugin.Logger.LogWarning($"[HQDiag] apply '{info.AddressKey}' receiverOwns={receiverOwnsThis} rentedPrior={priorRented} rentedNow={reg.RentedByPlayer} ownerPlayer='{info.OwnerPlayerId}' bizOwnerPlayer='{info.BusinessOwnerPlayerId}' infoSched={(info.Schedule?.Count ?? -1)} regSched={(reg.scheduleDays?.Count ?? -1)} tempClosed={reg.temporarilyClosed}");
+                    }
+                }
+                catch { }
+
+                // Writes above only update the DATA model.  The visible sign /
+                // logo / map marker are GameObjects that were initialised from
+                // this registration when the building first loaded — they will
+                // not auto-refresh.  Find the matching CityBuildingController
+                // and call UpdateSign + UpdatePoi to repaint the visuals.
+                //
+                // REPAINT ONLY WHEN THE VISUALS ACTUALLY CHANGED.  Every repaint
+                // wave makes the game's interactive-object system re-fire
+                // OnIoEnter on buildings near the local player — visible as
+                // street buildings "highlight flickering" whenever deltas apply
+                // (HiDiag-confirmed 2026-06-09).  Post-load field noise sends
+                // deltas whose visible fields didn't change at all; the data is
+                // already written above, so skip the repaint for those entirely.
+                string vsig = VisualSig(info);
+                if (_lastVisualSig.TryGetValue(info.AddressKey, out var prevVs) && prevVs == vsig)
+                    return true;
+                _lastVisualSig[info.AddressKey] = vsig;
+
+                // Phase-1 v3 also walks the CBC's children for the two sign
+                // controller MonoBehaviours and calls ConfigureSign / UpdateSign
+                // directly — because cbc.UpdateSign() may be a no-op when LOD
+                // state isn't 0, while a direct call forces a refresh now.
+                // JOIN-SMOOTH-1 (1.0.16, user: "the stutter when joining"; field a6373798: the first business snapshot's 885
+                // repaints took 1.6 s in ONE frame): the DATA above is applied at once; inside a snapshot the repaint of signs,
+                // logos and map pins waits in a queue that DrainDeferredRepaints works off a few ms per frame, nearest first.
+                if (_snapshotApplyDepth > 0) { _deferredRepaints[info.AddressKey] = (info, reg, receiverOwnsThis); return true; }
+                _deferredRepaints.Remove(info.AddressKey);   // a newer change of a building still queued: this one wins
+                RepaintBuilding(info, reg, receiverOwnsThis);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[Patcher] ApplyBusinessInfoLocal {info.AddressKey}: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>The visible part of applying a business: sign, logo and map pin of its building (see JOIN-SMOOTH-1).</summary>
+        private static void RepaintBuilding(BusinessInfo info, BuildingRegistration reg, bool receiverOwnsThis)
+        {
+            try
+            {
+            var cbc = FindCBC(info.AddressKey);
+            if (cbc == null)
+            {
+                Plugin.Logger.LogWarning($"[Patcher] No CBC found for {info.AddressKey}");
+            }
+            else
+            {
+                try { cbc.UpdateSign(); }    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] UpdateSign {info.AddressKey}: {ex.Message}"); }
+                try { cbc.UpdatePoi(null); } catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] UpdatePoi {info.AddressKey}: {ex.Message}"); }
+
+                // Direct refresh on child sign controllers, in case the CBC's
+                // UpdateSign deferred due to LOD/cull state.
+                int refreshed = 0;
+                try
+                {
+                    var signCtrls = cbc.GetComponentsInChildren(typeof(BuildingSignController), true);
+                    if (signCtrls != null)
+                    {
+                        for (int i = 0; i < signCtrls.Length; i++)
+                        {
+                            var sc = signCtrls[i] as BuildingSignController;
+                            if (sc == null) continue;
+                            try { sc.ConfigureSign(reg); refreshed++; }
+                            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] BuildingSignController.ConfigureSign: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] BuildingSignController scan: {ex.Message}"); }
+
+                try
+                {
+                    var logoCtrls = cbc.GetComponentsInChildren(typeof(BuildingLogoSignController), true);
+                    if (logoCtrls != null)
+                    {
+                        for (int i = 0; i < logoCtrls.Length; i++)
+                        {
+                            var lc = logoCtrls[i] as BuildingLogoSignController;
+                            if (lc == null) continue;
+                            try { lc.UpdateSign(reg); refreshed++; }
+                            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] BuildingLogoSignController.UpdateSign: {ex.Message}"); }
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] BuildingLogoSignController scan: {ex.Message}"); }
+
+                // Verbose log only for non-trivial businesses (matches the
+                // host-side filter so we get host/client side-by-side).
+                bool nonTrivial = !string.IsNullOrEmpty(info.BusinessName) || info.BusinessTypeName != "ba:businesstype_empty";
+                if (nonTrivial)
+                {
+                    Plugin.Logger.LogInfo($"[Patcher] Refresh {info.AddressKey}: name='{info.BusinessName}' type={info.BusinessTypeName} signType={info.SignType} sign=0x{info.SignLightPacked:X8}/0x{info.LampPacked:X8} logoShape='{info.LogoShape}' logoFont={info.LogoFont} refreshed={refreshed}");
+                }
+
+                // Player-customized sign logos are stored as multiple JPG
+                // files (Billboard / SquareSign / WideSign) inside a
+                // directory the host's BizMan UI created.  Client gets
+                // the directory contents from info.LogoFiles — recreate
+                // the directory and write every file so the next
+                // UpdateSign loads the same pixels the host sees.
+                bool wroteLogo = false;
+                if (nonTrivial && !string.IsNullOrEmpty(info.LogoShape) && (info.LogoFiles == null || info.LogoFiles.Count == 0)
+                    && _noLogoLogged.Add(info.AddressKey ?? ""))   // sweep item 10: once per address per launch
+                {
+                    Plugin.Logger.LogInfo($"[Patcher] No logo bytes on this message for {info.AddressKey} ('{info.BusinessName}') — either no logo exists, or it is unchanged (wave-2 attach-once; joiners get bytes via the snapshot).");
+                }
+                if (info.LogoFiles != null && info.LogoFiles.Count > 0 && !string.IsNullOrEmpty(info.BusinessName)
+                    && BusinessSync.SafeLogoDir(info.BusinessName) != null   // SEC-LOGO-1: never the character folder itself
+                    && !receiverOwnsThis)   // don't overwrite the owner's own logo image files with the host's replica
+                {
+                    try
+                    {
+                        string dir = LogoHelper.GetPlayerBusinessLogoPath(info.BusinessName);
+                        if (!string.IsNullOrEmpty(dir))
+                        {
+                            if (!System.IO.Directory.Exists(dir))
+                                System.IO.Directory.CreateDirectory(dir);
+                            int total = 0;
+                            foreach (var f in info.LogoFiles)
+                            {
+                                if (string.IsNullOrEmpty(f.Name) || string.IsNullOrEmpty(f.Base64)) continue;
+                                if (!BusinessSync.IsCanonicalLogoFileName(f.Name)) continue;   // round-190d: never write stray names (also path-safety belt)
+                                var bytes = Convert.FromBase64String(f.Base64);
+                                System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, f.Name), bytes);
+                                total += bytes.Length;
+                            }
+                            wroteLogo = total > 0;
+                            Plugin.Logger.LogInfo($"[Patcher] Wrote logo files for {info.AddressKey}: {info.LogoFiles.Count} file(s) {total}B → {dir}");
+                        }
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] Logo file write for {info.AddressKey}: {ex.Message}"); }
+                }
+
+                // After writing the files, queue a re-refresh in a fraction
+                // of a second so the sign controller loads them from disk.
+                // Also invalidate the texture cache — the first UpdateSign
+                // for this building cached a null/default when no files
+                // existed yet, so subsequent UpdateSign calls would just
+                // return the cached generic and ignore our newly-written
+                // files.  Dropping just this business's PLAYER cache entries
+                // forces its next load to re-read from disk; the game's own
+                // AI-business entries (same name, IsPlayerBusiness false) are
+                // left untouched.  Nothing is destroyed here and nothing that
+                // exists today is released, so the sign keeps drawing its
+                // current texture until the refresh queued below repaints it.
+                if (wroteLogo)
+                {
+                    InvalidateLogoTextureCacheForBusiness(info.BusinessName);
+                    _pendingLogoRefreshes.Add(new PendingLogoRefresh
+                    {
+                        AddressKey = info.AddressKey,
+                        RefreshAt  = UnityEngine.Time.realtimeSinceStartup + 0.5f,
+                    });
+                }
+            }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] repaint {info.AddressKey}: {ex.Message}"); }
+        }
+
+        private static readonly System.Collections.Generic.Dictionary<string, (BusinessInfo info, BuildingRegistration reg, bool owns)> _deferredRepaints = new();
+        private static readonly System.Collections.Generic.List<string> _repaintOrder = new();
+        private static int _repaintsDone;
+
+        /// <summary>JOIN-SMOOTH-1: main thread, every frame (MPCanvasUI) - the queued repaints, about 3 ms per frame, the
+        /// buildings nearest to the player first.</summary>
+        public static void DrainDeferredRepaints()
+        {
+            if (_deferredRepaints.Count == 0 || _snapshotApplyDepth > 0) return;
+            if (_repaintOrder.Count == 0)
+            {
+                UnityEngine.Vector3 me = default;
+                try { me = Helpers.PlayerHelper.GetPosition(); } catch { }
+                foreach (var k in _deferredRepaints.Keys) _repaintOrder.Add(k);
+                _repaintOrder.Sort((x, y) => Dist(x, me).CompareTo(Dist(y, me)));
+                _repaintsDone = 0;
+            }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (_repaintOrder.Count > 0 && sw.Elapsed.TotalMilliseconds < 3.0)
+            {
+                string k = _repaintOrder[0];
+                _repaintOrder.RemoveAt(0);
+                if (!_deferredRepaints.TryGetValue(k, out var job)) continue;
+                _deferredRepaints.Remove(k);
+                RepaintBuilding(job.info, job.reg, job.owns);
+                _repaintsDone++;
+            }
+            if (_repaintOrder.Count == 0 && _deferredRepaints.Count == 0)
+                Plugin.Logger.LogInfo($"[Patcher] {_repaintsDone} building sign(s) repainted over several frames (JOIN-SMOOTH-1).");
+        }
+
+        private static float Dist(string addressKey, UnityEngine.Vector3 me)
+        {
+            try { var cbc = FindCBC(addressKey); return cbc != null ? (cbc.transform.position - me).sqrMagnitude : float.MaxValue; }
+            catch { return float.MaxValue; }
+        }
+
+        // Cache CityBuildingController lookups by address.  FindObjectsOfType
+        // is expensive; building positions don't change.  Cleared on game load.
+        private static readonly System.Collections.Generic.Dictionary<string, CityBuildingController?> _cbcCache = new();
+        public static void ResetCBCCache() => _cbcCache.Clear();
+
+        // Last-repainted visual signature per building (see ApplyBusinessInfoLocal)
+        // — a delta whose visible fields match what we last painted skips the
+        // repaint (and its OnIoEnter highlight-flicker side effect) entirely.
+        private static readonly System.Collections.Generic.Dictionary<string, string> _lastVisualSig = new();
+        public static void ResetVisualSigCache() => _lastVisualSig.Clear();
+
+        /// <summary>Signature over the fields that affect a building's EXTERIOR
+        /// visuals (sign, logo, ownership/for-rent state).  Schedule, deposits,
+        /// prices etc. are data-only — they don't require a repaint.</summary>
+        private static string VisualSig(BusinessInfo info)
+        {
+            int logoBytes = 0, logoCount = 0;
+            if (info.LogoFiles != null)
+            {
+                logoCount = info.LogoFiles.Count;
+                for (int i = 0; i < info.LogoFiles.Count; i++)
+                    logoBytes += info.LogoFiles[i]?.Base64?.Length ?? 0;
+            }
+            return $"{info.BusinessName}|{info.BusinessTypeName}|{info.SignType}|{info.SignLightPacked}|{info.LampPacked}"
+                 + $"|{info.LogoShape}|{info.LogoFont}|{info.LogoColorPacked}|{info.FontColorPacked}|{info.BackgroundColorPacked}"
+                 + $"|{logoCount}:{logoBytes}|{info.AvailableForRent}|{info.TemporarilyClosed}"
+                 + $"|{info.BuildingOwnerRivalId}|{info.BusinessOwnerRivalId}|{info.RentedByPlayer}";
+        }
+
+        // Queue of addresses whose logo we asked BusinessLogoGenerator.Create
+        // to generate.  Ticked from MPCanvasUI.LateUpdate via DrainPendingLogoRefreshes.
+        // Each entry has a deadline timestamp; when reached, we re-call the sign
+        // controllers to refresh from the now-generated on-disk PNG.
+        private struct PendingLogoRefresh
+        {
+            public string AddressKey;
+            public float  RefreshAt;
+        }
+        private static readonly System.Collections.Generic.List<PendingLogoRefresh> _pendingLogoRefreshes = new();
+
+        // Prune LogoHelper's business-logo cache, BY NAME, so subsequent UpdateSign
+        // calls re-load that business's logo from disk.  Necessary after writing new
+        // logo files for a player business — without this the dictionary keeps the
+        // null/default it cached when the directory was empty (or the previous version
+        // of the texture from before the host re-customized).
+        //
+        // Only the PLAYER-business keys of the ONE named business are removed (never a
+        // whole-cache Clear(), never the game's AI entries), and of those only the
+        // Addressables-backed entries are Release()d — an entry holding a generated/from-disk
+        // Texture2D is dropped WITHOUT Release(), because that Release() would Destroy() the
+        // texture while signs and cards are still drawing it.  Player logos are never
+        // addressable, so nothing is actually released today.
+        // ReleaseAndRemoveLogoEntries has the full reasoning.
+        private static int _logoCacheInvalidationCount = 0;
+        private static System.Reflection.FieldInfo? _businessLogosField;
+        private static bool _businessLogosFieldWarned;
+        private static System.Reflection.PropertyInfo? _businessLogoKeyNameProp;
+        private static System.Reflection.PropertyInfo? _businessLogoKeyIsPlayerProp;
+        private static System.Reflection.MethodInfo? _businessLogoEntryRelease;
+        private static bool _businessLogoKeyNamePropWarned;
+        private static bool _businessLogoKeyIsPlayerPropWarned;
+        private static bool _businessLogoReleaseMethodWarned;
+        private static System.Reflection.FieldInfo? _businessLogoEntryIsAddressable;
+        private static bool _businessLogoIsAddressableWarned;
+        private static bool _logoReleaseWarned;
+
+        /// <summary>
+        /// Releases and drops the game's cached logo textures for ONE business, by name.  SHARED: this is also
+        /// what SharedShopWorkTabs.InvalidateLogoCaches calls (once per name on a rename), so the by-name walk
+        /// and the release rule live in a single place.
+        ///
+        /// GAME-PATCH-0916: the cache used to be the public LogoHelper.BusinessLogoTextures.  It is now the
+        /// PRIVATE static LogoHelper.BusinessLogos, a Dictionary(BusinessLogoKey, BusinessLogoCacheEntry) (new
+        /// decompile LogoHelper.cs:66, read back by GetBusinessLogoTexture :217-222), so it is reached by
+        /// reflection and handled as a plain IDictionary — the key struct is private, is never named here, and
+        /// is only ever asked for its BusinessName (:19) and IsPlayerBusiness (:23) properties.
+        ///
+        /// ONLY ADDRESSABLE ENTRIES ARE RELEASED.  BusinessLogoCacheEntry (decompile BusinessLogoCacheEntry.cs:5-33)
+        /// holds either a live Addressables handle or a plain Texture2D, and its private readonly `_isAddressable`
+        /// (:9, set from handle.IsValid() in the ctor :17) decides which.  Its parameterless Release() (:20-33)
+        /// does Addressables.Release for the handle — but for a NON-addressable entry it does
+        /// Object.Destroy(Texture) (:29-32), and the entries built by LoadLogoFile (LogoHelper.cs:267) and
+        /// StoreGeneratedTexture (:325) are exactly those.  So:
+        ///   * `_isAddressable` true  -> Release() (a handle that is dropped unreleased leaks its refcount).
+        ///   * `_isAddressable` false -> remove the dictionary entry only, NO Release().
+        /// Destroying the texture here would make that building's sign and cards draw a destroyed texture
+        /// (garbage) until the queued refresh repaints them ~0.5 s later; the game itself only ever releases a
+        /// non-addressable entry when it already has the replacement in hand (StoreGeneratedTexture
+        /// LogoHelper.cs:317-325 — release, then immediately store the new entry).  The texture simply stays
+        /// alive for whatever is still drawing it and is collected with its last reference once the reload has
+        /// replaced it, which is what the mod did before GAME-PATCH-0916 (an earlier attempt to Destroy() these
+        /// made signs render garbage).  `_isAddressable` is read by cached FieldInfo; if it cannot be read the
+        /// entry is dropped WITHOUT Release() (one warning per session) — leaking a refcount is recoverable,
+        /// destroying a live texture is not.  A failing Release() does not stop the removal (one warning per
+        /// session).
+        ///
+        /// Only the MATCHING keys are touched.  A whole-cache Clear() (what this did before) also destroyed an
+        /// unrelated sign texture that BusinessLogoGenerator happened to be generating: StoreGeneratedTexture is
+        /// replace-only (:314-320 — no entry for the key, no store, the fresh texture is Destroyed) and the
+        /// generator stores only at the very end of a multi-frame run (BusinessLogoGenerator.cs:170-172), so a
+        /// Clear() in that window left that building on its fallback logo until the game was restarted.  The same
+        /// narrow window still exists for the ONE business invalidated here — a generation in flight for this
+        /// name loses its result — which is acceptable: that business is being renamed or re-synced and is about
+        /// to re-render anyway.
+        ///
+        /// ONLY PLAYER-BUSINESS KEYS ARE TOUCHED.  The key struct also carries IsPlayerBusiness (LogoHelper.cs:23)
+        /// and the walk now requires it to be true, so an AI business of the same name keeps its entry: the mod
+        /// only ever invalidates PLAYER logos (renames, custom logos synced between machines), and those are
+        /// always non-addressable (LoadLogoFile LogoHelper.cs:267 / StoreGeneratedTexture :325).  The addressable
+        /// branch below is therefore unreachable in practice today and is kept only as a guard, in case a player
+        /// logo ever arrives through Addressables.  If a key's flag reads as anything but true that key is left
+        /// alone; if either reflected key property (BusinessName / IsPlayerBusiness) is MISSING entirely, the
+        /// walk warns once per session naming the property and returns 0/0 rather than reporting a clean zero.
+        ///
+        /// What is dropped re-loads on the next UpdateSign (a small async cost); nothing that exists today is
+        /// released, and a plain texture is left to the collector.  Textures still referenced by another
+        /// sign's MaterialPropertyBlock are NOT touched, because only this business's player keys are removed.
+        /// LogoHelper.PendingBusinessLogoLoads (:68) is deliberately LEFT ALONE: an entry there is an in-flight
+        /// load still owned by its handle, and pulling it out from under that handle would leak or
+        /// double-release the texture.
+        /// </summary>
+        /// <returns>how many of this business's PLAYER cache entries were removed in total (released + dropped);
+        /// AI-business entries of the same name are not counted because they are not touched.</returns>
+        internal static int ReleaseAndRemoveLogoEntries(string businessName)
+            => ReleaseAndRemoveLogoEntries(businessName, out _, out _);
+
+        /// <summary>As <see cref="ReleaseAndRemoveLogoEntries(string)"/>, but also reports the split:
+        /// <paramref name="released"/> = Addressables-backed entries whose handle was given back (none exist
+        /// today — player logos are never addressable),
+        /// <paramref name="dropped"/> = every entry handled WITHOUT a release: non-addressable (its texture
+        /// survives until the reload replaces it), `_isAddressable` unreadable, no Release() method on the
+        /// entry type, a null value in the dictionary, or an entry whose handling threw — that last one is the
+        /// only case where the entry may also still be in the cache.</summary>
+        /// <returns>released + dropped.</returns>
+        internal static int ReleaseAndRemoveLogoEntries(string businessName, out int released, out int dropped)
+        {
+            released = 0;
+            dropped = 0;
+            if (string.IsNullOrEmpty(businessName)) return 0;
+            try
+            {
+                if (_businessLogosField == null)
+                    _businessLogosField = typeof(LogoHelper).GetField(
+                        "BusinessLogos", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                var dict = _businessLogosField?.GetValue(null) as System.Collections.IDictionary;
+                if (dict == null)
+                {
+                    if (!_businessLogosFieldWarned)
+                    {
+                        _businessLogosFieldWarned = true;
+                        Plugin.Logger.LogWarning("[Patcher] LogoHelper.BusinessLogos (private static) was not found — the logo texture cache cannot be invalidated, so a renamed business may keep drawing its old sign until the game is restarted.");
+                    }
+                    return 0;
+                }
+                var kill = new System.Collections.Generic.List<object>();
+                foreach (var k in dict.Keys)
+                {
+                    if (k == null) continue;
+                    if (_businessLogoKeyNameProp == null) _businessLogoKeyNameProp = k.GetType().GetProperty("BusinessName");
+                    if (_businessLogoKeyNameProp == null)
+                    {
+                        // The key struct no longer exposes the name: EVERY key would silently fail the match
+                        // below and the walk would report a clean zero. Say so once and give up honestly.
+                        if (!_businessLogoKeyNamePropWarned)
+                        {
+                            _businessLogoKeyNamePropWarned = true;
+                            Plugin.Logger.LogWarning("[Patcher] BusinessLogoCacheKey.BusinessName (property) was not found — no logo cache entry can be matched by name, so the cache is left untouched and a renamed business may keep drawing its old sign until the game is restarted.");
+                        }
+                        return 0;
+                    }
+                    if ((_businessLogoKeyNameProp.GetValue(k) as string) != businessName) continue;
+                    // PLAYER entries only.  The key also carries IsPlayerBusiness (LogoHelper.cs:23); an
+                    // AI business can share the name, and its entry is the game's — releasing it would
+                    // unload a texture the mod never changed (the mod only ever invalidates player logos:
+                    // renames and custom logos synced between machines).  Read the flag the same way as
+                    // the name, through a cached PropertyInfo on the private key struct; if a key's flag reads
+                    // as anything but true the key is LEFT ALONE (not touching an entry is always the safe
+                    // side), and if the PROPERTY itself is missing the walk warns once and gives up (below).
+                    if (_businessLogoKeyIsPlayerProp == null) _businessLogoKeyIsPlayerProp = k.GetType().GetProperty("IsPlayerBusiness");
+                    if (_businessLogoKeyIsPlayerProp == null)
+                    {
+                        // Same reasoning as BusinessName: without the flag no key can be confirmed as a player
+                        // entry, so every one would be left alone and the walk would report a misleading zero.
+                        if (!_businessLogoKeyIsPlayerPropWarned)
+                        {
+                            _businessLogoKeyIsPlayerPropWarned = true;
+                            Plugin.Logger.LogWarning("[Patcher] BusinessLogoCacheKey.IsPlayerBusiness (property) was not found — a player logo entry cannot be told apart from an AI one, so the cache is left untouched and a renamed business may keep drawing its old sign until the game is restarted.");
+                        }
+                        return 0;
+                    }
+                    if (_businessLogoKeyIsPlayerProp.GetValue(k) is bool isPlayer && isPlayer) kill.Add(k);
+                }
+                foreach (var k in kill)
+                {
+                    try
+                    {
+                        var entry = dict[k];
+                        if (entry == null) dropped++;   // nothing to release, but the entry is still removed below — counted as dropped
+                        else
+                        {
+                            if (_businessLogoEntryIsAddressable == null)
+                                _businessLogoEntryIsAddressable = entry.GetType().GetField(
+                                    "_isAddressable", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                            if (_businessLogoEntryIsAddressable == null)
+                            {
+                                if (!_businessLogoIsAddressableWarned)
+                                {
+                                    _businessLogoIsAddressableWarned = true;
+                                    Plugin.Logger.LogWarning("[Patcher] BusinessLogoCacheEntry._isAddressable (private) was not found — logo cache entries are dropped without Release(), which may leak an Addressables refcount per invalidation but never destroys a texture a sign is still drawing.");
+                                }
+                                dropped++;
+                            }
+                            else if (_businessLogoEntryIsAddressable.GetValue(entry) is bool addressable && addressable)
+                            {
+                                // Unreachable today: only player-business keys get here and a player logo is
+                                // never addressable.  Kept as a guard in case one ever arrives that way.
+                                if (_businessLogoEntryRelease == null)
+                                    _businessLogoEntryRelease = entry.GetType().GetMethod("Release", System.Type.EmptyTypes);
+                                if (_businessLogoEntryRelease == null)
+                                {
+                                    // No Release() to call — the handle cannot be given back, so this is a DROP.
+                                    // Counting it as released would have claimed a refcount return that never happened.
+                                    if (!_businessLogoReleaseMethodWarned)
+                                    {
+                                        _businessLogoReleaseMethodWarned = true;
+                                        Plugin.Logger.LogWarning("[Patcher] BusinessLogoCacheEntry.Release() was not found — an addressable logo cache entry is dropped without it, which may leak an Addressables refcount per invalidation but never destroys a texture a sign is still drawing.");
+                                    }
+                                    dropped++;
+                                }
+                                else
+                                {
+                                    _businessLogoEntryRelease.Invoke(entry, null);
+                                    released++;
+                                }
+                            }
+                            else
+                            {
+                                // Non-addressable: Release() would Object.Destroy(Texture) and the sign would
+                                // draw garbage until the queued refresh repaints it.  Drop the entry only.
+                                dropped++;
+                            }
+                        }
+                        dict.Remove(k);   // inside the try: a Remove that throws must not abandon the other entries
+                    }
+                    catch (Exception rex)
+                    {
+                        // The try spans the _isAddressable read and the Remove as well as Release(), so name
+                        // neither: this entry could not be processed at all.
+                        if (!_logoReleaseWarned)
+                        {
+                            _logoReleaseWarned = true;
+                            Plugin.Logger.LogWarning($"[Patcher] a logo cache entry for '{businessName}' could not be processed — it was not released and may still be in the cache; the remaining entries are still handled: {rex.GetType().Name}: {rex.Message}");
+                        }
+                        dropped++;  // counted as not-released; the walk carries on with the next entry
+                    }
+                }
+                return released + dropped;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] ReleaseAndRemoveLogoEntries({businessName}): {ex.GetType().Name}: {ex.Message}"); return 0; }
+        }
+
+        /// <summary>Invalidates the game's business-logo texture cache for ONE business after its logo or name
+        /// changed.  All of the work — the by-name walk over PLAYER keys only, why only Addressables-backed
+        /// entries are Release()d, and why the cache is no longer Clear()ed wholesale — is in
+        /// ReleaseAndRemoveLogoEntries; this wrapper
+        /// only counts the invalidations and logs the first three plus every fiftieth, with the
+        /// released/dropped split.</summary>
+        public static void InvalidateLogoTextureCacheForBusiness(string businessName)
+        {
+            if (string.IsNullOrEmpty(businessName)) return;
+            ReleaseAndRemoveLogoEntries(businessName, out int released, out int dropped);
+            _logoCacheInvalidationCount++;
+            if (_logoCacheInvalidationCount <= 3 || _logoCacheInvalidationCount % 50 == 0)
+            {
+                Plugin.Logger.LogInfo($"[Patcher] LogoHelper cache invalidated for '{businessName}' update (released={released} dropped={dropped}; op #{_logoCacheInvalidationCount}).");
+            }
+        }
+
+        /// <summary>MODULE-SIGNS-1: this machine wrote a business's sign files itself - drop the cached textures and
+        /// repaint its signs now (the same repaint a received logo gets).</summary>
+        public static void RefreshOwnLogo(string businessName, string addressKey)
+        {
+            InvalidateLogoTextureCacheForBusiness(businessName);
+            _pendingLogoRefreshes.Add(new PendingLogoRefresh { AddressKey = addressKey, RefreshAt = 0f });
+            DrainPendingLogoRefreshes();   // now: in single player nothing else drains the list
+        }
+
+        public static void DrainPendingLogoRefreshes()
+        {
+            if (_pendingLogoRefreshes.Count == 0) return;
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            for (int i = _pendingLogoRefreshes.Count - 1; i >= 0; i--)
+            {
+                var p = _pendingLogoRefreshes[i];
+                if (now < p.RefreshAt) continue;
+                _pendingLogoRefreshes.RemoveAt(i);
+                try
+                {
+                    var reg = FindRegistration(p.AddressKey);
+                    var cbc = FindCBC(p.AddressKey);
+                    if (reg != null && cbc != null)
+                    {
+                        try { cbc.UpdateSign(); } catch { }
+                        // Re-walk children and refresh directly too.
+                        try
+                        {
+                            var logoCtrls = cbc.GetComponentsInChildren(typeof(BuildingLogoSignController), true);
+                            if (logoCtrls != null)
+                                for (int j = 0; j < logoCtrls.Length; j++)
+                                {
+                                    var lc = logoCtrls[j] as BuildingLogoSignController;
+                                    if (lc != null) { try { lc.UpdateSign(reg); } catch { } }
+                                }
+                            var signCtrls = cbc.GetComponentsInChildren(typeof(BuildingSignController), true);
+                            if (signCtrls != null)
+                                for (int j = 0; j < signCtrls.Length; j++)
+                                {
+                                    var sc = signCtrls[j] as BuildingSignController;
+                                    if (sc != null) { try { sc.ConfigureSign(reg); } catch { } }
+                                }
+                        }
+                        catch { }
+                        Plugin.Logger.LogInfo($"[Patcher] Deferred logo refresh fired for {p.AddressKey}.");
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] DrainPendingLogoRefreshes: {ex.Message}"); }
+            }
+        }
+
+        private static CityBuildingController? FindCBC(string addressKey)
+        {
+            if (_cbcCache.TryGetValue(addressKey, out var cached)) return cached;
+
+            try
+            {
+                var all = UnityEngine.Object.FindObjectsOfType(typeof(CityBuildingController));
+                if (all != null)
+                {
+                    for (int i = 0; i < all.Length; i++)
+                    {
+                        var cbc = all[i] as CityBuildingController;
+                        if (cbc == null) continue;
+                        var reg = cbc.buildingRegistration;
+                        if (reg == null) continue;
+                        var k = GameStateReader.AddressKey(reg);
+                        if (!string.IsNullOrEmpty(k)) _cbcCache[k] = cbc;
+                    }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] FindCBC scan: {ex.Message}"); }
+
+            _cbcCache.TryGetValue(addressKey, out var found);
+            return found;
+        }
+
+        // ── Round-102i: demand-sync health (PERMANENT diagnostic) ─────────────────
+        // Demand is host-authoritative; a client that stops receiving it silently falls back to
+        // locally-computed values, which on a client are always 99-100% (its provider counts are
+        // empty). That is exactly what a field report showed and it was invisible in the logs.
+        // These make a recurrence self-identifying.
+        private static volatile string? _pendingMarketJson;   // arrived before the world existed
+        private static float _lastMarketApplyAt;              // real time of the last SUCCESSFUL apply
+        private static bool  _haveAuthoritativeDemand;        // ≥1 host payload applied this session
+        // Sweep item 10 (2026-08-18): "no logo files" is a passive per-apply INFO that reached
+        // storm scale (3,147 lines/6 bundles — most businesses legitimately have no logo dir).
+        // Once per address per launch carries the same information.
+        private static readonly HashSet<string> _noLogoLogged = new(StringComparer.Ordinal);
+        private static float _nextDemandWatchdogAt;
+
+        /// <summary>True once a host market payload has been applied — the client's own demand
+        /// computation is suppressed from that point (it cannot compute correctly).</summary>
+        public static bool HaveAuthoritativeDemand => _haveAuthoritativeDemand;
+
+        /// <summary>Per-session teardown for the demand channel. REQUIRED: these are
+        /// process-lifetime statics, and without this (a) a held payload from the previous world
+        /// could be applied to the new one, and (b) the "we already have authoritative demand"
+        /// flag would keep a client from computing demand in a SECOND session until that host's
+        /// data arrived. Found reviewing my own round-102 change before pushing it.</summary>
+        public static void ResetDemandState()
+        {
+            _pendingMarketJson       = null;
+            _haveAuthoritativeDemand = false;
+            _lastMarketApplyAt       = 0f;
+            _nextDemandWatchdogAt    = 0f;
+        }
+
+        public static void ApplyMarketSnapshot(string marketJson)
+        {
+            RunOnMainThread(() =>
+            {
+                int mRows = -1;                                        // PROBE: P-MIDNIGHT
+                StallWatch.MarketBegin(marketJson);                   // PROBE: P-MIDNIGHT ('market parse')
+                try
+                {
+                    var dtos = Newtonsoft.Json.JsonConvert.DeserializeObject<List<MarketEntryDto>>(marketJson);
+                    if (dtos == null) return;
+
+                    var gi = SaveGameManager.Current;
+                    if (gi == null)
+                    {
+                        // Round-102i: the join-time payload routinely arrives while the client's
+                        // world is still loading. It used to be dropped here in silence, leaving
+                        // the client on its own 99-100% values until the next periodic send.
+                        _pendingMarketJson = marketJson;
+                        Plugin.Logger.LogInfo("[Demand] market payload arrived before the world was live — held for retry.");
+                        return;
+                    }
+
+                    // PROBE-START: Demand — candidate (a): is this apply INERT? Count what the
+                    // host sent vs what actually landed. entryMissing/rowMissing > 0 means the
+                    // host's values have nowhere to go (add-if-missing is the fix); all-zero
+                    // misses with the symptom still present points at candidate (b), a
+                    // client-side recompute clobbering these values afterwards.
+                    int pEntryHit = 0, pEntryMissing = 0, pRowHit = 0, pRowMissing = 0, pNullRowList = 0;
+                    int pEntryAdded = 0, pRowAdded = 0;   // round-102i: created from the host's payload
+                    // PROBE-END: Demand
+                    StallWatch.Step("market apply items"); int mI = 0;   // PROBE: P-MIDNIGHT
+                    foreach (var dto in dtos)
+                    {
+                        StallWatch.Item(mI++, dto.ItemName);             // PROBE: P-MIDNIGHT (a reference, no allocation)
+                        // Round-102i: ADD-IF-MISSING. This used to only UPDATE rows the client
+                        // already had, so anything the client hadn't built yet (its world still
+                        // loading at join) was silently dropped and the host's values landed
+                        // nowhere. With the client's own demand computation now suppressed once
+                        // authoritative data exists, the host's payload is the ONLY source — it
+                        // must be able to create what's missing.
+                        bool haveEntry = false;
+                        foreach (var e in gi.productMarketEntries) if (e != null && e.itemName == dto.ItemName) { haveEntry = true; break; }
+                        if (!haveEntry)
+                        {
+                            try
+                            {
+                                gi.productMarketEntries.Add(new Entities.ProductMarketEntry
+                                {
+                                    itemName     = dto.ItemName,
+                                    demandValues = new List<Entities.NeighborhoodDemand>(),
+                                });
+                                pEntryAdded++;
+                            }
+                            catch { }
+                        }
+
+                        // Find matching entry; update import price + per-neighborhood demand (host-authoritative).
+                        bool pFoundEntry = false;   // PROBE: Demand
+                        int mJ = 0;                 // PROBE: P-MIDNIGHT
+                        foreach (var entry in gi.productMarketEntries)
+                        {
+                            if (entry.itemName == dto.ItemName)
+                            {
+                                pFoundEntry = true; pEntryHit++;   // PROBE: Demand
+                                if (entry.demandValues == null) entry.demandValues = new List<Entities.NeighborhoodDemand>();
+                                entry.importPriceIndex = dto.ImportPriceIndex;
+                                if (dto.DemandValues != null && entry.demandValues == null) pNullRowList++;   // PROBE: Demand
+                                if (dto.DemandValues != null && entry.demandValues != null)
+                                    foreach (var ndDto in dto.DemandValues)
+                                    {
+                                        StallWatch.Row(mJ++, ndDto.Neighborhood);   // PROBE: P-MIDNIGHT
+                                        bool pFoundRow = false;   // PROBE: Demand
+                                        foreach (var nd in entry.demandValues)
+                                            if (nd != null && nd.neighborhood == ndDto.Neighborhood)
+                                            {
+                                                pFoundRow = true;   // PROBE: Demand
+                                                nd.demand                   = ndDto.Demand;
+                                                nd.providers                = ndDto.Providers;
+                                                nd.lastDaySold              = ndDto.LastDaySold;
+                                                nd.lastDayProvidersExceeded = ndDto.LastDayProvidersExceeded;
+                                                // Round-102: monopoly is PER PLAYER. The old line copied the
+                                                // host's own bool, handing this machine the host's monopoly
+                                                // (+30% price tolerance / optimal-price index it never earned).
+                                                // The host now stamps the OWNER; we hold it only if it's us.
+                                                // Pre-v5 payloads carry no owner → "" → nobody (conservative).
+                                                nd.hasPlayerMonopoly        = !string.IsNullOrEmpty(ndDto.MonopolyOwnerPlayerId)
+                                                                              && ndDto.MonopolyOwnerPlayerId == MPConfig.PlayerId;
+                                                break;
+                                            }
+                                        if (!pFoundRow)
+                                        {
+                                            // Round-102i: create the row the host has and we lack.
+                                            try
+                                            {
+                                                entry.demandValues.Add(new Entities.NeighborhoodDemand
+                                                {
+                                                    neighborhood             = ndDto.Neighborhood,
+                                                    demand                   = ndDto.Demand,
+                                                    providers                = ndDto.Providers,
+                                                    lastDaySold              = ndDto.LastDaySold,
+                                                    lastDayProvidersExceeded = ndDto.LastDayProvidersExceeded,
+                                                    hasPlayerMonopoly        = !string.IsNullOrEmpty(ndDto.MonopolyOwnerPlayerId)
+                                                                               && ndDto.MonopolyOwnerPlayerId == MPConfig.PlayerId,
+                                                });
+                                                pRowAdded++;
+                                            }
+                                            catch { }
+                                        }
+                                        if (pFoundRow) pRowHit++; else pRowMissing++;   // PROBE: Demand
+                                    }
+                                break;
+                            }
+                        }
+                        if (!pFoundEntry) pEntryMissing++;   // PROBE: Demand
+                    }
+                    // PROBE-START: Demand
+                    // Name the CLIENT-ONLY rows: rows this machine holds that the host's payload
+                    // does not mention. Measured at 10 on two different saves; they are the rows
+                    // stuck at ~100% (providers==0) because nothing authoritative ever writes them.
+                    // Knowing WHICH they are decides whether dropping them is safe.
+                    StallWatch.Step("market orphan scan");   // PROBE: P-MIDNIGHT
+                    int pOrphan = 0; var pOrphanNames = new System.Text.StringBuilder();
+                    try
+                    {
+                        var sent = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+                        foreach (var dto in dtos)
+                        {
+                            if (!sent.TryGetValue(dto.ItemName ?? "", out var set))
+                                sent[dto.ItemName ?? ""] = set = new HashSet<string>(StringComparer.Ordinal);
+                            if (dto.DemandValues != null)
+                                foreach (var nd in dto.DemandValues) set.Add(nd.Neighborhood ?? "");
+                        }
+                        foreach (var entry in gi.productMarketEntries)
+                        {
+                            if (entry?.demandValues == null) continue;
+                            sent.TryGetValue(entry.itemName ?? "", out var set);
+                            foreach (var nd in entry.demandValues)
+                            {
+                                if (nd == null) continue;
+                                if (set != null && set.Contains(nd.neighborhood ?? "")) continue;
+                                pOrphan++;
+                                if (pOrphan <= 12) pOrphanNames.Append($" [{entry.itemName}@{nd.neighborhood} d={nd.demand} p={nd.providers}]");
+                            }
+                        }
+                    }
+                    catch { }
+                    // PERMANENT one-liner: proves the client's demand is host-derived and current.
+                    StallWatch.Step("market apply commit"); mRows = pRowHit + pRowAdded;   // PROBE: P-MIDNIGHT
+                    _pendingMarketJson = null;
+                    _lastMarketApplyAt = UnityEngine.Time.unscaledTime;
+                    _haveAuthoritativeDemand = true;
+                    Plugin.Logger.LogInfo(
+                        $"[Demand] host market applied: {pRowHit} row(s) updated, {pRowAdded} added, {pEntryAdded} new item entry(s).");
+                    Plugin.Logger.LogInfo(
+                        $"[PROBE] Demand APPLY: entries hit={pEntryHit} missing={pEntryMissing} nullRowList={pNullRowList} " +
+                        $"| demand rows written={pRowHit} missing={pRowMissing} (missing rows are values the host sent that landed NOWHERE)");
+                    if (pOrphan > 0)
+                        Plugin.Logger.LogWarning($"[PROBE] Demand APPLY: {pOrphan} CLIENT-ONLY row(s) the host never sends —{pOrphanNames}");
+                    // PROBE-END: Demand
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogError($"[Patcher] ApplyMarketSnapshot error: {ex.Message}");
+                }
+                finally { StallWatch.MarketEnd(mRows); }   // PROBE: P-MIDNIGHT ('[Midnight] market apply end')
+            });
+        }
+
+        // ── Helpers ───────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Marks the BuildingRegistration for this address as unavailable for rent
+        /// in the local GameInstance — prevents the local player seeing it as rentable.
+        /// </summary>
+        private static void MarkBuildingUnavailable(string addressKey)
+        {
+            var reg = FindRegistration(addressKey);
+            if (reg == null) return;
+            reg.AvailableForRent = false;
+            Plugin.Logger.LogInfo($"[Patcher] {addressKey} marked unavailable.");
+        }
+
+        /// <summary>HOST: reflect a client's RENT in the host's OWN game — the building leaves the
+        /// for-rent pool and shows as that player's BUSINESS. Rent-vs-deed split (2026-07-07): the
+        /// tenant goes in businessOwnerRivalId (who RUNS the business); buildingOwnerRivalId is the
+        /// DEED (the AI landlord, never re-assigned after worldgen) and is NOT touched — writing the
+        /// renter there was the "rival page shows he OWNS the building" community bug, and the old
+        /// vacate erased the landlord permanently.  MAIN THREAD.</summary>
+        /// <summary>HOST, MAIN THREAD (round-50): why this address can NOT be rented by a client,
+        /// per the host's own game — "" when it's genuinely available. The player ledger is checked
+        /// separately by the caller; this guards against DIVERGED CLIENTS renting a building the
+        /// host's world has occupied (bug 2026-07-21-204010: the ledger got stamped onto a
+        /// rival-run shop and the conflicted record churned forever). Fails open — a probe error
+        /// must never block a legitimate rent.</summary>
+        public static string HostRentUnavailableReason(string addressKey)
+        {
+            try
+            {
+                var reg = FindRegistration(addressKey);
+                if (reg == null) return "";   // unknown address — can't judge; legacy behavior
+                if (reg.RentedByPlayer) return "rented by the host player";
+                bool hasBusiness = false;
+                try
+                {
+                    hasBusiness = !string.IsNullOrEmpty(reg.BusinessName?.ToString())
+                               || (!string.IsNullOrEmpty(reg.businessTypeName) && reg.businessTypeName != "ba:businesstype_empty");
+                }
+                catch { }
+                if (hasBusiness) return $"occupied by '{reg.BusinessName}' ({reg.businessTypeName}, owner '{reg.businessOwnerRivalId}')";
+                if (!reg.AvailableForRent) return "not on the for-rent market";
+                return "";
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>HOST, MAIN THREAD (round-50): LEDGER DECONTAMINATION. Drops BuildingOwners
+        /// reservations that contradict the host's own rival economy — an address an AI rival
+        /// authoritatively runs a business at (RivalData.ownedRetailOfficeBusinesses, the same
+        /// source the rivals leaderboard reads) can not be reserved to a player. Field case
+        /// 2026-07-21-204010: a diverged client rented such an address; the grant stamped the
+        /// ledger AND overwrote the reg's businessOwnerRivalId, making the AI shop read as a
+        /// player's (overtake offers auto-rejected). Restores the rival's tenancy stamp. Skips
+        /// injected session-player rival ids (their businesses ARE player businesses). Best-effort:
+        /// rival factories/warehouses aren't in the retail/office list and aren't checked.</summary>
+        public static void SweepLedgerVsRivalBusinesses(string reason)
+        {
+            if (!MPServer.IsRunning) return;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) return;
+
+                // Pass 1 — reservations on addresses an AI RIVAL authoritatively runs (round-50).
+                var aiBiz = new Dictionary<string, string>();   // addressKey → AI rival id
+                if (gi.rivalStates != null)
+                    foreach (var rs in gi.rivalStates)
+                    {
+                        string id = rs?.rivalId?.ToString() ?? "";
+                        if (string.IsNullOrEmpty(id) || IsSessionPlayerRivalId(id)) continue;
+                        try
+                        {
+                            var rd = BigAmbitions.Rivals.RivalsHelper.GetRivalData(id);
+                            if (rd?.ownedRetailOfficeBusinesses == null) continue;
+                            foreach (var reg in rd.ownedRetailOfficeBusinesses)
+                                if (reg != null) aiBiz[GameStateReader.AddressKey(reg)] = id;
+                        }
+                        catch { }
+                    }
+
+                var contaminated = new List<string>();
+                foreach (var kv in MPServer.BuildingOwners)
+                    if (!string.IsNullOrEmpty(kv.Value) && !IsHostLedgerId(kv.Value) && aiBiz.ContainsKey(kv.Key))
+                        contaminated.Add(kv.Key);
+                foreach (var addr in contaminated)
+                {
+                    string rid = aiBiz[addr];
+                    if (!MPServer.BuildingOwners.TryRemove(addr, out var pid)) continue;
+                    try
+                    {
+                        var reg = FindRegistration(addr);
+                        if (reg != null)
+                        {
+                            if ((reg.businessOwnerRivalId?.ToString() ?? "") == pid) reg.businessOwnerRivalId = rid;   // undo the grant's stamp
+                            reg.AvailableForRent = false;   // an AI-run shop is not on the market
+                        }
+                    }
+                    catch { }
+                    Plugin.Logger.LogWarning($"[Integrity] ({reason}) ledger decontaminated: '{addr}' was reserved to player '{pid}' but the host's world runs AI rival '{rid}'s business there — reservation dropped, rival tenancy restored.");
+                }
+
+                // Pass 2 (round-50b) — reservations contradicting the HOST'S OWN TENANCY: the
+                // host's native game actively rents the address (TrulyMine excludes merger-flipped
+                // partner shops), so no client can hold the reservation. Field: 57-fifthavenue —
+                // a manifest-carried 'RED ROC' entry re-attributed the host's own shop to the
+                // client every session; the client's lease-terminate could never stick.
+                var hostTenanted = new List<string>();
+                foreach (var kv in MPServer.BuildingOwners)
+                {
+                    if (string.IsNullOrEmpty(kv.Value) || IsHostLedgerId(kv.Value)) continue;   // round-172: the host's own entries are not client reservations
+                    try
+                    {
+                        var reg = FindRegistration(kv.Key);
+                        if (reg != null && reg.RentedByPlayer && MergerFlip.TrulyMine(reg)) hostTenanted.Add(kv.Key);
+                    }
+                    catch { }
+                }
+                foreach (var addr in hostTenanted)
+                {
+                    if (!MPServer.BuildingOwners.TryRemove(addr, out var pid)) continue;
+                    try
+                    {
+                        var reg = FindRegistration(addr);
+                        if (reg != null && (reg.businessOwnerRivalId?.ToString() ?? "") == pid) reg.businessOwnerRivalId = "";   // undo the stamp; host tenancy needs no runner entry
+                    }
+                    catch { }
+                    Plugin.Logger.LogWarning($"[Integrity] ({reason}) ledger decontaminated: '{addr}' was reserved to player '{pid}' but the HOST'S OWN game actively rents it — reservation dropped (double-tenancy, round-50b).");
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Integrity] ledger sweep: {ex.Message}"); }
+        }
+
+        public static void HostReflectPlayerRent(string addressKey, string playerId)
+        {
+            try
+            {
+                var reg = FindRegistration(addressKey);
+                if (reg == null) { Plugin.Logger.LogWarning($"[Patcher/Host] rent reflect: no reg for '{addressKey}'."); return; }
+                reg.AvailableForRent = false;                       // out of the for-rent pool
+                try { reg.businessOwnerRivalId = playerId; } catch { }   // the TENANT — runs the business here
+                Plugin.Logger.LogInfo($"[Patcher/Host] {addressKey} now rented by player '{playerId}' (removed from for-rent; landlord '{reg.buildingOwnerRivalId}' kept).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher/Host] HostReflectPlayerRent: {ex.Message}"); }
+        }
+
+        /// <summary>HOST: reverse HostReflectPlayerRent — a player vacated their
+        /// building, so clear the tenant mark and put it back in the for-rent pool in
+        /// the host's OWN game. The deed field (landlord) stays.  MAIN THREAD.</summary>
+        /// <summary>Is the native one-shot item load of this Hamptons house still running? NOT
+        /// `_itemsLoadCoroutine != null`: native never nulls that field after an ordinary LOD load
+        /// (HamptonsHouse.cs:349-356), so it stays non-null for the house's life. The load copies the registration's
+        /// items into `_itemsToInstantiate` and its coroutine adds exactly ONE controller to `allItemControllers` per
+        /// entry (:372-376), so 'fewer controllers than copied entries' is the in-flight window.</summary>
+        internal static bool HamptonsLoadInFlight(HamptonsHouse? hh)
+        {
+            try
+            {
+                if (hh == null || hh._itemsLoadCoroutine == null) return false;
+                return hh.allItemControllers.Count < hh._itemsToInstantiate.Count;
+            }
+            catch { return false; }
+        }
+
+        public static void HostReflectPlayerVacate(string addressKey, bool ledgerNamedSender = false)
+        {
+            try
+            {
+                var reg = FindRegistration(addressKey);
+                if (reg == null) { Plugin.Logger.LogWarning($"[Patcher/Host] vacate reflect: no reg for '{addressKey}'."); return; }
+                MakeRegVacant(reg);
+                Plugin.Logger.LogInfo($"[Patcher/Host] {addressKey} vacated — back on the for-rent market (name/type cleared, round-260).");
+                // D3b (fold V1b): the host's reflection of a player's terminate is an explicit, address-naming tenancy
+                // END - the same positive evidence the client vacate apply acts on. MakeRegVacant leaves itemInstances
+                // alone, and the host's copy is the one every viewer is served from, so a Hamptons house is emptied
+                // here too (the entry point gates on Hamptons / not-mine / multiplayer itself).
+                // Re-check HIGH (2026-09-19): HandleVacateRequest honours a vacate whose owner the ledger does not
+                // know. Flipping flags on that was harmless; DELETING the authoritative furniture is not - so the
+                // clear needs the ledger to have named the sender as this address's tenant.
+                if (ledgerNamedSender) ClearHamptonsInteriorOnTenancyEnd(addressKey, "vacate (host reflect)");
+                else Plugin.Logger.LogInfo($"[Patcher/Host] {addressKey}: the rent ledger did not name the vacating player - flags reflected, interior left untouched.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher/Host] HostReflectPlayerVacate: {ex.Message}"); }
+        }
+
+        // ── BAN-PLAYERS-1 build B (owner-approved 2026-10-01): REMOVE PROPERTY of a banned player ────────────────────
+        // The host releases every address the banned player rented or bought (MPServer.RemoveProperty) and tells every
+        // machine with one PropertyForfeit message. A machine that is NOT the banned player clears its copy (flags, name,
+        // type, furniture/stock/storage; a building its own player holds is never touched). The banned player's OWN machine
+        // - only if it is ever unbanned and rejoins - ends those leases with the game's own lease-end steps WITHOUT any
+        // payout and gives up the bought buildings. Vehicles are held only in their owner's own save (other machines hold
+        // no VehicleInstance of another player), so they go on the owner's machine.
+        private static readonly List<PropertyForfeitPayload> _heldForfeits = new();
+
+        /// <summary>CLIENT (network thread): a forfeit notice from the host - applied on the MAIN thread once this world is
+        /// settled (held until then, so the load window cannot race the save's own records).</summary>
+        internal static void ReceivePropertyForfeit(PropertyForfeitPayload? p)
+        {
+            if (p?.Entries == null || p.Entries.Count == 0) return;
+            EnqueueOnMainThread(() =>
+            {
+                try
+                {
+                    if (!MPWorldReady.IsSettled || SaveGameManager.Current == null)
+                    {
+                        _heldForfeits.Add(p);
+                        Plugin.Logger.LogInfo($"[Forfeit] notice held ({p.Entries.Count} entr(ies), '{p.Why}') - this world is not settled yet; applied at the settled edge.");
+                        return;
+                    }
+                    ApplyPropertyForfeit(p);
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] receive: {ex.Message}"); }
+            });
+        }
+
+        /// <summary>CLIENT, MAIN THREAD (MPClient.TickSettledReport, every frame): the settled edge releases held notices.
+        /// A notice held by a session that has since ended is discarded (it belongs to that host's world).</summary>
+        internal static void TickHeldForfeits()
+        {
+            if (_heldForfeits.Count == 0 && _ownerWaitingExit.Count == 0 && _ownerWaitingVehicle.Count == 0) return;
+            try
+            {
+                if (!MPClient.IsConnected)
+                {
+                    Plugin.Logger.LogInfo($"[Forfeit] {_heldForfeits.Count + _ownerWaitingExit.Count + _ownerWaitingVehicle.Count} held notice(s) discarded - the session ended before this world settled.");
+                    _heldForfeits.Clear();
+                    _ownerWaitingExit.Clear();
+                    _ownerWaitingVehicle.Clear(); _forfeitVehWaitId = "";
+                    try { GlobalEvents.onExitBuilding -= OnOwnerExitedBuilding; } catch { }
+                    return;
+                }
+                if (_ownerWaitingVehicle.Count > 0) TickOwnerVehicleExit();   // R3: the get-out finishes a frame after ExitVehicle
+                if (_heldForfeits.Count == 0) return;
+                if (!MPWorldReady.IsSettled || SaveGameManager.Current == null) return;
+                var held = new List<PropertyForfeitPayload>(_heldForfeits);
+                _heldForfeits.Clear();
+                foreach (var p in held) ApplyPropertyForfeit(p);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] held release: {ex.Message}"); }
+        }
+
+        /// <summary>CLIENT, MAIN THREAD: one notice - the entry naming THIS machine's stable id is its own property (B4),
+        /// every other entry is a viewer clear.</summary>
+        internal static void ApplyPropertyForfeit(PropertyForfeitPayload p)
+        {
+            foreach (var e in p.Entries)
+            {
+                if (e == null) continue;
+                try
+                {
+                    bool mine = !string.IsNullOrEmpty(e.OwnerStable) && e.OwnerStable == MPConfig.StableId;
+                    if (mine) OwnerApplyForfeit(e, p.Why ?? "");
+                    else ViewerApplyForfeit(e, p.Why ?? "");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] apply for '{e.OwnerName}': {ex.Message}"); }
+            }
+            try { HamptonsAccess.RefreshAllBlockers(); }
+            catch (Exception ex) { HamptonsAccess.WarnOnce("Forfeit/hamptons-refresh", ex); }
+        }
+
+        /// <summary>HOST, MAIN THREAD (MPServer.RemoveProperty step 5): release the host's own copy of one forfeited address.
+        /// The ledger entries are already gone. Rented -> back on the for-rent market (MakeRegVacant); bought -> any listing
+        /// of the banned player replaced by the game's own unowned market listing (RealEstateHelper.SetBuildingForSale, the
+        /// market value; deed field cleared); contents (furniture, stock, storage) cleared where asked. No money moves.</summary>
+        internal static void HostApplyForfeit(string addr, bool rented, bool bought, bool clear, string ownerName)
+        {
+            try
+            {
+                var reg = FindRegistration(addr);
+                if (reg == null) { Plugin.Logger.LogWarning($"[Forfeit] host '{addr}': no registration - ledgers released, world copy untouched."); return; }
+                bool flipped = MergerFlip.IsFlipped(addr);
+                // F5 (review of b625534): only where the banned player was the TENANT - on a bought-only address the flip is a
+                // company partner's tenancy, and parking it empty would blank that partner's saved tenant mark.
+                if (flipped && rented) MergerFlip.ParkRunnerIfFlipped(addr, "");   // the flip's OFF edge (keys already left the company) restores an EMPTY tenant mark
+                if (rented) MakeRegVacant(reg);
+                bool listed = false;
+                if (bought)
+                {
+                    try
+                    {
+                        var gi = SaveGameManager.Current;
+                        if (gi?.buildingsForSale != null) gi.buildingsForSale.RemoveAll(x => GameStateReader.AddressKey(x.address) == addr);
+                        RealEstateHelper.SetBuildingForSale(reg);
+                        listed = true;
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] host '{addr}': sale-market listing failed: {ex.Message}"); }
+                    if (!rented && clear) { try { reg.AvailableForRent = true; } catch { } }
+                }
+                int items = 0, veh = 0;
+                if (clear) ClearForfeitContents(reg, addr, false, out items, out veh);
+                RefreshForfeitPoi(reg);
+                string what = (rented ? "back on the for-rent market" : "")
+                            + (rented && bought ? "; " : "")
+                            + (bought ? (listed ? "back on the sale market as unowned" : "deed freed (listing failed)") : "");
+                Plugin.Logger.LogInfo($"[Forfeit] host '{addr}' released (owner '{ownerName}'): {what}; {items} item(s) cleared from the host's copy{(flipped && rented ? "; company flip parked empty" : "")}.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] host '{addr}': {ex.Message}"); }
+        }
+
+        /// <summary>CLIENT, MAIN THREAD: another player's forfeited addresses on THIS machine's copy. A building this
+        /// machine's own player rents (true tenancy, not a company flip) or owns is never touched (refused, logged).</summary>
+        private static void ViewerApplyForfeit(PropertyForfeitInfo e, string why)
+        {
+            var all = new List<string>(e.Rented ?? new List<string>());
+            foreach (var a in e.Bought ?? new List<string>()) if (!all.Contains(a)) all.Add(a);
+            int done = 0, skipped = 0, itemsAll = 0;
+            foreach (var addr in all)
+            {
+                try
+                {
+                    var reg = FindRegistration(addr);
+                    if (reg == null) { skipped++; Plugin.Logger.LogWarning($"[Forfeit] viewer '{addr}': no registration here - skipped."); continue; }
+                    bool rented = e.Rented != null && e.Rented.Contains(addr);
+                    bool clear = e.Cleared != null && e.Cleared.Contains(addr);
+                    bool ownRent = false; try { ownRent = MergerFlip.TrulyMine(reg); } catch { }
+                    bool ownDeed = false; try { ownDeed = reg.BuildingOwnedByPlayer; } catch { }
+                    // F1 (review of b625534): a DEED held here stops only the deed-side work - when the banned player RENTED
+                    // a building this machine's player owns, the banned tenancy (name, type, furniture, stock) is still cleared.
+                    if (ownRent || (ownDeed && !rented))
+                    {
+                        skipped++;
+                        Plugin.Logger.LogWarning($"[Forfeit] viewer '{addr}' REFUSED - this machine's own player {(ownRent ? "rents" : "owns")} it; a forfeit of '{e.OwnerName}' never touches another player's holding.");
+                        continue;
+                    }
+                    if (ownDeed) Plugin.Logger.LogInfo($"[Forfeit] viewer '{addr}' - this machine's own player owns the building - the deed is left alone; the banned tenancy is cleared.");
+                    bool flipped = MergerFlip.IsFlipped(addr);
+                    if (flipped && rented) MergerFlip.ParkRunnerIfFlipped(addr, "");   // F5: only where the banned player was the tenant; the flip's OFF edge restores an EMPTY tenant mark
+                    if (rented)
+                    {
+                        // The vacate notify's own writes (ApplyBuildingVacated): tenant off, name/type cleared, for rent.
+                        reg.AvailableForRent = true;
+                        if (!flipped) { try { reg.businessOwnerRivalId = ""; } catch { } }
+                        try { reg.BusinessName = null; } catch { }
+                        try { reg.businessTypeName = "ba:businesstype_empty"; } catch { }
+                    }
+                    else if (clear) { try { reg.AvailableForRent = true; } catch { } }
+                    int items = 0, veh = 0;
+                    if (clear) ClearForfeitContents(reg, addr, false, out items, out veh);
+                    RefreshForfeitPoi(reg);
+                    done++; itemsAll += items;
+                    Plugin.Logger.LogInfo($"[Forfeit] viewer '{addr}' released ({(rented ? "rented" : "bought")}{(flipped && rented ? ", company flip parked empty" : "")}): {items} item(s) cleared from this copy.");
+                }
+                catch (Exception ex) { skipped++; Plugin.Logger.LogWarning($"[Forfeit] viewer '{addr}': {ex.Message}"); }
+            }
+            Plugin.Logger.LogInfo($"[Forfeit] viewer apply for '{e.OwnerName}' ({why}): {done} address(es) released, {itemsAll} item(s) cleared, {skipped} skipped.");
+        }
+
+        /// <summary>B4 - the banned player's OWN machine (unbanned, rejoined), MAIN THREAD. Every forfeited lease this world
+        /// still holds is ended with the game's own lease-end steps (BizManPresentation.OnTerminateContractConfirm,
+        /// decompile :621-705) MINUS its two payouts - the deposit/furniture/vehicle refund (ChangeMoneySafe
+        /// 'depositreturnfurniture', :650) and the bare deposit refund (:700) are simply never called, and nothing else in
+        /// those steps moves money (so the mod's lease-end watch, which keys on those two refund transactions, never fires
+        /// either). Every forfeited building it still owns is given up (the realEstate record and its own sale listing go,
+        /// no sale price is paid). The wallet is read before and after and logged.</summary>
+        private static void OwnerApplyForfeit(PropertyForfeitInfo e, string why)
+        {
+            var gi = SaveGameManager.Current;
+            if (gi == null) { Plugin.Logger.LogWarning("[Forfeit] own property: no world loaded - nothing applied."); return; }
+            if (OwnerMustLeaveFirst(e, why)) return;   // L3: inside a forfeited building - applied when the game's own exit completes
+            float before = 0f; try { before = gi.Money; } catch { }
+            int leases = 0, deeds = 0, already = 0, items = 0, veh = 0;
+            var rentedList = e.Rented ?? new List<string>();
+            foreach (var addr in rentedList)
+            {
+                try
+                {
+                    var reg = FindRegistration(addr);
+                    if (reg == null) { Plugin.Logger.LogWarning($"[Forfeit] own lease '{addr}': no registration here - skipped."); continue; }
+                    bool rentedHere = false; try { rentedHere = reg.RentedByPlayer && !MergerFlip.IsFlipped(addr); } catch { }
+                    if (!rentedHere) { already++; Plugin.Logger.LogInfo($"[Forfeit] own lease '{addr}': not rented on this machine - nothing to end."); continue; }
+                    OwnerEndLeaseNoPayout(reg, addr, out var i1, out var v1);
+                    leases++; items += i1; veh += v1;
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own lease '{addr}': {ex.Message}"); }
+            }
+            foreach (var addr in e.Bought ?? new List<string>())
+            {
+                try
+                {
+                    var reg = FindRegistration(addr);
+                    if (reg == null) { Plugin.Logger.LogWarning($"[Forfeit] own building '{addr}': no registration here - skipped."); continue; }
+                    bool clear = e.Cleared != null && e.Cleared.Contains(addr);
+                    // F7 (review of b625534): rented on THIS machine although the host's rent list does not name it - that
+                    // local lease ends too (the same no-payout lease end), so RentedByPlayer does not stay true here.
+                    if (!rentedList.Contains(addr))
+                    {
+                        bool rentedLocal = false; try { rentedLocal = reg.RentedByPlayer && !MergerFlip.IsFlipped(addr); } catch { }
+                        if (rentedLocal)
+                        {
+                            OwnerEndLeaseNoPayout(reg, addr, out var i3, out var v3);
+                            leases++; items += i3; veh += v3;
+                            clear = false;   // the lease end already cleared the contents
+                            Plugin.Logger.LogInfo($"[Forfeit] own building '{addr}': also rented on this machine though the host's rent list does not name it - that local lease ended too, no payout.");
+                        }
+                    }
+                    bool ownedHere = false; try { ownedHere = reg.BuildingOwnedByPlayer; } catch { }
+                    if (!ownedHere) { already++; Plugin.Logger.LogInfo($"[Forfeit] own building '{addr}': not owned on this machine - nothing to give up."); continue; }
+                    OwnerGiveUpBuilding(reg, addr, clear, out var i2, out var v2);
+                    deeds++; items += i2; veh += v2;
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own building '{addr}': {ex.Message}"); }
+            }
+            _forfeitExitedVehicleId = ""; _forfeitKeepVehicleId = "";
+            float after = before; try { after = gi.Money; } catch { }
+            if (leases + deeds > 0) { try { SaveGameManager.MarkChange(); } catch { } }
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            Plugin.Logger.LogInfo($"[Forfeit] OWN property removed by the host's ban (day {e.Day}, {why}): {leases} lease(s) ended, {deeds} bought building(s) given up, {already} already released; {items} item(s) and {veh} vehicle(s) removed; no payout - money before={before.ToString("F2", inv)} after={after.ToString("F2", inv)}.");
+        }
+
+        // L3 (review leftover): owner entries waiting for the player to be outside a forfeited building.
+        private static readonly List<KeyValuePair<PropertyForfeitInfo, string>> _ownerWaitingExit = new();
+        private static string _forfeitExitedVehicleId = "";   // the vehicle the player was just taken out of (its live controller goes with it)
+        private static string _forfeitKeepVehicleId = "";     // a vehicle the player could not be taken out of (kept this time, logged)
+        // R3 (re-check of 6586fc3): owner entries waiting for the game to finish the get-out. CarController.ExitVehicle places
+        // the player on walkable ground ONE FRAME LATER using the car (decompile CarController.cs:584-591) and gets back in
+        // when no spot is found - so the car is deleted only once the game's own state says the player is out of it.
+        private static readonly List<KeyValuePair<PropertyForfeitInfo, string>> _ownerWaitingVehicle = new();
+        private static string _forfeitVehWaitId = "";         // the vehicle the get-out was started on
+        private static int _forfeitVehWaitFrame;              // the frame ExitVehicle ran
+        private static string _forfeitCarryExited = "", _forfeitCarryKeep = "";   // the outcome handed to the re-applied entries
+
+        /// <summary>L3 - OWNER SIDE, MAIN THREAD. Native refuses its own lease end while the player is inside that building
+        /// (BizManPresentation.TerminateContract, decompile :599). Inside a forfeited building: the player is walked out with
+        /// the game's own exit (BuildingManager.ExitFromBuilding(0), as CityManager/GameManager call it) and the entry is
+        /// applied on the game's own exit-completed event (GlobalEvents.onExitBuilding) - true = held. Driving a vehicle kept
+        /// at a forfeited address: the game's own get-out (the current vehicle's ExitVehicle, as RescueBarrier calls it) runs
+        /// first, so the vehicle is never deleted under the player.</summary>
+        private static bool OwnerMustLeaveFirst(PropertyForfeitInfo e, string why)
+        {
+            _forfeitExitedVehicleId = _forfeitCarryExited; _forfeitKeepVehicleId = _forfeitCarryKeep;   // R3: a finished get-out's outcome
+            _forfeitCarryExited = ""; _forfeitCarryKeep = "";
+            try
+            {
+                var set = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var a in e.Rented ?? new List<string>()) set.Add(a);
+                foreach (var a in e.Bought ?? new List<string>()) set.Add(a);
+                if (set.Count == 0) return false;
+                string inside = "";
+                try
+                {
+                    if (BuildingManager.IsInsideBuilding)
+                    {
+                        var b = InstanceBehavior<BuildingManager>.Instance?.building;
+                        if (b != null) inside = GameStateReader.AddressKey(b.Address);
+                    }
+                }
+                catch { }
+                if (inside.Length > 0 && set.Contains(inside))
+                {
+                    _ownerWaitingExit.Add(new KeyValuePair<PropertyForfeitInfo, string>(e, why));
+                    try { GlobalEvents.onExitBuilding -= OnOwnerExitedBuilding; } catch { }
+                    GlobalEvents.onExitBuilding += OnOwnerExitedBuilding;
+                    InstanceBehavior<BuildingManager>.Instance!.ExitFromBuilding(0);   // non-null: IsInsideBuilding above read it
+                    Plugin.Logger.LogInfo($"[Forfeit] own property: the player is INSIDE forfeited '{inside}' - walked out with the game's own exit; the removal applies when the exit completes.");
+                    return true;
+                }
+                VehicleInstance? cur = null; try { cur = VehicleHelper.GetCurrentVehicle(); } catch { }
+                string vAddr = ""; try { if (cur != null) vAddr = GameStateReader.AddressKey(cur.Address); } catch { }
+                string curVid = ""; try { if (cur != null) curVid = cur.id ?? ""; } catch { }
+                if (cur != null && vAddr.Length > 0 && set.Contains(vAddr) && !(curVid.Length > 0 && curVid == _forfeitKeepVehicleId))
+                {
+                    string vid = curVid;
+                    try
+                    {
+                        var vc = VehicleHelper.GetCurrentVehicleBase();
+                        if (vc == null) throw new InvalidOperationException("no live controller for the current vehicle");
+                        vc.ExitVehicle();
+                        // R3: held until the game has the player out (TickOwnerVehicleExit) - the car is not deleted this frame.
+                        _ownerWaitingVehicle.Add(new KeyValuePair<PropertyForfeitInfo, string>(e, why));
+                        _forfeitVehWaitId = vid; _forfeitVehWaitFrame = UnityEngine.Time.frameCount;
+                        Plugin.Logger.LogInfo($"[Forfeit] own property: the player was DRIVING a vehicle kept at forfeited '{vAddr}' - the game's own get-out started; the removal applies once the game has the player out of it.");
+                        return true;
+                    }
+                    catch (Exception ex)
+                    {
+                        _forfeitKeepVehicleId = vid;
+                        Plugin.Logger.LogWarning($"[Forfeit] own property: the player is driving a vehicle kept at forfeited '{vAddr}' and could not be taken out ({ex.Message}) - that vehicle is kept this time.");
+                    }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own property: leave-first check: {ex.Message}"); }
+            return false;
+        }
+
+        /// <summary>R3 (re-check of 6586fc3) - CLIENT, MAIN THREAD, every frame while a get-out is pending (TickHeldForfeits).
+        /// From the second frame after ExitVehicle (its walkable-ground step runs one frame later) the game's own current
+        /// vehicle is read: none / another = the player is out (the car goes, with its live object); still that car = the
+        /// game found no place to put the player and got back in - the car is kept this time, as when the get-out throws.</summary>
+        private static void TickOwnerVehicleExit()
+        {
+            try
+            {
+                if (UnityEngine.Time.frameCount < _forfeitVehWaitFrame + 2) return;
+                VehicleInstance? cur = null; try { cur = VehicleHelper.GetCurrentVehicle(); } catch { }
+                string curId = ""; try { if (cur != null) curId = cur.id ?? ""; } catch { }
+                string vid = _forfeitVehWaitId;
+                bool refused = vid.Length > 0 && curId == vid;
+                var list = new List<KeyValuePair<PropertyForfeitInfo, string>>(_ownerWaitingVehicle);
+                _ownerWaitingVehicle.Clear(); _forfeitVehWaitId = "";
+                if (refused) Plugin.Logger.LogWarning($"[Forfeit] own property: the game refused the get-out (no place to stand found - the player is back in the vehicle) - that vehicle is kept this time.");
+                else Plugin.Logger.LogInfo($"[Forfeit] own property: the game has the player out of the vehicle - applying {list.Count} held notice(s).");
+                if (SaveGameManager.Current == null) { Plugin.Logger.LogInfo("[Forfeit] own property: no world loaded any more - the held notice(s) are discarded."); return; }
+                foreach (var kv in list)
+                {
+                    _forfeitCarryExited = refused ? "" : vid; _forfeitCarryKeep = refused ? vid : "";
+                    try { OwnerApplyForfeit(kv.Key, kv.Value); }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own property after the get-out: {ex.Message}"); }
+                }
+                _forfeitCarryExited = ""; _forfeitCarryKeep = "";
+            }
+            catch (Exception ex) { _ownerWaitingVehicle.Clear(); _forfeitVehWaitId = ""; Plugin.Logger.LogWarning($"[Forfeit] own property get-out check: {ex.Message}"); }
+        }
+
+        /// <summary>L3: the game's exit-completed event (any thread the game raises it on) - the held owner entries apply on
+        /// the main thread.</summary>
+        private static void OnOwnerExitedBuilding(Address _)
+        {
+            try { EnqueueOnMainThread(ReleaseOwnerWaitingExit); } catch { }
+        }
+
+        private static void ReleaseOwnerWaitingExit()
+        {
+            try
+            {
+                if (_ownerWaitingExit.Count == 0) return;
+                var list = new List<KeyValuePair<PropertyForfeitInfo, string>>(_ownerWaitingExit);
+                _ownerWaitingExit.Clear();
+                try { GlobalEvents.onExitBuilding -= OnOwnerExitedBuilding; } catch { }
+                if (!MPClient.IsConnected || SaveGameManager.Current == null)
+                {
+                    Plugin.Logger.LogInfo($"[Forfeit] {list.Count} own-property notice(s) waiting for the exit discarded - the session ended.");
+                    return;
+                }
+                Plugin.Logger.LogInfo($"[Forfeit] own property: the exit completed - applying {list.Count} held notice(s).");
+                foreach (var kv in list)
+                {
+                    try { OwnerApplyForfeit(kv.Key, kv.Value); }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own property after the exit: {ex.Message}"); }
+                }
+                try { HamptonsAccess.RefreshAllBlockers(); }
+                catch (Exception ex) { HamptonsAccess.WarnOnce("Forfeit/hamptons-refresh", ex); }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own property exit release: {ex.Message}"); }
+        }
+
+        /// <summary>F8 (review of b625534) - OWNER SIDE: a Hamptons house that is no longer the player's (no lease, no deed
+        /// here) gets the vacated-interior clear (HamptonsAccess.ClearVacatedInterior - it refuses while the house is still
+        /// the player's, so it runs after the records go) and the game's own 'house sold' visual step
+        /// (CityHamptonsHouseController.OnBuildingSold, decompile :135-145).</summary>
+        private static void OwnerHamptonsReleased(BuildingRegistration reg, string addr)
+        {
+            try
+            {
+                bool hamptons = false; try { hamptons = reg.BuildingCached != null && reg.BuildingCached.IsHamptonsHouse(); } catch { }
+                if (!hamptons) return;
+                bool stillMine = false; try { stillMine = reg.RentedByPlayer || reg.BuildingOwnedByPlayer; } catch { }
+                if (stillMine) return;   // a lease end of a house still owned here: the give-up that follows does this
+                _forfeitClearing = true;
+                try { ClearHamptonsInteriorOnTenancyEnd(addr, "property forfeited (own)"); }
+                finally { _forfeitClearing = false; }
+                bool sold = false;
+                try
+                {
+                    var ctl = InstanceBehavior<CityManager>.Instance?.FindCityBuildingController(reg.Address) as CityHamptonsHouseController;
+                    if (ctl != null) { ctl.OnBuildingSold(); sold = true; }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own house '{addr}': OnBuildingSold: {ex.Message}"); }
+                Plugin.Logger.LogInfo($"[Forfeit] own house '{addr}': Hamptons interior cleared{(sold ? "; the game's house-sold step ran" : " (no city controller loaded)")}.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own house '{addr}': {ex.Message}"); }
+        }
+
+        /// <summary>B4: native's lease end for one building, without the payouts. A business is shut down first with the
+        /// game's own BusinessHelper.ShutdownBusiness (decompile Helpers/BusinessHelper.cs:1340) - native's terminate does
+        /// NOT unassign staff (read), ShutdownBusiness does (UnassignEmployeeFromAllWorkshifts for every employee assigned to
+        /// the address) and also drops that address's delivery contracts, licensing rows, logistics and an HQ's plans; it
+        /// moves no money. Homes (residential) have no business and skip it, exactly as native keeps their type.</summary>
+        internal static void OwnerEndLeaseNoPayout(BuildingRegistration reg, string addr, out int items, out int vehicles)
+        {
+            string btype = ""; try { btype = reg.GetBuildingType() ?? ""; } catch { }
+            bool residential = btype == "ba:buildingtype_residential";
+            string name = ""; try { name = reg.BusinessName ?? ""; } catch { }
+            if (!residential)
+            {
+                try { BusinessHelper.ShutdownBusiness(reg); }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own lease '{addr}': ShutdownBusiness: {ex.Message}"); }
+            }
+            ClearForfeitContents(reg, addr, true, out items, out vehicles);
+            if (name.Length > 0)
+            {
+                try { string? dir = BusinessSync.SafeLogoDir(name); if (dir != null && System.IO.Directory.Exists(dir)) System.IO.Directory.Delete(dir, true); } catch { }   // SEC-LOGO-1
+            }
+            reg.BusinessName = null;
+            reg.RentedByPlayer = false;
+            reg.AvailableForRent = true;
+            try { reg.takenOver = false; } catch { }
+            if (btype == "ba:buildingtype_warehouse")
+            { try { Buildings.Office.Headquarters.PurchasingAgentHelper.CancelPlansThatDeliverToAddress(reg.Address); } catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] own lease '{addr}': purchasing plans: {ex.Message}"); } }
+            if (!residential) reg.businessTypeName = "ba:businesstype_empty";
+            RefreshForfeitPoi(reg);
+            try { UI.Guiders.GuidersManager.UpdateGuidersWithAddress(reg.Address); } catch { }
+            try { RealEstateHelper.AddNoHomeModifierIfNeeded(); } catch { }
+            var a = reg.Address;
+            try { SaveGameManager.Current.FurnitureDeliveryContracts.RemoveAll(x => x.toAddress == a); } catch { }
+            try { Buildings.BuildingTypes.Special.FoodDelivery.FoodDeliveryHelper.RemoveContractsForAddress(a); } catch { }
+            try
+            {
+                var tasksUi = InstanceBehavior<UI.UIs>.Instance?.tasksUI;
+                if (tasksUi != null)
+                {
+                    var done = new List<Entities.TodoTask>();
+                    foreach (var t in SaveGameManager.Current.TodoTasks)
+                        if (t != null && t.address == a) done.Add(t);
+                    if (done.Count > 0) tasksUi.InstantlyCompleteListOfTasks(done);
+                }
+            }
+            catch { }
+            try { GameEvent.Invoke("ba:gameevent_rentedbuilding"); } catch { }
+            OwnerHamptonsReleased(reg, addr);   // F8
+            Plugin.Logger.LogInfo($"[Forfeit] own lease '{addr}' ENDED ({(residential ? "home" : (name.Length > 0 ? $"business '{name}' shut down, staff unassigned" : "no business"))}): {items} item(s) and {vehicles} vehicle(s) removed, NO refund.");
+        }
+
+        /// <summary>B4: give up one bought building without a sale price - the game's own AI-purchase steps
+        /// (RealEstateHelper.SimulateCompetitorBuyingPlayerBuildings, decompile :138-149) minus the payment: the realEstate
+        /// record and this player's own sale listing go; contents and vehicles at the address go when the host cleared them.</summary>
+        internal static void OwnerGiveUpBuilding(BuildingRegistration reg, string addr, bool clear, out int items, out int vehicles)
+        {
+            items = 0; vehicles = 0;
+            if (clear) ClearForfeitContents(reg, addr, true, out items, out vehicles);
+            var gi = SaveGameManager.Current;
+            var a = reg.Address;
+            int listings = 0, records = 0;
+            try { listings = gi.buildingsForSale.RemoveAll(x => x.address == a); } catch { }
+            try { records = gi.realEstate.RemoveAll(x => x != null && x.address == a); } catch { }
+            RefreshForfeitPoi(reg);
+            try { RealEstateHelper.AddNoHomeModifierIfNeeded(); } catch { }
+            OwnerHamptonsReleased(reg, addr);   // F8
+            Plugin.Logger.LogInfo($"[Forfeit] own building '{addr}' GIVEN UP: {records} ownership record(s) and {listings} own sale listing(s) removed; {items} item(s) and {vehicles} vehicle(s) removed; NO sale price.");
+        }
+
+        /// <summary>Clear one address's contents on THIS machine's copy: every item (furniture, shelves and the stock in
+        /// them, storage) through the game's own RemoveItemInstanceFromBuilding; a Hamptons house's served interior through
+        /// the existing tenancy-end clear (viewers); on the OWNER's machine also the vehicles at the address (native's
+        /// VehicleInstance.Delete, with the controller for a Hamptons motor vehicle exactly as native passes it). The
+        /// interior baselines are forgotten and an open interior of this address is redrawn.</summary>
+        private static void ClearForfeitContents(BuildingRegistration reg, string addr, bool ownerSide, out int items, out int vehicles)
+        {
+            items = 0; vehicles = 0;
+            bool hamptons = false; try { hamptons = reg.BuildingCached != null && reg.BuildingCached.IsHamptonsHouse(); } catch { }
+            try { items = reg.itemInstances?.Count ?? 0; } catch { }
+            // F9 (review of b625534): a machine holding keys / helper access to this building would forward one 'item
+            // removed' per cleared item (HousingPatches guest-removal forward) - suppressed while the forfeit clears.
+            _forfeitClearing = true;
+            try
+            {
+                if (hamptons && !ownerSide) ClearHamptonsInteriorOnTenancyEnd(addr, "property forfeited");   // owner side: OwnerHamptonsReleased (F8)
+                var list = new List<BigAmbitions.Items.ItemInstance>();
+                try { if (reg.itemInstances != null) foreach (var ii in reg.itemInstances.Values) if (ii != null) list.Add(ii); } catch { }
+                foreach (var ii in list) { try { reg.RemoveItemInstanceFromBuilding(ii); } catch { } }
+            }
+            finally { _forfeitClearing = false; }
+            if (ownerSide)
+            {
+                var vl = new List<VehicleInstance>();
+                try
+                {
+                    var vi = SaveGameManager.Current?.VehicleInstances;
+                    if (vi != null)
+                        foreach (var v in vi) { if (v == null) continue; bool here = false; try { here = v.Address == reg.Address; } catch { } if (here) vl.Add(v); }
+                }
+                catch { }
+                foreach (var v in vl)
+                {
+                    try
+                    {
+                        string vid = ""; try { vid = v.id ?? ""; } catch { }
+                        if (vid.Length > 0 && vid == _forfeitKeepVehicleId) { Plugin.Logger.LogWarning($"[Forfeit] '{addr}': the vehicle the player could not leave is kept this time."); continue; }
+                        VehicleController? vc = null;
+                        if (hamptons) { try { if (v.VehicleType.IsMotorVehicle) vc = VehicleHelper.GetVehicleController(v); } catch { } }
+                        if (vid.Length > 0 && vid == _forfeitExitedVehicleId) { try { vc = VehicleHelper.GetVehicleController(v); } catch { } }   // L3: the car just left stands in the street - its object goes too
+                        v.Delete(vc);
+                        vehicles++;
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] '{addr}': vehicle delete: {ex.Message}"); }
+                }
+            }
+            ForgetInteriorBaselines(addr);
+            try { TryRefreshActiveInteriorIfMatches(addr); } catch { }
+        }
+
+        /// <summary>F9: true while a forfeit clears a building's items on this machine (HousingPatches reads it).</summary>
+        private static bool _forfeitClearing;
+        internal static bool ForfeitClearing => _forfeitClearing;
+
+        /// <summary>Is this id an AI rival of this world (a rivalStates row) - never a session player?</summary>
+        internal static bool IsAiRivalId(string? id)
+        {
+            if (string.IsNullOrEmpty(id)) return false;
+            try
+            {
+                if (IsSessionPlayerRivalId(id)) return false;
+                var rs = SaveGameManager.Current?.rivalStates;
+                if (rs != null) foreach (var r in rs) if ((r?.rivalId?.ToString() ?? "") == id) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>F2/F4 (review of b625534): the TENANCY side of an address on THIS machine's copy - 0 = free (no player
+        /// lease here, no business name, no tenant mark); 1 = a stale player tenancy (a non-AI tenant mark, or an off-market
+        /// shell with no business) the ledger does not back; 2 = held here (this machine's player rents it, or an AI business
+        /// runs it); -1 = no registration. MAIN THREAD.</summary>
+        internal static int ForfeitTenancyState(string addr)
+        {
+            try
+            {
+                var reg = FindRegistration(addr);
+                if (reg == null) return -1;
+                if (reg.RentedByPlayer) return 2;
+                string tid = ""; try { tid = reg.businessOwnerRivalId?.ToString() ?? ""; } catch { }
+                if (tid.Length > 0) return IsAiRivalId(tid) ? 2 : 1;
+                if (!string.IsNullOrEmpty(reg.BusinessName)) return 2;   // an AI business without a rival id
+                return reg.AvailableForRent ? 0 : 1;
+            }
+            catch { return -1; }
+        }
+
+        /// <summary>F2/F3: the DEED side of an address on THIS machine's copy - 0 = free; 1 = a stale non-AI owner mark;
+        /// 2 = held here (this machine's player owns it, or an AI rival bought it); -1 = no registration. MAIN THREAD.</summary>
+        internal static int ForfeitDeedState(string addr)
+        {
+            try
+            {
+                var reg = FindRegistration(addr);
+                if (reg == null) return -1;
+                if (reg.BuildingOwnedByPlayer) return 2;
+                string oid = ""; try { oid = reg.buildingOwnerRivalId?.ToString() ?? ""; } catch { }
+                if (oid.Length > 0) return IsAiRivalId(oid) ? 2 : 1;
+                return 0;
+            }
+            catch { return -1; }
+        }
+
+        private static void RefreshForfeitPoi(BuildingRegistration reg)
+        {
+            try { InstanceBehavior<CityManager>.Instance?.FindCityBuildingController(reg.Address)?.UpdatePoi(); } catch { }
+            try { InstanceBehavior<UI.UIs>.Instance?.mapFilters.ApplyFilters(); } catch { }
+        }
+        /// <summary>Round-260 (field 20260810-232704): the ONE definition of "this reg is
+        /// vacant" — used by the vacate reflect above and the ghost-tenancy healer. The
+        /// field wedge: the reflect cleared only AvailableForRent + tenant id, while the
+        /// rent-availability check (HostRentUnavailableReason) ALSO refuses on
+        /// BusinessName/businessTypeName — the leftovers denied every re-rent until the
+        /// host cycled the building natively. Shape mirrors what native rent/terminate
+        /// leave behind (ResetRegistrationOnRent: name null, type empty).</summary>
+        internal static void MakeRegVacant(BuildingRegistration reg)
+        {
+            reg.AvailableForRent = true;
+            try { reg.businessOwnerRivalId = ""; } catch { }
+            try { reg.BusinessName = null; } catch { }
+            try { reg.businessTypeName = "ba:businesstype_empty"; } catch { }
+            try { reg.RentPerDay = 0f; reg.lastDeposit = 0f; } catch { }
+        }
+
+        /// <summary>Is this id one of the session's HUMAN players? (Rent-vs-deed repair: a player id
+        /// in the DEED field is contamination from the pre-split plumbing.) Checks the live roster +
+        /// self — an offline ex-member's pid isn't matchable, so the sweep is best-effort by design.</summary>
+        public static bool IsSessionPlayerId(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return false;
+            if (id == MPConfig.PlayerId) return true;
+            try { foreach (var p in MPRestSync.AllPlayers()) if (p == id) return true; } catch { }
+            return false;
+        }
+
+        /// <summary>World-integrity line (approved diagnostics batch, 2026-07-09): one line per session
+        /// describing the world-population invariants MP degradation can break (ANTIPATTERNS Class 14).
+        /// A rival-poor / deed-contaminated world announces itself in the FIRST report instead of being
+        /// reverse-engineered from downstream NREs. Called ~30s after scene-ready (the rival cache
+        /// fills after load; an at-ready read would false-alarm zero).</summary>
+
+        /// <summary>Round-157 — the ledger→world translation, extracted so it runs EARLY (from the
+        /// world-ready integrity sweep, before anything native can act on a just-loaded world) and
+        /// again at every world-health check (idempotent: every sub-pass skips already-correct
+        /// records).  Order inside: ledger bootstrap → rent-reflect re-assertion → ghost-tenancy
+        /// release.  Running before the zombie detector means detector output only shows what could
+        /// not be healed.</summary>
+        internal static void ReassertLedgerWorldState(string reason)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                if (MPServer.IsRunning)
+                {
+                    // BAN-PLAYERS-1 F3 (review of b625534): the host's world load - the forfeit record (restored with the
+                    // ledgers, after the rivals carry) is re-applied to the host's OWN copy, so a member who was offline at
+                    // the removal and now hosts does not keep the banned tenancy in its world.
+                    if (reason == "world-ready") { try { MPServer.HostReapplyForfeitsAtLoad(reason); } catch (Exception ex) { Plugin.Logger.LogWarning($"[Forfeit] world-load re-apply: {ex.Message}"); } }
+                    // ROUND-156 (#2) — LEDGER BOOTSTRAP.  The reflect protection below only covers
+                    // buildings the ledger knows; a host's rentals from BEFORE the session existed
+                    // never got entries (the benched round-113 gap), leaving a PREVIOUS host's own
+                    // businesses eatable after a handoff exactly like the RedRoc case.  Natively-rented
+                    // registrations on the host ARE the host's own rentals — enter them.  The next
+                    // manifest write persists them; from then on every machine's load protects them.
+                    try
+                    {
+                        int booted = 0;
+                        foreach (var reg in gi.BuildingRegistrations)
+                        {
+                            if (reg == null) continue;
+                            // Round-173 safety: TrulyMine - a merger-flipped PARTNER shop reads
+                            // RentedByPlayer=true, and ledgering it as the host's would misattribute
+                            // a partner's business (the test pair has no merger; released pairs do).
+                            bool mine = false; try { mine = MergerFlip.TrulyMine(reg); } catch { }
+                            if (!mine) continue;
+                            string aKey = ""; try { aKey = GameStateReader.AddressKey(reg); } catch { }
+                            if (string.IsNullOrEmpty(aKey) || MPServer.BuildingOwners.ContainsKey(aKey)) continue;
+                            // Round-162: a natively-mine record CARRYING ANOTHER SESSION PLAYER'S tenant
+                            // mark is contradictory evidence ('57 fifthavenue': both files claimed it) —
+                            // never rule here; the contested-tenancy arbiter decides on development scores.
+                            string mark = ""; try { mark = reg.businessOwnerRivalId?.ToString() ?? ""; } catch { }
+                            if (!string.IsNullOrEmpty(mark) && mark != MPConfig.PlayerId && IsSessionPlayerId(mark))
+                            {
+                                Plugin.Logger.LogWarning($"[Integrity] ({reason}) ledger bootstrap SKIPPED '{aKey}' — natively mine but tenant-marked '{mark}' (contradictory; left to contested-tenancy arbitration).");
+                                continue;
+                            }
+                            MPServer.BuildingOwners[aKey] = MPConfig.PlayerId;
+                            booted++;
+                            if (booted <= 10)
+                                Plugin.Logger.LogWarning($"[Integrity] ({reason}) ledger bootstrap: '{aKey}' " +
+                                    $"(name='{reg.BusinessName}') is natively rented here but had no ledger entry — recorded as the host's.");
+                        }
+                        if (booted > 0)
+                            Plugin.Logger.LogWarning($"[Integrity] ({reason}) ledger-bootstrap×{booted} host rental(s) entered into the session ledger.");
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Integrity] ledger bootstrap: {ex.Message}"); }
+
+                    try
+                    {
+                        int tenancyFixed = 0;
+                        foreach (var reg in gi.BuildingRegistrations)
+                        {
+                            if (reg == null) continue;
+                            if (reg.RentedByPlayer) continue;   // natively rented (the host's own) — healthy
+                            string aKey = "";
+                            try { aKey = GameStateReader.AddressKey(reg); } catch { }
+                            if (string.IsNullOrEmpty(aKey)) continue;
+                            if (!MPServer.BuildingOwners.TryGetValue(aKey, out var owner) || string.IsNullOrEmpty(owner)) continue;
+                            // Round-155b: the repair re-runs HostReflectPlayerRent's OWN writes and
+                            // nothing more — RentedByPlayer deliberately stays false for remote tenants
+                            // (menus/economics are built on that); the eating hazard was ONLY the
+                            // building sitting back on the rent market with the tenant mark lost, which
+                            // is what four host handoffs produced (each new host loads a file that never
+                            // received the old host's reflects).
+                            bool isSelf = false;
+                            try { isSelf = owner == MPConfig.PlayerId || owner == MPConfig.StableId; } catch { }
+                            if (isSelf) continue;   // own rentals are native — never ours to touch
+                            bool marketBad = false, tenantBad = false;
+                            try { marketBad = reg.AvailableForRent; } catch { }
+                            try { tenantBad = (reg.businessOwnerRivalId?.ToString() ?? "") != owner; } catch { }
+                            // (Merger note 2026-09-10: a FLIPPED partner shop never reaches this point - the loop bails on
+                            // RentedByPlayer above, and a flipped reg is always RentedByPlayer=true; re-review r2 #1.)
+                            if (!marketBad && !tenantBad) continue;
+                            try
+                            {
+                                reg.AvailableForRent = false;
+                                try { reg.businessOwnerRivalId = owner; } catch { }
+                                tenancyFixed++;
+                                if (tenancyFixed <= 10)
+                                    Plugin.Logger.LogWarning($"[Integrity] ({reason}) rent reflect RE-ASSERTED: '{aKey}' " +
+                                        $"(name='{reg.BusinessName}') — ledger tenant '{owner}'; the world had it " +
+                                        $"{(marketBad ? "back on the rent market" : "with a lost tenant mark")}.");
+                            }
+                            catch { }
+                        }
+                        if (tenancyFixed > 0)
+                            Plugin.Logger.LogWarning($"[Integrity] ({reason}) rent-reflects×{tenancyFixed} re-asserted from the session ledger.");
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Integrity] tenancy re-assert: {ex.Message}"); }
+
+                    // ROUND-159 — DEED-LEDGER HYGIENE.  Legacy deed entries hold the literal "host",
+                    // which is ambiguous across handoffs and invisible to the ledger shield.  Migrate an
+                    // entry to the current host's id ONLY on native evidence (this machine's world says
+                    // the building is player-owned — true exactly when this host bought it); an entry
+                    // with no such evidence belonged to a previous host and cannot be attributed safely,
+                    // so it is named in the log and left alone.
+                    try
+                    {
+                        int migrated = 0;
+                        foreach (var kv in MPServer.BuildingRealEstateOwners)
+                        {
+                            if (kv.Value != "host") continue;
+                            var reg = FindRegistration(kv.Key);
+                            bool nativeMine = false;
+                            try { nativeMine = reg != null && reg.BuildingOwnedByPlayer; } catch { }
+                            if (nativeMine)
+                            {
+                                MPServer.BuildingRealEstateOwners[kv.Key] = MPConfig.PlayerId;
+                                migrated++;
+                                Plugin.Logger.LogWarning($"[Integrity] ({reason}) deed ledger: '{kv.Key}' migrated \"host\" → '{MPConfig.PlayerId}' (natively owned on this machine).");
+                            }
+                            else
+                                Plugin.Logger.LogWarning($"[Integrity] ({reason}) deed ledger: '{kv.Key}' is recorded as \"host\" but is NOT natively owned here — a previous host's purchase; left as-is (cannot be attributed safely).");
+                        }
+                        if (migrated > 0)
+                            Plugin.Logger.LogWarning($"[Integrity] ({reason}) deed-ledger×{migrated} \"host\" entr(ies) migrated to the current host's id.");
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Integrity] deed ledger hygiene: {ex.Message}"); }
+
+                    // ROUND-156 (#1) — GHOST-TENANCY RELEASE (the reverse gap).  A member VACATES while
+                    // A hosts: A's world clears the reflect and the ledger drops the entry — but B's
+                    // file never hears of it.  When B later hosts, the building loads OFF-MARKET with a
+                    // stale tenant mark and no ledger entry: nobody can rent it, forever.  Release =
+                    // exactly HostReflectPlayerVacate's writes.  Scope guards: only ids that are LIVE
+                    // SESSION PLAYERS (never AI rival ids — a genuine rival's business is untouched
+                    // even when its id fails to resolve, e.g. on a degraded/remapped world), only
+                    // unledgered addresses, only not-natively-rented records.
+                    try
+                    {
+                        int released = 0;
+                        foreach (var reg in gi.BuildingRegistrations)
+                        {
+                            if (reg == null) continue;
+                            try
+                            {
+                                if (reg.RentedByPlayer || reg.AvailableForRent) continue;   // only stuck-off-market records
+                                string tid = reg.businessOwnerRivalId?.ToString() ?? "";
+                                if (string.IsNullOrEmpty(tid) || !IsSessionPlayerId(tid)) continue;   // only OUR tenant marks
+                                string aKey = GameStateReader.AddressKey(reg);
+                                if (string.IsNullOrEmpty(aKey) || MPServer.BuildingOwners.ContainsKey(aKey)) continue;   // ledgered = legit
+                                // Round-173 safety: a DEVELOPED tenant-marked unledgered building is far
+                                // more likely a LOST LEDGER ENTRY (manifest rollback - observed on the
+                                // rig) than a swallowed vacate.  Releasing it would put a real member
+                                // business on the market for native actors to eat.  Only a KNOWN-empty
+                                // shell releases; anything else is named and left for the round-61
+                                // owner-push adoption to reconcile.
+                                if (!ContestedTenancy.IsKnownEssentiallyEmpty(reg, out int gScore))
+                                {
+                                    Plugin.Logger.LogWarning($"[Integrity] ({reason}) ghost-tenancy SKIPPED '{aKey}' - tenant-marked '{tid}', unledgered, but the copy is {(gScore < 0 ? "UNKNOWN" : $"developed (score {gScore})")} - likely a lost ledger entry, not a swallowed vacate; left for owner-push adoption.");
+                                    continue;
+                                }
+                                string ghostName = ""; try { ghostName = reg.BusinessName?.ToString() ?? ""; } catch { }
+                                MakeRegVacant(reg);   // round-260: full vacant shape — a half-cleared reg wedges re-rents
+                                released++;
+                                if (released <= 10)
+                                    Plugin.Logger.LogWarning($"[Integrity] ({reason}) ghost tenancy RELEASED: '{aKey}' " +
+                                        $"(name='{ghostName}') — tenant-marked '{tid}' but the ledger says nobody rents it; back on the market.");
+                            }
+                            catch { }
+                        }
+                        if (released > 0)
+                            Plugin.Logger.LogWarning($"[Integrity] ({reason}) ghost-tenancies×{released} released.");
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Integrity] ghost tenancy: {ex.Message}"); }
+
+                    ContestedTenancy.HostSeed();   // round-162: the host's native claims enter arbitration
+                }
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Integrity] ledger world-state: {ex.Message}"); }
+        }
+
+        public static void LogWorldHealth(string reason)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                int regs = 0, landlorded = 0, playerDeeds = 0, tenanted = 0;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    regs++;
+                    string deed = ""; try { deed = reg.buildingOwnerRivalId ?? ""; } catch { }
+                    if (!string.IsNullOrEmpty(deed)) landlorded++;
+                    if (IsSessionPlayerId(deed)) playerDeeds++;
+                    try { if (!string.IsNullOrEmpty(reg.businessOwnerRivalId)) tenanted++; } catch { }
+                }
+                int nonSpecialRivals = -1;
+                try { nonSpecialRivals = BigAmbitions.Rivals.RivalsHelper.GetNonSpecialRivals()?.Count ?? -1; } catch { }
+                int forSale = -1; try { forSale = gi.buildingsForSale?.Count ?? -1; } catch { }
+                int injected = MPRegisterSync.InjectedCount;
+                int players = 0; try { players = MPRestSync.AllPlayers().Count; } catch { }
+
+                bool sick = nonSpecialRivals == 0 || playerDeeds > 0;
+                string line = $"[WorldHealth] ({reason}) regs={regs} landlorded={landlorded} rivalBiz={tenanted} playerDeeds={playerDeeds} " +
+                              $"nonSpecialRivals={nonSpecialRivals} forSale={forSale} injectedStaff={injected} players={players}";
+                if (sick) Plugin.Logger.LogWarning(line + "  ← DEGRADED WORLD (rival-poor and/or deed contamination)");
+                else      Plugin.Logger.LogInfo(line);
+
+                ReassertLedgerWorldState(reason);   // round-157: heal BEFORE detecting — zombie output shows only what could not be healed
+
+                // Round-50 ZOMBIE DETECTOR (approved, log-only): a record with a business NAME but
+                // no tenant while still ON THE RENT MARKET is a state no clean native flow produces
+                // (rent occupies, terminate wipes the name, AI shops are off the market). Field case
+                // 2026-07-21-204010: such a save-resident zombie LOOKED like a rival shop but was
+                // rentable — the "couldn't take over rival business" report. Runs on both sides at
+                // both health checks; first 10 named, rest counted.
+                try
+                {
+                    int zombies = 0;
+                    foreach (var reg in gi.BuildingRegistrations)
+                    {
+                        if (reg == null) continue;
+                        bool named = false;
+                        try { named = !string.IsNullOrEmpty(reg.BusinessName?.ToString()); } catch { }
+                        if (!named || reg.RentedByPlayer || !reg.AvailableForRent) continue;
+
+                        zombies++;
+                        if (zombies <= 10)
+                            Plugin.Logger.LogWarning($"[WorldHealth] ({reason}) ZOMBIE record: '{GameStateReader.AddressKey(reg)}' " +
+                                $"name='{reg.BusinessName}' type={reg.businessTypeName} rented=False AVAILABLE — " +
+                                $"occupied-looking but rentable (bizOwner='{reg.businessOwnerRivalId}', deed='{reg.buildingOwnerRivalId}').");
+                    }
+                    if (zombies > 10) Plugin.Logger.LogWarning($"[WorldHealth] ({reason}) …and {zombies - 10} more zombie record(s).");
+                }
+                catch { }
+
+                // ROUND-155 — LEDGER-DRIVEN TENANCY RE-ASSERTION (host only).  Offline analysis of the
+                // field RedRoc save proved the failure at full scale: the HOST's file carried
+                // rentedByPlayer=False for EVERY member-owned building while the MEMBER's own file said
+                // True — and the worst-hit buildings had ALREADY lost their business name and furniture,
+                // making them invisible to the zombie detector above (it requires a name; the players'
+                // three reported losses were exactly the nameless ones).  The session ledger
+                // (MPServer.BuildingOwners) is the authority the session restore already trusts, so it —
+                // not record evidence — drives the repair: any ledger-owned building whose native flags
+                // read not-rented gets them re-asserted.  Interiors already eaten by native cleanup are
+                // NOT recoverable here; this stops the eating.
+                // round-157: the ledger pass now runs EARLY (world-ready sweep) and before the
+                // zombie detector below — see ReassertLedgerWorldState.
+
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[WorldHealth] {ex.Message}"); }
+        }
+
+        /// <summary>HOST, world-ready (round-53): the drain dial replaced the old energy on/off
+        /// toggle, and for LOADED saves the flag baked into gameVariables must follow it — old MP
+        /// saves baked disableEnergy=true (the old default), which silently deadened the dial
+        /// (needs stayed off no matter what it said). The session values themselves are already
+        /// applied and heartbeat-distributed; this only aligns the native flag on the host's save
+        /// (it re-bakes on the next save, and clients take the flag via the game-variables sync).</summary>
+        public static void ReconcileLoadedNeedsFlag()
+        {
+            if (!MPServer.IsRunning) return;
+            try
+            {
+                var gv = SaveGameManager.Current?.gameVariables;
+                if (gv == null) return;
+                bool want = MPNeedsTuning.DrainPercent == 0;
+                if (gv.disableEnergy != want)
+                {
+                    Plugin.Logger.LogInfo($"[Needs] loaded save disableEnergy {gv.disableEnergy} → {want} (drain dial {MPNeedsTuning.DrainPercent}% is the authority, round-53).");
+                    gv.disableEnergy = want;
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Needs] reconcile flag: {ex.Message}"); }
+        }
+
+        /// <summary>One-shot save repair: the pre-split plumbing wrote RENTERS into
+        /// buildingOwnerRivalId (the deed field) and erased AI landlords on vacate — both persisted
+        /// into saves. Any session player id found in a deed field moves to the tenant field
+        /// (businessOwnerRivalId) where the display actually belongs; the landlord itself is
+        /// unrecoverable (worldgen never re-assigns) and stays empty — benign: the building simply
+        /// isn't listed under any rival's owned buildings.
+        /// H-DEEDSTRIP-1 (2026-09-18): the deed half is HOST-ONLY. The purchase ledger that tells a
+        /// legitimate deed from the contamination exists only on the host, so on a client this branch
+        /// is DETECT-ONLY — it counts and reports, and writes nothing. The runner-field half below
+        /// needs no ledger and still runs on every machine.</summary>
+        public static void SweepRivalFieldContamination(string reason)
+        {
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                int repaired = 0, unjudged = 0;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    string deed; try { deed = reg.buildingOwnerRivalId ?? ""; } catch { continue; }
+                    if (!IsSessionPlayerId(deed)) continue;
+                    string addr; try { addr = GameStateReader.AddressKey(reg); } catch { continue; }
+                    // LEGITIMATE deed vs the bug: the real-estate ledger is the authority. If it names
+                    // this player as the BUYER of this building, the attribution is correct — keep it.
+                    //
+                    // H-DEEDSTRIP-1 (2026-09-18): that ledger lives ONLY on the host, so a CLIENT has
+                    // nothing to judge with — it used to strip every player deed it saw and MOVE the pid
+                    // into businessOwnerRivalId. That is not self-healing: the next sweep reads the
+                    // damaged value first, and MPSaveIntegrity Class 6 reads the player's OWN rented
+                    // shop as another player's business and unassigns its staff on every load (57
+                    // buildings in the field log). Without the ledger this branch WRITES NOTHING.
+                    if (!MPServer.IsRunning) { unjudged++; continue; }
+                    bool legitimateDeed = false;
+                    try
+                    {
+                        if (MPServer.BuildingRealEstateOwners.TryGetValue(addr, out var buyer))
+                            legitimateDeed = (buyer == deed) || (buyer == "host" && deed == MPConfig.PlayerId);
+                    }
+                    catch { }
+                    if (legitimateDeed) continue;
+                    try
+                    {
+                        if (string.IsNullOrEmpty(reg.businessOwnerRivalId) && !MergerFlip.IsFlipped(addr)) reg.businessOwnerRivalId = deed;   // merger phase 0 (review #4): a flipped reg's empty stamp is by design
+                        reg.buildingOwnerRivalId = "";
+                        repaired++;
+                        Plugin.Logger.LogInfo($"[Patcher] rent-vs-deed repair: '{addr}' deed field held player '{deed}' with no purchase on the ledger → moved to tenant field.");
+                    }
+                    catch { }
+                }
+                if (repaired > 0)
+                    Plugin.Logger.LogWarning($"[Patcher] rent-vs-deed repair ({reason}): {repaired} building(s) had a PLAYER in the deed field (pre-split contamination) — repaired.");
+                // Only a real MP CLIENT is missing a ledger it should have had; in single player and in the
+                // offline fork there is no host to hold one, and the line would just be noise.
+                if (unjudged > 0 && MPClient.IsClientInWorld && !MPClient.OfflineFork)
+                    Plugin.Logger.LogInfo($"[Patcher] rent-vs-deed: {unjudged} building(s) hold a player in the deed field — not judged here (the purchase ledger lives on the host), left untouched.");
+
+                // Runner-field self-contamination (echo-loop family, 2026-07-13): MY OWN pid
+                // in MY businessOwnerRivalId is always wrong — my tenancy is RentedByPlayer.
+                // Sources: the 0.1.10 ownership-apply hole (fixed), a degraded delta, or the
+                // deed→tenant move ABOVE when the contaminated deed held my own pid.  Other
+                // players' pids in the runner field are LEGITIMATE (that's how "run by X"
+                // is stored) — only the self case is swept.  RentedByPlayer is untouched:
+                // whether I truly rent here is my save's own authority.
+                int selfRunner = 0;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    try
+                    {
+                        if (reg == null || (reg.businessOwnerRivalId ?? "") != MPConfig.PlayerId) continue;
+                        reg.businessOwnerRivalId = "";
+                        selfRunner++;
+                        if (selfRunner <= 10)
+                            Plugin.Logger.LogInfo($"[Patcher] runner-field repair: '{GameStateReader.AddressKey(reg)}' held MY OWN pid as business runner — cleared.");
+                    }
+                    catch { }
+                }
+                if (selfRunner > 0)
+                    Plugin.Logger.LogWarning($"[Patcher] runner-field repair ({reason}): {selfRunner} building(s) had my own pid in the runner field — cleared.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Patcher] SweepRivalFieldContamination: {ex.Message}"); }
+        }
+
+        private static void MarkBuildingAvailable(string addressKey)
+        {
+            var reg = FindRegistration(addressKey);
+            if (reg == null) return;
+            reg.AvailableForRent = true;
+        }
+
+        /// <summary>
+        /// Executes the actual BuildingHelper.RentBuilding call for the local player
+        /// after the host has confirmed approval.
+        /// </summary>
+        private static void ExecuteLocalRent(BuildingOwnershipPayload payload)
+        {
+            try
+            {
+                var building = FindBuilding(payload.AddressKey);
+                if (building == null)
+                {
+                    Plugin.Logger.LogError($"[Patcher] Could not find building for {payload.AddressKey}");
+                    return;
+                }
+
+                // Execute the actual game logic — this deducts money, sets RentedByPlayer, etc.
+                // The Harmony patch will see MPPatches.SuppressNextRentRequest = true and skip
+                // sending another network request for this call.
+                MPPatches.SuppressNextRentRequest = true;
+                BuildingHelper.RentBuilding(building, payload.DailyRent, payload.LastDeposit);
+                Plugin.Logger.LogInfo($"[Patcher] Local rent executed for {payload.AddressKey}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError($"[Patcher] ExecuteLocalRent error: {ex.Message}");
+            }
+        }
+
+        internal static BuildingRegistration? FindRegistration(string addressKey)
+        {
+            var gi = SaveGameManager.Current;
+            if (gi == null) return null;
+
+            foreach (var reg in gi.BuildingRegistrations)
+            {
+                if (GameStateReader.AddressKey(reg) == addressKey)
+                    return reg;
+            }
+            return null;
+        }
+
+        private static Building? FindBuilding(string addressKey)
+        {
+            // BuildingHelper.allBuildings is a static list of all city buildings
+            foreach (var b in BuildingHelper.allBuildings)
+            {
+                if (GameStateReader.AddressKey(b) == addressKey)
+                    return b;
+            }
+            return null;
+        }
+    }
+}

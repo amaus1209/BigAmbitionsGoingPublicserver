@@ -1,0 +1,49 @@
+[h1]Going Online – werde Kabelnetzbetreiber[/h1]
+Gründe deinen eigenen Internet- und Kabel-TV-Anbieter: Kauf Bandbreite ein, schließ die Häuser der Stadt an und verkaufe Internet, Fernsehen und Telefon. Wie viel Kundschaft ein Haus bringt, hängt von seiner Größe ab. Gebaut nach dem Vorbild echter Kabelnetze: Kopfstelle, Glasfaserknoten, Verstärker, Hausübergabepunkt, Modem.
+
+[h2]Wichtig[/h2]
+[list]
+[*][b]Neuer Mod, noch im Test[/b] – Fehler und Wünsche bitte hier in die Kommentare, mit der Player.log, wenn möglich.
+[*][b]Spielstände:[/b] Dein Anbieter steckt im Spielstand. Ohne den Mod bleibt er dort einfach liegen.
+[*][b]Mehrspieler:[/b] In [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182]Going Public Server[/url] ist Going Online schon eingebaut (Modul 8), und die Rangliste des Servers zeigt die Kabelanbieter der Spieler. Ist Going Public Server aktiv, hält sich dieser Mod raus.
+[/list]
+
+[h2]So startest du[/h2]
+Erst das Büro, dann das Kundencenter: Miete ein [b]Büro[/b] und gründe dort in [b]BizMan[/b] den [b]„Kabelanbieter“[/b] (Kurs „Bürounternehmen“) – es wird deine Kopfstelle. Dann miete einen [b]Laden[/b] im selben Viertel und gründe dort ein [b]„Kabel-Kundencenter“[/b]. Erst wenn beides steht, schließt jemand ab. Die App [b]Going Online[/b] (Handy oder [b]Umschalt+F12[/b]) führt dich durch die ersten Schritte. Für den Start brauchst du 25.000 $ für das CMTS; einen Transporter kannst du leasen.
+
+[h2]Was drin ist[/h2]
+[list]
+[*][b]Häuser anschließen[/b]: Die Größe eines Hauses bestimmt die Haushalte und Firmen darin. Der Platzhirsch hat anfangs alle Kunden. Wie viele zu dir wechseln, hängt von Preis, Tempo am Abend, Störungen und deinem Ruf ab.
+[*][b]Konkurrenz: Skyline Cable[/b]: Der alteingesessene Kabelanbieter wehrt sich, wo du ihm Kundschaft abnimmst. Er senkt die Preise, wirbt mit Wechselprämien zurück, baut sein Netz aus, schließt Exklusivverträge für Häuser und bietet bei jeder Ausschreibung mit. Fällt sein Netz aus, wechseln viele zu dir. Wie hart er kämpft, richtet sich nach der Konkurrenz-Einstellung des Spiels.
+[*][b]Neu in 0.8 – Büros, Hubs, Kundencenter[/b]: Jedes Viertel braucht ein Büro und ein Kundencenter. Ein Büro in einem anderen Viertel wird mit Glasfaser-Zuführung zum Hub mit eigenem CMTS; ein Ring übersteht den Bagger. Im Kundencenter kommt Kundschaft herein, schaut am Gerätetisch, wartet auf den Stühlen vor dem Werbe-TV mit deinem Spot und geht zum Kundenplatz. Eine Person betreut 400 (Technik), 800 (Schaltdienst) oder 500 (Kundenservice) Anschlüsse, ein Netzmeister führt bis zu 10 Leute.
+[*][b]Glasfaserknoten je Viertel[/b]: Alle Anschlüsse an einem Knoten teilen sich seine Kapazität, abends ist Spitze. Jedes CMTS hat 8 Ports. Knoten lassen sich auch wieder abbauen.
+[*][b]Technik in Stufen[/b]: Du startest mit DOCSIS 3.0 (Tarife bis 500 Mbit/s). Ab 300 Anschlüssen kommt DOCSIS 3.1 (bis 1000 Mbit/s, schneller nur mit 3.1-Modem). Ab 1500 Anschlüssen kommt Glasfaser bis in die Wohnung mit XGS-PON. Dazu High-Split für mehr Upload (Hausverstärker tauschen), Fiber Deep mit kleinen Knoten ohne Verstärker und Remote-PHY am vCMTS-Server.
+[*][b]Bandbreite einkaufen[/b]: IP-Transit von 100 Mbit/s bis 100 Gbit/s, je mehr, desto billiger, abgerechnet nach dem 95-Prozent-Verfahren; dazu Peering-Ports.
+[*][b]Tarife[/b]: Name, Tempo, Fernsehen (Kabel oder IPTV), Telefon, Preis pro Tag und Mindestlaufzeit. Der Marktpreis steht daneben.
+[*][b]Telefon[/b]: Mit der Telefonie-Plattform bekommt jeder Internettarif auf Wunsch einen Telefonanschluss. Rufnummern kaufst du in Blöcken zu 1.000, und viele Neue bringen ihre Nummer mit (Portierung, zwei Tage).
+[*][b]IPTV[/b]: Rund 120 Sender und Replay über die Internetleitung, ohne Kabelkanäle, mit Set-Top-Box. Dafür steigt die Last an den Knoten zur Fernsehzeit.
+[*][b]Geräte[/b]: Kabelmodems, ONTs und Set-Top-Boxen kaufst du im Großhandel ein. Die Kundschaft mietet, kauft oder bringt ein eigenes Gerät mit (Routerfreiheit).
+[*][b]Fernsehen per Satellit[/b]: Jedes Sat-Gerät bringt einen Transponder ins Kabel. Jeder Sender kostet aber Platz, der dem Internet fehlt.
+[*][b]Pay-TV als Wiederverkäufer[/b]: Großhandelsverträge mit Einkaufspreis und Mindestabnahme, den Verkaufspreis legst du fest. Dafür brauchst du ein CA-System und Smartcards.
+[*][b]Störungen wie im echten Netz[/b]: Rückwegstörer, Verstärkerausfall, Wasser im Hausanschluss, Stromausfall am Knoten, Faserbruch durch Bagger, defekte Modems und WLAN-Probleme. Stromausfälle im Viertel überbrücken Akkus, USV und Notstromaggregat. Eine Netzüberwachung im Leitstand findet Störungen, bevor jemand anruft. Nach zwei Tagen ohne Lösung wird eine Entschädigung fällig (§ 58 TKG).
+[*][b]Personal in sechs Rollen[/b]: Technik, Schaltdienst, Netzmeister, Außendienst, Kundenservice und Technische Entstörung, jeweils mit Können, Lohn und Schicht. Du kannst auch selbst hinfahren und reparieren.
+[*][b]Fahrzeuge und Arbeitsplätze[/b]: Fahrzeuge parkst du an deinen Büros. Die Berufe kommen mit den Arbeitsplätzen; der Kundenservice arbeitet im Kundencenter. Die Monitore zeigen die App, als würde dein Personal sich durchklicken.
+[*][b]Neu in 0.8.1 – in BizMan[/b]: Der Kabelanbieter steht in BizMans Liste (Anschlüsse, Zufriedenheit) mit den Reitern Lieferungen, Fuhrpark und Inventar. Großhändler bringen die Geräte per Liefervertrag, das Möbelhaus liefert per Telefon ins Büro.
+[*][b]Eigene Modelle[/b]: Alle Geräte haben eigene 3D-Modelle mit blinkenden LEDs, ohne Marken. Der Servicewagen ist ein echtes Fahrzeug: im Autohaus zu kaufen, selbst zu fahren, mit Beklebung aus dem Reiter „Servicewagen“ und Kennzeichen „GO1-Name“ …; geleaste Wagen fahren durch die Stadt.
+[*][b]Neu in 0.8.3[/b]: Ereignisse mit Entscheidung (Unwetter, Fußballspiel, Bagger, Zeitung, Testsieg, Glasfaser-Förderung), Verteilerkästen mit Logo und Baustellen in der Stadt, für alle sichtbar, Leitungen an Mitspieler (Going Public Server) und Vorlagen für mehr Gebäudegrößen.
+[*][b]Geschäfte[/b]: Ein Streaming-Cache spart Bandbreite, ein Anbieter ohne Netz mietet Leitungen bei dir, Firmen buchen Tarife mit 8 Stunden Entstörzeit, und große Wohnhäuser schließen Sammelverträge für Fernsehen.
+[*][b]Bestellweg wie im echten Leben[/b]: Bestellung, Portierung, Freischalten im Haus, dann Selbstinstallation oder Termin. Wer kündigt, hat noch Signal, bis der Anschluss abgeschaltet ist.
+[*][b]Gestattungsverträge[/b]: Jedes Haus hat einen Vertrag mit dem Eigentümer über zwei Spieljahre. Verlängere ihn rechtzeitig, sonst gibt es eine Ausschreibung, und bei schlechtem Ruf übernimmt ein anderer Anbieter das Haus samt Kundschaft. Der Außendienst hilft dabei und bringt an der Haustür neue Kundschaft.
+[*][b]Kundenzufriedenheit[/b]: Fünf Teile zeigen, wo es hakt: Netz, Störungen, Termine, Anrufe, Bestellungen. Fehlt Personal, siehst du es dort zuerst. Fremdfirmen und Überstunden helfen über Engpässe.
+[*][b]Klein anfangen, groß werden[/b]: Am Anfang packst du selbst mit an. Mit mehr Kundschaft gibt es Mengenrabatt.
+[*][b]Alter und Wartung[/b]: Neue Anschlüsse kosten kaum Wartung, alte mehr und fallen öfter aus – erneuern oder auf Glasfaser umziehen. Reparaturen am alten Koax sind billig, ein Faserbruch ist teuer.
+[*][b]Umzüge, Pauschalen, Beschwerden[/b]: Umzugsgebühr, Entstörungspauschale bei Fehlern der Kundschaft, Beschwerden über unfreundliche Technik – eine Schulung hilft.
+[*][b]Finanzen[/b]: Die Abrechnung läuft um Mitternacht, jeder Posten steht auch in der Finanz-App des Spiels.
+[*][b]Einstellungen[/b] unter Optionen → Mods: wie oft Störungen kommen, wie schnell die Kundschaft wächst, ab wann DOCSIS 3.1 und Glasfaser kommen.
+[/list]
+
+[h2]Sprachen[/h2]
+Deutsch und Englisch, die anderen Sprachen zeigen Englisch.
+
+[h2]Danke[/h2]
+Entwickelt von amaus1209 zusammen mit Claude Code (Anthropic). Die Zahlen stammen aus Recherchen zu echten Kabelnetzen: DOCSIS, XGS-PON, IP-Transit, § 58 TKG, Router-Mieten und Pay-TV-Verträge. Big Ambitions gehört Hovgaard Games.

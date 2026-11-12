@@ -1,0 +1,39 @@
+# Build output
+bin/
+obj/
+dist/
+
+# IDE
+.vs/
+.idea/
+*.user
+
+# Local launcher secrets
+/tools/BigAmbitionsMP.Launcher/launcher-secrets.json
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Local test harness (machine-specific launchers etc.) - never published
+/local/
+
+# Dev-only working material — kept on disk for continuity, not part of the mod
+# and not published.  (Modding knowledge base, run logs, session logs, planning
+# docs, and Claude Code project config.)
+/.modding/
+/.claude/
+/context-log-*.md
+/release-hardening-plan.md
+/STATUS.md
+
+# Dev-only (2026-08-24 ruling: GitHub holds only files the mod needs to function)
+/tools/StoreMigrationHarness/
+/tools/sync-test-rig.ps1
+/tools/unit-tests/
+__pycache__/
+
+# Python
+__pycache__/
+*.pyc
+.venv-build/

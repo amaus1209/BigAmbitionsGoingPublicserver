@@ -1,0 +1,1103 @@
+using System;
+using HarmonyLib;
+using BigAmbitions.Items;   // CargoInstance, ItemInstance, ItemType, ICargoHolder
+using Buildings;
+using Extensions;           // ToShortCurrencyFormat (round-47b sell confirms)
+using Helpers;
+using Localizor;            // .Localize (native confirm-dialog bodies)
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Business-helper interaction routing (round-32, Phase 2 of business permissions). A granted HELPER's
+    /// stocking actions in another player's business must change the OWNER's authoritative building data,
+    /// never the local replica. Where an action moves cargo between two owner-authoritative containers
+    /// (stock displays, producers, storage), we forward the OPERATION and the owner's machine runs the
+    /// game's own logic on it. See docs/PERMISSIONS-SYSTEM.md (Business Permissions).
+    /// (The round-35→37 shelf/register probe fleet was retired 2026-07-05 after the ActiveVehicleId
+    /// null-contract root fix — see the context log rounds 37a-37m for the investigation record.)
+    /// </summary>
+    internal static class BusinessHelperRoute
+    {
+        /// <summary>The local player stands in a business they hold a HELPER grant for (never true for
+        /// the owner, never true in residences). HousingFurniture.LocalHelperHere reads this too.</summary>
+        internal static bool HelperHere(out string addr)
+        {
+            addr = "";
+            try
+            {
+                return HelperAt(InstanceBehavior<BuildingManager>.Instance?.buildingRegistration, out addr);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>HelperHere for any registration. TRUE when the host-pushed helper set names the address, OR
+        /// (H-MERGERSTOCK-2) when it is a merger-FLIPPED partner shop that this machine does not book and whose LIVE
+        /// business type is a business - so a push that is late or missing (bundle 145749: the host set the shop's
+        /// type after renting it, and no refresh followed) can no longer turn a partner's till into an UNROUTED
+        /// replica write. The flip table also holds partners' HOMES: the live-type gate keeps helper behaviour out of
+        /// them. BooksHere keeps a stand-in for an absent owner booking locally. The host's own helper list keeps
+        /// counting merger membership exactly as before.</summary>
+        internal static bool HelperAt(BuildingRegistration? reg, out string addr)
+        {
+            addr = "";
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return false;
+                if (reg == null) return false;
+                addr = GameStateReader.AddressKey(reg);
+                // Review MEDIUM-1: the machine STANDING IN for an absent owner books this shop - it is never a
+                // helper here, whatever the host-sent list says (a merged owner's shop is in every member's
+                // list). Not BooksHere: inside a HousingFurniture.Enter scope the rented flag is raised, so
+                // BooksHere would read true for an ordinary permission helper.
+                if (MergerAbsence.SimulatesHere(addr)) return false;
+                if (GrantSync.IsHelperBusiness(addr)) return true;
+                if (!MergerFlip.IsFlipped(addr)) return false;          // inert without a merger (empty flip table)
+                if (MergerFlip.BooksHere(reg)) return false;             // this machine is the single writer here
+                return AccessSets.CountsAsBusiness(reg.businessTypeName);
+            }
+            catch { return false; }
+        }
+
+        // TILL-PUT-1 (M1): Routed = amounts actually left our hands for the owner. Handled = we consumed the
+        // gesture but moved NOTHING (one of the two toasts). Only Routed may stand in for a native deposit.
+        internal enum RefillResult { NotApplicable, Handled, Routed }
+
+        /// <summary>Shared helper-refill core (round-36d): pour the helper's held/vehicle cargo into a
+        /// single-slot stock station (producer OR cash register — same data shape: ItemInstance with one
+        /// stock CargoInstance) as routed owner-side ops. Optionally sets the stock name first (empty
+        /// station, "producerset" — bare name-set, refused if occupied), then puts amounts CLAMPED to the
+        /// station's remaining capacity ("producer" Ctx: owner-side single-slot merge guard + exact-amount
+        /// consume on our side). NotApplicable = shape didn't match; Handled = a toast, nothing moved;
+        /// Routed = amounts were actually sent to the owner (TILL-PUT-1 M1). Caller decides the fallback.</summary>
+        internal static RefillResult RouteStationRefill(ItemController? station, string addr)
+        {
+            try
+            {
+                var ii = station?.ItemInstance;
+                if (ii?.cargoInstances == null || ii.cargoInstances.Count != 1 || ii.ItemCached == null)
+                    return RefillResult.NotApplicable;
+
+                ICargoHolder? holder = !PlayerHelper.IsHoldingItem
+                    ? VehicleHelper.GetCurrentVehicle()
+                    : (ICargoHolder?)PlayerHelper.ItemInstanceInHands;
+                var src = holder?.GetCargoInstances();
+                if (src == null || src.Count == 0) return RefillResult.NotApplicable;
+
+                var stock = ii.cargoInstances[0];
+                string stockName = stock.itemName ?? "";
+                string id = ii.id?.ToString() ?? "";
+
+                if (string.IsNullOrEmpty(stockName))
+                {
+                    // Empty station: pick the first held item this station can showcase — the native
+                    // flow's selection rule — and ask the owner to load that name first.
+                    CargoInstance? fit = null;
+                    var can = station!.Item?.itemsThatCanShowcase;
+                    if (can != null)
+                        foreach (var c in src)
+                            if (c != null && !c.IsSealed && c.amount > 0)
+                                foreach (var y in can)
+                                    if (y == c.itemName) { fit = c; break; }
+                    if (fit == null) { PassengerHud.Toast("Nothing fitting to load this with."); return RefillResult.Handled; }
+                    stockName = fit.itemName;
+                    BuildingStorageSync.RequestSetStock(addr, id, stockName, "producerset");
+                }
+
+                int capacity = 0;
+                try
+                {
+                    foreach (var c in src)
+                        if (c != null && c.itemName == stockName) { capacity = c.GetMaxStockCapacity(ii); break; }
+                }
+                catch { }
+                int space = capacity - stock.amount;
+                if (capacity > 0 && space <= 0) { PassengerHud.Toast("It's already fully loaded."); return RefillResult.Handled; }
+
+                int routed = 0;
+                foreach (var c in new System.Collections.Generic.List<CargoInstance>(src))
+                {
+                    if (c == null || c.IsSealed || c.amount <= 0 || c.itemName != stockName) continue;
+                    int amt = capacity > 0 ? Math.Min(c.amount, space - routed) : c.amount;
+                    if (amt <= 0) break;
+                    BuildingStorageSync.RequestPut(addr, id, c.itemName, amt, c.paid, c.pricePerUnit, "producer");
+                    routed += amt;
+                }
+                if (routed == 0 && !string.IsNullOrEmpty(stock.itemName))
+                    return RefillResult.NotApplicable;   // held nothing matching an already-set station
+
+                Plugin.Logger.LogInfo($"[Business] helper station refill {routed}×{stockName} @'{addr}' ({station!.GetType().Name}) → routed to owner.");
+                return routed > 0 ? RefillResult.Routed : RefillResult.Handled;   // M1: a bare name-set moved nothing
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] station refill route: {ex.Message}"); return RefillResult.NotApplicable; }
+        }
+    }
+
+    /// <summary>The stock DROPDOWN's visibility refresh gates on IsPlayerOwnedBusiness inline — the same
+    /// scoped flip the overlay wraps use lets a helper see it. Patches the BASE implementation only:
+    /// SignController overrides this method separately (its dropdown stays owner-only).</summary>
+    [HarmonyPatch(typeof(ItemController), nameof(ItemController.UpdateSelectedStockOverlay))]
+    public static class Patch_ItemController_StockOverlay_Helper
+    {
+        static void Prefix()    { HousingFurniture.Enter(includeHelper: true); }
+        static void Finalizer() { HousingFurniture.Exit(); }
+    }
+
+    /// <summary>Round-38e — the register panel's REMOVE CONTENT button (DropdownOverlay.OnRemoveContentClick
+    /// → ItemController.RemoveStockInContent) ran NATIVELY for helpers: it emptied the REPLICA slot and
+    /// minted the contents box locally, while the owner's real station kept its stock — the field-proven
+    /// duplication (2026-07-07; the cargo authority shield stops the laundering, this routes the take
+    /// itself). Helper click → same native walk → RequestTake ctx "stationtake"; the owner empties the REAL
+    /// slot (native RemoveStockInContent semantics) and the box arrives via the take delivery. Empty hands
+    /// required up front — the deferred delivery makes the native merge-into-holder branch racy.</summary>
+    [HarmonyPatch(typeof(ItemController), nameof(ItemController.RemoveStockInContent))]
+    public static class Patch_ItemController_RemoveContent_HelperRoute
+    {
+        static bool Prefix(ItemController __instance)
+        {
+            try
+            {
+                if (!BusinessHelperRoute.HelperHere(out var addr)) return true;
+                var ii = __instance?.ItemInstance;
+                if (ii?.cargoInstances == null || ii.cargoInstances.Count != 1 || ii.ItemCached == null) return true;
+                if ((ii.ItemCached.type & (ItemType.PointOfSale | ItemType.ShowcaseShelf)) == 0) return true;
+                var stock = ii.cargoInstances[0];
+                string name = stock.itemName ?? "";
+                int shown = stock.amount;
+                if (string.IsNullOrEmpty(name) || shown <= 0) return false;   // replica shows nothing — never run native (replica mutation)
+                if (PlayerHelper.IsHoldingItem || PlayerHelper.IsUsingVehicle)
+                { PassengerHud.Toast("Empty your hands to take the contents."); return false; }
+                string a = addr, id = ii.id?.ToString() ?? "";
+                InstanceBehavior<GameManager>.Instance.playerController.SetGoal(__instance, delegate
+                {
+                    try
+                    {
+                        BuildingStorageSync.RequestTake(a, id, name, shown, paid: false, price: 0f, "stationtake");
+                        Plugin.Logger.LogInfo($"[Business] helper station take {shown}×{name} @'{a}' → routed to owner (owner truth decides the amount).");
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] station take: {ex.Message}"); }
+                });
+                return false;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] remove-content route: {ex.Message}"); return true; }
+        }
+    }
+
+    /// <summary>Round-38f — Phase 3 slice 1: let a helper MAN the register (the panel's WORK button was a
+    /// silent no-op: ButtonOverlay renders under the visibility flip so the button SHOWED, but the
+    /// click-time CanWork re-check ran unflipped — ShouldOpenWorkUI needs IsPlayerOwnedBusiness or a hired
+    /// job — and Work() returned false doing nothing). Flipping CanWork itself covers both callers
+    /// uniformly. What the helper gets is the OWNER's work mode (WorkActivity with a null job): no salary
+    /// (IsWorkingInPlayerBuilding skips the payout — "helping is donating" for free), native energy drain,
+    /// session bounded by the store's opening hours. Serving is currently COSMETIC on the helper's machine —
+    /// every economic step in FullServiceEmployee (paperbag entry :111, Pay-with-revenue :135, order
+    /// recording :154) gates on the unflipped IsPlayerOwnedBusiness, so no money moves and nothing records.
+    /// Order forwarding to the owner (the real Phase 3) comes after this slice answers whether customers
+    /// even queue on the helper's machine.</summary>
+    [HarmonyPatch(typeof(EmployeeStationController), nameof(EmployeeStationController.CanWork))]
+    public static class Patch_StationCanWork_Helper
+    {
+        static void Prefix()    { HousingFurniture.Enter(includeHelper: true); }
+        static void Finalizer() { HousingFurniture.Exit(); }
+    }
+
+    /// <summary>Round-39f — Phase 3 slice-2 step-2: ORDER FORWARDING. Order.Pay is the single point
+    /// every NPC checkout passes through (full-service serve :136, self-service, kiosk). On a helper's
+    /// machine the pay moves no money and records nothing (all owner-gated) — so when an NPC pays HERE
+    /// in a granted business, forward the paid order to the owner, who claims the schedule entry
+    /// (single-writer dedup), deducts real stock + a bag, and records it. Only orders born from the
+    /// owner's synced schedule forward (EntryIdOf null = a local stray — skip); each forwards once.</summary>
+    [HarmonyPatch(typeof(Order), nameof(Order.Pay))]
+    public static class Patch_Order_Pay_HelperForward
+    {
+        private static readonly System.Collections.Generic.HashSet<string> _sent = new();
+
+        /// <summary>H-SALEHOLE-1 rig read-only: how many distinct orders this machine has forwarded to an
+        /// owner this session (session-wide — the dedup ledger itself is the count).</summary>
+        internal static int SentCount => _sent.Count;
+
+        // ── H-SKIPDOUBLE-1 measurement (2026-09-20, read by the DEV lever `tilldupes`) ──────
+        /// <summary>Live NPC checkouts completed per shop address on this machine this session.
+        /// Order.Pay is the single point every NPC checkout passes through, and the abstract hourly
+        /// simulator does NOT call it (RetailBusinessSimulator.ProcessCustomer flags its own entries),
+        /// so this counts ONLY live serves - the half of the till-duplication question that the order
+        /// list cannot answer on its own. One dictionary write per checkout; nothing per frame. DEV BUILDS ONLY
+        /// (the body is compiled out of a release). CAVEATS: it keys on the building the LOCAL PLAYER stands in,
+        /// so it is meaningful only while that player stays in the measured shop; and shop types whose customers
+        /// never pass Order.Pay (a gym completes through Customer.CompleteOrder) read 0 here even when served live.
+        /// 0 for an address with no live checkout yet (the hook itself always exists in this build).</summary>
+        private static readonly System.Collections.Generic.Dictionary<string, int> _livePays = new();
+        internal static int LivePayCount(string addressKey)
+            => (!string.IsNullOrEmpty(addressKey) && _livePays.TryGetValue(addressKey, out var n)) ? n : 0;
+        private static void NoteLivePay()
+        {
+#if BAMP_DEV   // review MEDIUM: a measurement for a DEV lever must cost a release build nothing (it allocated a key per checkout)
+            try
+            {
+                var regL = InstanceBehavior<BuildingManager>.Instance?.buildingRegistration;
+                if (regL == null) return;
+                string kL = GameStateReader.AddressKey(regL);
+                if (string.IsNullOrEmpty(kL)) return;
+                _livePays.TryGetValue(kL, out var nL);
+                _livePays[kL] = nL + 1;
+            }
+            catch { }
+#endif
+        }
+
+        static void Postfix(Order __instance, bool isPlayer, bool __result)
+        {
+            try
+            {
+                if (!__result || isPlayer || __instance == null) return;
+                NoteLivePay();   // H-SKIPDOUBLE-1 census - before the helper gate, so an OWNER counts too
+#if BAMP_DEV
+                CustomerHandoff.SdNotePaid(__instance);   // H-HANDOFF-1 stock oracle: an Order paid by a live checkout here
+#endif
+                if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return;
+                if (!BusinessHelperRoute.HelperHere(out var addr)) return;
+                string? entryId = CustomerEntrySync.EntryIdOf(__instance);
+                if (string.IsNullOrEmpty(entryId) || _sent.Contains(entryId)) return;
+
+                var payload = new HelperOrderPayload { AddressKey = addr, PlayerId = MPConfig.PlayerId, EntryId = entryId! };
+                // Recheck B1: native prices AND judges acceptability inside the owner gate
+                // (FullServiceEmployee.CheckConditions :175-185), so on this helper machine every
+                // entry arrives priced 0 and un-judged. Judge it HERE with the live customer's own
+                // tolerance against this machine's synced price table (the owner re-prices on adopt
+                // from its authoritative table; the price sent is an audit figure). No live citizen
+                // known (a stray) → a random neighborhood citizen, exactly what the native abstract
+                // simulators use (OfficeBusinessSimulator :45, RetailBusinessSimulator :209).
+                var regH = InstanceBehavior<BuildingManager>.Instance?.buildingRegistration;
+                var citizen = CustomerEntrySync.CitizenFor(__instance);
+                if (citizen == null && regH != null)
+                {
+                    try { citizen = AI.Citizens.CitizenHelper.CreateRandomCitizenDataNonAlloc(regH.Neighborhood); } catch { }
+                }
+                int refused = 0;
+                foreach (var e in __instance.entries)
+                {
+                    if (e == null || !e.paid || string.IsNullOrEmpty(e.itemName)) continue;
+                    float price = e.price;
+                    try { if (price <= 0f && regH != null) price = ItemHelper.GetPrice(e.itemName, regH); } catch { }
+                    bool acceptable = true;
+                    try { if (citizen != null) acceptable = citizen.IsPriceAcceptable(e.itemName, price); } catch { }
+                    if (!acceptable) refused++;
+                    payload.Items.Add(new OrderEntryInfo { ItemName = e.itemName, Price = price, WholesalePrice = e.wholesalePrice, Acceptable = acceptable });
+                }
+                if (payload.Items.Count == 0) return;   // empty basket — nothing real happened
+                _sent.Add(entryId!);
+
+                if (MPServer.IsRunning) MPServer.HandleHelperOrder(payload, MPConfig.PlayerId);
+                else                    MPClient.SendEnvelope(MessageEnvelope.Create(MessageType.HelperOrderForward, MPConfig.PlayerId, payload));
+                Plugin.Logger.LogInfo($"[Business] forwarded helper-served order {entryId} ({payload.Items.Count} item(s){(refused > 0 ? $", {refused} priced too high for this customer" : "")}{(citizen == null ? ", no citizen — unjudged" : "")}) @'{addr}' → owner.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] order forward: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>Round-39e — complaint parity: a just-arrived customer's complaint bubbles
+    /// (Customer.Init :204 → ComplainAboutUnfulfilledDemands) gate on IsPlayerOwnedBusiness, so the
+    /// owner saw customers complain about shop shortcomings and a helper never did. The scoped flip
+    /// makes Init's two ownership reads (:196 demand score, :204 complain) pass for helpers; the
+    /// complaint data is real on this machine now that entries carry customerDemandTypes and the
+    /// snapshot carries the fulfilled-demand set (round-39e sync). Cosmetic-only: the expression
+    /// coroutine plays audio + an emoji bubble, no economy writes.</summary>
+    [HarmonyPatch(typeof(Customer), nameof(Customer.Init))]
+    public static class Patch_Customer_Init_HelperComplaints
+    {
+        static void Prefix()    { HousingFurniture.Enter(includeHelper: true); }
+        static void Finalizer() { HousingFurniture.Exit(); }
+        // Recheck B1: remember which live citizen owns which order, so the forward at Order.Pay can
+        // run the price-acceptability check the owner gate hid from this machine (registry, not a
+        // scene sweep — design principle 3).
+        static void Postfix(Customer __instance)
+        {
+            try { if (__instance != null && __instance.order != null && __instance.citizenData != null) CustomerEntrySync.RecordCitizen(__instance.order, __instance.citizenData); } catch { }
+        }
+    }
+
+    // (register-npc investigation CLOSED 2026-07-07: the [StaffProbe] run showed exactly ONE
+    // AssignEmployee — tpc='Player' isPlayer=True via WorkActivity.StartWorking — no rogue spawner.
+    // The "NPC on top" was the native business-uniform overlay applied to the working player, same as
+    // an owner working their own register; the look restores on stop. Probe retired.)
+
+    /// <summary>Round-38f — when the helper STOPS working, WorkActivity.Finish's deferred branch (:185-191,
+    /// runs one frame later so no scoped flip can cover it) sees a non-owner building and calls
+    /// AssignAiToEmployeeStation — minting a phantom AI cashier on the helper's replica register. Skip it in
+    /// helper businesses; its two native call sites are AI-shop setup (HelperHere false there) and this
+    /// Finish branch, so nothing legitimate is lost.</summary>
+    [HarmonyPatch(typeof(BuildingManager), nameof(BuildingManager.AssignAiToEmployeeStation))]
+    public static class Patch_AssignAi_HelperGuard
+    {
+        static bool Prefix()
+        {
+            try { return !BusinessHelperRoute.HelperHere(out _); }
+            catch { return true; }
+        }
+    }
+
+    /// <summary>Round-38 — hover-tooltip parity: the stock overlay ("Contents: …" + "0/1000") gates on
+    /// IsPlayerOwnedBusiness (StockOverlay.ShouldShow), so a helper hovering the owner's register saw only
+    /// the bare-name tooltip while the owner saw contents+amount — the two players were reading DIFFERENT
+    /// facts off the same machine. Read-only overlay (GetStockInstance), so the same scoped visibility flip
+    /// the dropdown wrap uses is safe here.</summary>
+    [HarmonyPatch(typeof(Player.HUD.ItemInfoOverlays.StockOverlay),
+                  nameof(Player.HUD.ItemInfoOverlays.StockOverlay.ShouldShow))]
+    public static class Patch_StockOverlay_HelperParity
+    {
+        static void Prefix()    { HousingFurniture.Enter(includeHelper: true); }
+        static void Finalizer() { HousingFurniture.Exit(); }
+    }
+
+    /// <summary>A helper picking a stock type routes the change to the owner instead of mutating the
+    /// replica (native OnStockOptionSelected shuffles cargo between the display, storage shelves, and
+    /// parked vehicles — ALL owner-authoritative). Targets the private string overload so both the
+    /// dropdown's int path and any direct calls are covered. Gated to stock DISPLAYS by FLAGS
+    /// (PointOfSale/ShowcaseShelf) or — TILL-PUT-1 — by SHAPE: a single-slot station that DECLARES
+    /// showcasable items but whose flags carry neither (the reporter's cash register) used to fall through
+    /// to the NATIVE body, so the pick landed
+    /// on the replica and the owner's absolute cargo statement wiped it. Signs never reach this base string
+    /// overload (SignController overrides the int one), and producers route through the Producer patch below.</summary>
+    [HarmonyPatch(typeof(ItemController), "OnStockOptionSelected", typeof(string), typeof(UI.Elements.Dropdown))]
+    public static class Patch_ItemController_StockSelect_HelperRoute
+    {
+        // TILL-PUT-1: one line per station whose flags did not name it but whose shape did.
+        private static readonly System.Collections.Generic.HashSet<string> _shapeLogged = new System.Collections.Generic.HashSet<string>();
+
+        static bool Prefix(ItemController __instance, string stockItemName)
+        {
+            try
+            {
+                if (!BusinessHelperRoute.HelperHere(out var addr))
+                {
+                    // PUT-PERM-1 (2026-09-18): the dropdown's native body shuffles cargo between the
+                    // display, the storage shelves and parked vehicles — all of it the OWNER's. An
+                    // UNGRANTED visitor doing that only mutates their own replica, so refuse it with the
+                    // same message as the shelf/fridge put. A granted helper falls into the route above.
+                    if (MPPatches.Patch_ItemController_TryToGrabItem_ForeignShopGate.RefusedForeignGrab(out string putOwner))
+                    {
+                        MPPatches.Patch_ItemController_TryToGrabItem_ForeignShopGate.PutRefusalToast(putOwner, "the stock dropdown");
+                        return false;
+                    }
+                    return true;
+                }
+                var ii = __instance?.ItemInstance;
+                if (ii == null || ii.ItemCached == null) return true;
+                bool byFlags = (ii.ItemCached.type & (ItemType.PointOfSale | ItemType.ShowcaseShelf)) != 0;
+                // L1: one slot alone is too wide a net (a one-slot decorative prop would match too). Require a
+                // STOCK station: one that declares items it can showcase. Enumerated rather than counted so the
+                // test holds whatever collection type the game hands back.
+                bool canShowcase = false;
+                try
+                {
+                    var cs = __instance!.Item?.itemsThatCanShowcase;
+                    if (cs != null) foreach (var s in cs) { canShowcase = true; break; }
+                }
+                catch { }
+                bool byShape = ii.cargoInstances != null && ii.cargoInstances.Count == 1 && canShowcase;   // stock station (TILL-PUT-1 L1)
+                if (!byFlags && !byShape) return true;
+                if (!byFlags && _shapeLogged.Add(ii.id?.ToString() ?? ii.itemName ?? "?"))
+                    Plugin.Logger.LogInfo($"[Business] helper stock-select on '{ii.itemName}' type={ii.ItemCached.type} routed by shape (TILL-PUT-1)");
+                BuildingStorageSync.RequestSetStock(addr, ii.id?.ToString() ?? "", stockItemName ?? "");
+                Plugin.Logger.LogInfo($"[Business] helper stock-select '{stockItemName}' on {ii.itemName} @'{addr}' → routed to owner.");
+                return false;   // the owner's interior push re-renders the shelf; nothing to change locally
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] stock-select route: {ex.Message}"); return true; }
+        }
+    }
+
+    /// <summary>Round-49 slice 5 — SIGN parity. SignController's IO methods gate on IsPlayerOwnedBusiness
+    /// (decompile :66/:78): non-owners get redirected to the linked item's customer overlay instead of the
+    /// sign's own owner overlay (whose dropdown the already-wrapped base UpdateSelectedStockOverlay shows).
+    /// Read-only routing decisions — same scoped-flip family as the CTA/overlay wraps.</summary>
+    [HarmonyPatch(typeof(Controllers.SignController), nameof(Controllers.SignController.OnIoEnter))]
+    public static class Patch_SignController_IoEnter_Helper
+    {
+        static void Prefix()    { HousingFurniture.Enter(includeHelper: true); }
+        static void Finalizer() { HousingFurniture.Exit(); }
+    }
+
+    [HarmonyPatch(typeof(Controllers.SignController), nameof(Controllers.SignController.OnIoLeftClick))]
+    public static class Patch_SignController_IoLeftClick_Helper
+    {
+        static void Prefix()    { HousingFurniture.Enter(includeHelper: true); }
+        static void Finalizer() { HousingFurniture.Exit(); }
+    }
+
+    /// <summary>Round-49 slice 5 — the sign's dropdown pick. SignController overrides the INT overload and
+    /// sets ItemInstance.linkedItemName directly (self-gated on IsPlayerOwnedBusiness, :97) — it never
+    /// reaches the base string overload our generic stock-select route patches. linkedItemName is a pure
+    /// display link (no cargo moves), so the route is: set the replica for instant feedback, send
+    /// "signset" to the owner (authoritative), whose interior push carries linkedItemName back to every
+    /// client (it's in the snapshot hash + apply, GameStatePatcher :1936/:1968).</summary>
+    [HarmonyPatch(typeof(Controllers.SignController), nameof(Controllers.SignController.OnStockOptionSelected),
+                  typeof(int), typeof(UI.Elements.Dropdown))]
+    public static class Patch_SignController_StockSelect_HelperRoute
+    {
+        static bool Prefix(Controllers.SignController __instance, int stockIndex)
+        {
+            try
+            {
+                if (!BusinessHelperRoute.HelperHere(out var addr)) return true;
+                var ii = __instance?.ItemInstance;
+                var st = __instance?.StockTypes;
+                if (ii == null || st == null || stockIndex < 0 || stockIndex >= st.Count) return false;   // helper + bad pick: mirror the native no-op
+                string newName = st[stockIndex] == "ba:itemname_undefined" ? string.Empty : st[stockIndex];
+                ii.linkedItemName = newName;   // optimistic local — the owner's next interior push confirms it
+                try { HarmonyLib.AccessTools.Method(typeof(Controllers.SignController), "SetInfo")?.Invoke(__instance, null); } catch { }
+                BuildingStorageSync.RequestSetStock(addr, ii.id?.ToString() ?? "", newName, "signset");
+                Plugin.Logger.LogInfo($"[Business] helper sign-select '{newName}' on {ii.itemName} @'{addr}' → routed to owner.");
+                return false;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] sign-select route: {ex.Message}"); return true; }
+        }
+    }
+
+    /// <summary>2026-09-12 (I1, supersedes round-34's blanket suppress): WARNING ICONS are the shop
+    /// floor's shared state, not owner-only UI — a helper or a merger co-member restocking someone
+    /// else's shelves could not see which shelf was empty. Native gates the icon on
+    /// <c>alwaysShowWarningIcon || BuildingManager.IsPlayerOwnedBusiness || CanInteractInAnyBusiness</c>
+    /// (decompile ItemWarningIconManager :140-149), and IsPlayerOwnedBusiness is just
+    /// <c>buildingRegistration.RentedByPlayer</c> (BuildingManager :187) — so the same scoped visibility
+    /// flip the stock-overlay wrap uses gives a visitor icon PARITY. Held back: the licensing-fee Danger.
+    /// Its requirement (Furniture.Requirements.HasActiveLicensingFee :13-30) early-returns "met" while
+    /// <c>!RentedByPlayer</c> and otherwise reads the OWNER's local fee schedule, which a visitor does not
+    /// hold — under the flip it would fabricate a red exclamation off our own save. Read-only: the icon
+    /// itself is inert (no button, no tooltip) and nothing here mutates the replica.
+    ///
+    /// D4 (user rule 2026-09-18) rides this SAME prefix — one patch on one method, never two competing
+    /// ones. Its subject is the opposite case: a HAMPTONS item in a house the local player has no access
+    /// to. Native's IsPlayerOwnedBusiness term is the ACTIVE building's RentedByPlayer, so a player
+    /// standing on their OWN Hamptons plot lit up every icon over the NEIGHBOUR's furniture, item by item
+    /// as it came on screen (ItemController.OnBecameVisible :444). That item is hidden the way native
+    /// hides one and the original is skipped.</summary>
+    [HarmonyPatch(typeof(Player.HUD.ItemWarningIcons.ItemWarningIconManager),
+                  nameof(Player.HUD.ItemWarningIcons.ItemWarningIconManager.UpdateWarningIcon), typeof(ItemController))]
+    public static class Patch_WarningIcons_VisitorParity
+    {
+        /// <summary>Set by the prefix when IT opened the flip, cleared by the finalizer. Main-thread
+        /// only (UpdateWarningIcon is a HUD call) and never re-entrant.</summary>
+        private static bool _flipped;
+        /// <summary>Edge detection for the once-per-building log line.</summary>
+        private static string _notedAddr = "";
+
+        // Fold f (review r1 MAJOR-1): the patched method is an INSTANCE method of the ICON MANAGER, so
+        // Harmony's `__instance` is the manager, not the item - the item is the method's argument and
+        // is injected by its parameter NAME (`itemController`). The first build declared
+        // `ItemController __instance` and would have read the manager through an item-typed reference.
+        static bool Prefix(Player.HUD.ItemWarningIcons.ItemWarningIconManager __instance, ItemController itemController)
+        {
+            _flipped = false;
+            try
+            {
+                // D4: a stranger's Hamptons furniture shows no icon. First, because it is about a
+                // RESIDENCE and the helper rule below is about a business the local player works in; a
+                // granted guest is not suppressed here and keeps exactly what that rule gives them.
+                // HideWarningIcon(ItemController) is native's own public overload onto the private
+                // hash-keyed remover (GetHashCode of the controller) — the same key UpdateWarningIcon
+                // would have used, so any icon already pooled for this item is released.
+                if (itemController != null && itemController.loadedInHamptonsHouse
+                    && HamptonsAccess.IconsSuppressedHere(itemController, out _))
+                {
+                    try { __instance?.HideWarningIcon(itemController); }
+                    catch (Exception hx) { Plugin.Logger.LogWarning($"[Hamptons] hide warning icon: {hx.Message}"); }
+                    return false;
+                }
+                if (!BusinessHelperRoute.HelperHere(out var addr)) { _notedAddr = ""; return true; }
+                if (itemController == null) return true;
+                if (itemController.CanInteractInAnyBusiness) return true;   // native already shows this one to everyone
+                HousingFurniture.Enter(includeHelper: true);
+                _flipped = true;
+                NoteEntry(addr);
+                if (itemController.GetWarningIconType() != Player.HUD.ItemWarningIcons.WarningIconType.Danger) return true;
+                var missing = ItemHelper.GetMissingRequirements(itemController.ItemInstance);   // decompile ItemHelper :526
+                if (missing != null)
+                    foreach (var r in missing)
+                        if (r is Furniture.Requirements.HasActiveLicensingFee)
+                            return false;   // the owner's fee schedule — not ours to render
+                return true;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] warning-icon parity: {ex.Message}"); return true; }
+        }
+
+        static void Finalizer()
+        {
+            try { if (_flipped) { _flipped = false; HousingFurniture.Exit(); } }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] warning-icon parity exit: {ex.Message}"); }
+        }
+
+        /// <summary>One line per building entry (edge-detected by address), naming which grant it is:
+        /// a merger co-member is a helper to GrantSync (HelperAddressKeys unions merger membership), so
+        /// the owner pid decides the wording.</summary>
+        private static void NoteEntry(string addr)
+        {
+            if (string.IsNullOrEmpty(addr) || _notedAddr == addr) return;
+            _notedAddr = addr;
+            bool coMember = false;
+            try { coMember = CompanyLists.TryOwnerOfAddress(addr, out var owner) && !string.IsNullOrEmpty(owner) && MergerSync.IsMemberPid(owner); }
+            catch { }
+            Plugin.Logger.LogInfo($"[Business] warning icons shown as {(coMember ? "co-member" : "helper")} in '{addr}' (licensing icon withheld).");
+        }
+    }
+
+    /// <summary>A helper REFILLING a producer (pouring held/vehicle ingredients into it). The native
+    /// owner-branch never runs for a helper (RentedByPlayer is unflipped at Interact time), so this
+    /// prefix IMPLEMENTS the refill as routed ops. Falls through to the native (customer) flow whenever
+    /// the refill shape doesn't apply.</summary>
+    [HarmonyPatch(typeof(Producer), nameof(Producer.Interact))]
+    public static class Patch_Producer_Interact_HelperRefill
+    {
+        static bool Prefix(Producer __instance, ref bool __result)
+        {
+            try
+            {
+                if (!BusinessHelperRoute.HelperHere(out var addr)) return true;
+                // Visitor-shopping producers (purchaser-enabled) keep their native customer flow.
+                try { var ps = __instance.playerItemPurchaserSettings; if (ps != null && ps.enabled) return true; } catch { }
+                // M1: Handled (a toast) and Routed (a real put) both CONSUME the gesture here — only
+                // NotApplicable falls through to the native body.
+                if (BusinessHelperRoute.RouteStationRefill(__instance, addr) != BusinessHelperRoute.RefillResult.NotApplicable)
+                { __result = true; return false; }
+                return true;   // shape didn't match → native (customer) flow
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] producer refill route: {ex.Message}"); return true; }
+        }
+    }
+
+    /// <summary>Round-37b — the register deposit's REAL click path: no CTA behavior reliably claims the
+    /// register, so the owner's deposit rides the null-CTA fallback (overlay refuses → WalkOverAndInteract
+    /// → Producer.Interact owner-merge); the helper never gets there because our visibility flip makes the
+    /// register's overlay SHOW, eating the click. Fix at the decision point: after UpdateCta, if nothing
+    /// claimed the click and the helper's cargo fits the register, BIND the click action directly
+    /// (CtaManager.ctaKey/ctaAction are public statics) — the click then runs the routed refill and the
+    /// overlay never opens, mirroring the owner's experience.</summary>
+    [HarmonyPatch(typeof(Player.HUD.ItemInfoOverlays.CtaManager),
+                  nameof(Player.HUD.ItemInfoOverlays.CtaManager.UpdateCta))]
+    [HarmonyPriority(HarmonyLib.Priority.Last)]   // run after the visibility wrap's own postfix ordering
+    public static class Patch_RegisterCta_HelperBind
+    {
+        static void Postfix(EntityController entityController)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(Player.HUD.ItemInfoOverlays.CtaManager.ctaKey)) return;   // something claimed it — keep
+                if (Player.HUD.ItemInfoOverlays.CtaManager.ctaAction != null) return;
+                var reg = entityController as Controllers.CashRegisterController;
+                if (reg == null) return;
+                if (!BusinessHelperRoute.HelperHere(out var addr)) return;
+                if (!PlayerHelper.HasPaidForAllItems()) return;   // shopper flow keeps priority
+                bool can = false;
+                try
+                {
+                    if (PlayerHelper.IsUsingVehicle && VehicleHelper.GetCurrentVehicle() != null)
+                        can = reg.CanAddAnyToInventory(VehicleHelper.GetCurrentVehicle().cargoInstances);
+                    else if (PlayerHelper.IsHoldingItem && PlayerHelper.ItemInstanceInHands != null)
+                        can = reg.CanAddAnyToInventory(PlayerHelper.ItemInstanceInHands.cargoInstances);
+                }
+                catch { }
+                if (!can) return;
+                var ec = entityController; string a = addr;
+                Player.HUD.ItemInfoOverlays.CtaManager.ctaKey = "click_to_add_inventory";
+                Player.HUD.ItemInfoOverlays.CtaManager.ctaAction = delegate
+                {
+                    try
+                    {
+                        InstanceBehavior<GameManager>.Instance.playerController.SetGoal(ec, delegate
+                        {
+                            BusinessHelperRoute.RouteStationRefill(ec as ItemController, a);
+                        });
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] helper register refill: {ex.Message}"); }
+                };
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>Round-47 (slice 2b) — helpers get the storage manage panel, GUARDED. History: round-37b
+    /// blocked the whole panel because its take/sell/discard mutate the LOCAL replica (a take duplicated
+    /// 1000 bags) and sell credits the LOCAL wallet. Now: the panel OPENS for helpers; per-row rewiring
+    /// lives in Patch_CargoItemUi_HelperRoute (take → routed "boxtake"; sell/discard hidden); the
+    /// sell-all button hides + its handler hard-blocks below.</summary>
+    internal static class HelperStorageGuard
+    {
+        /// <summary>The building-owned ItemInstance behind a manage-panel holder when the local player is
+        /// a business HELPER **or a housing GUEST** here (round-47c: the storage panel serves both grant
+        /// kinds — the BStore relay/apply gates accept Housing OR Business) — null in every
+        /// owner/non-building case (native behavior untouched).</summary>
+        internal static ItemInstance? HelperBuildingHolder(ICargoHolder? holder, out string addr)
+        {
+            addr = "";
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return null;
+                var ii = holder as ItemInstance;
+                if (ii == null) return null;   // own vehicles/boxes etc. — not building-owned
+                // The player's own HAND item is never building storage.  The native grab is
+                // hands-first, reg-removal-second (TryToGrabItem :599 vs :637) with the item
+                // panel rebuilt synchronously in between (AddItemToHands :326), so a just-grabbed
+                // box sits in BOTH hands and reg.itemInstances when the rows build — without this
+                // guard the rewire below treated it as storage and hid the native Place button
+                // for guests only (the owner never enters this gate; the parity gap).  Identity
+                // against the game's own hand variable, the Stage-0 hand-slot rule's shape.
+                if (ReferenceEquals(ii, PlayerHelper.ItemInstanceInHands)) return null;
+                if (!HousingFurniture.LocalGuestHere() && !HousingFurniture.LocalHelperHere()) return null;
+                var reg = InstanceBehavior<BuildingManager>.Instance?.buildingRegistration;
+                if (reg == null) return null;
+                addr = GameStateReader.AddressKey(reg);
+                bool inBuilding = false;
+                try { inBuilding = reg.itemInstances != null && ii.id != null && reg.itemInstances.ContainsKey(ii.id.ToString()); } catch { }
+                return inBuilding ? ii : null;
+            }
+            catch { return null; }
+        }
+    }
+
+    /// <summary>Round-47b (full parity, user: the grant is trust-scoped) — helper SELL ALL: same
+    /// confirm-then-act shape as native, but every removal routes to the owner; the sale money credits
+    /// the helper's wallet per group verdict (Transfers exist for gifting it back).</summary>
+    [HarmonyPatch(typeof(UI.MergeCargo.ManageCargoUi), "OnSellAllClick")]
+    public static class Patch_ManageCargo_HelperSellAll
+    {
+        static bool Prefix(UI.MergeCargo.ManageCargoUi __instance)
+        {
+            try
+            {
+                var ii = HelperStorageGuard.HelperBuildingHolder(__instance.currentCargoHolder, out var addr);
+                if (ii == null) return true;
+                // Group the holder's PAID non-sealed instances by identity (name+amount+paid) — the same
+                // grouping the panel rows use.
+                var groups = new System.Collections.Generic.Dictionary<string, (CargoInstance first, int count)>();
+                float total = 0f;
+                var src = __instance.currentCargoHolder.GetCargoInstances();
+                if (src != null)
+                    foreach (var ci in src)
+                    {
+                        if (ci == null || !ci.paid || ci.IsSealed) continue;
+                        string k = $"{ci.itemName}|{ci.amount}";
+                        groups[k] = groups.TryGetValue(k, out var g) ? (g.first, g.count + 1) : (ci, 1);
+                        try { total += ci.GetSellingPrice(); } catch { }
+                    }
+                if (groups.Count == 0) return false;
+                string itemId = ii.id?.ToString() ?? "";
+                HudConfirm.Show(default, "manage_cargo_sell_all_confirm".Localize(new
+                {
+                    cargoName = __instance.currentCargoHolder.GetCargoName(),
+                    totalPrice = total.ToShortCurrencyFormat(),
+                }), delegate
+                {
+                    foreach (var kv in groups)
+                        BuildingStorageSync.RequestStackOp(addr, itemId, kv.Value.first.itemName, kv.Value.first.amount,
+                                                           paid: true, kv.Value.first.pricePerUnit, kv.Value.count, sell: true);
+                    Plugin.Logger.LogInfo($"[Business] helper SELL ALL routed: {groups.Count} group(s) @'{addr}'.");
+                });
+                return false;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] sell-all route: {ex.Message}"); return true; }
+        }
+    }
+
+    /// <summary>NULLNAME-1 (bundle 20260918-013040) — CRASH GUARD, single-player included. Vanilla
+    /// CargoItemUi.SetUp (decompile UI.PlayerHUD/CargoItemUi.cs:110-121) builds a Dictionary keyed on
+    /// nestedCargoInstance.itemName for an UNSEALED container: a nested entry whose name is NULL throws
+    /// ArgumentNullException out of TryGetValue. That abort lands inside ItemPanelUI.SetVehicle, which
+    /// VehicleController.EnterVehicle calls at :357 — AFTER :340-341 already set ActiveVehicleId and
+    /// controlledByPlayer — so the player half-possesses a hand truck that was never parented and every
+    /// later click throws again. Strip the nameless entries before the native body sees them: REMOVE,
+    /// never blank, because "" flows on into the label lookup and the dictionary indexer at :121.
+    /// This is a repair of data already sitting in a save, so it must run outside multiplayer too.</summary>
+    [HarmonyPatch(typeof(UI.PlayerHUD.CargoItemUi), nameof(UI.PlayerHUD.CargoItemUi.SetUp))]
+    public static class Patch_CargoItemUi_DropNamelessNested
+    {
+        private static int _logged;
+
+        /// <summary>FOLD F3: the native SetUp reads ONLY cargoInstances[0] (decompile
+        /// UI.PlayerHUD/CargoItemUi.cs:95, :101, :111 — firstCargoInstance and its
+        /// nestedCargoInstances), so that is the only instance we strip; the other slots keep
+        /// their data.</summary>
+        private static BigAmbitions.Items.CargoInstance? FirstCargoInstance(BigAmbitions.Items.CargoItem? cargoItem)
+        {
+            var list = cargoItem?.cargoInstances;
+            return (list == null || list.Count == 0) ? null : list[0];
+        }
+
+        static void Prefix(BigAmbitions.Items.CargoItem cargoItem)
+        {
+            try
+            {
+                var ci = FirstCargoInstance(cargoItem);
+                if (ci == null) return;
+                {
+                    var nested = ci.nestedCargoInstances;
+                    if (nested == null || nested.Count == 0) return;
+                    int dropped = 0;
+                    for (int i = nested.Count - 1; i >= 0; i--)
+                    {
+                        var n = nested[i];
+                        if (n != null && n.itemName != null && n.itemName.Length > 0) continue;
+                        nested.RemoveAt(i);
+                        dropped++;
+                    }
+                    if (dropped > 0 && _logged++ < 20)
+                        Plugin.Logger.LogWarning($"[Cargo] dropped {dropped} nameless nested entr(ies) from '{ci.itemName}' (NULLNAME-1)"
+                                                 + (nested.Count == 0 ? " - container now empty" : ""));
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Cargo] Patch_CargoItemUi_DropNamelessNested: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>Round-47 — per-row rewiring for helpers on building storage: SELL/DISCARD route the
+    /// removal to the owner (money credits the helper), the item click becomes a ROUTED box take — the
+    /// owner removes the real sealed box (contents echoed over the wire) and it lands in the helper's
+    /// hands, exactly like the owner's own ClickItem take. Empty hands required (deferred delivery makes
+    /// holder-merge racy). Round-49 (helper parity): the action button's one building-holder action —
+    /// PLACE furniture from a delivery spot — is re-enabled with the reduce routed ("placereduce"; the
+    /// placement itself rides the native flow + the existing guest interior forward), and vehicle-type
+    /// cargo (stored hand trucks / flatbeds) becomes a routed take that spawns the vehicle LOCALLY as the
+    /// HELPER'S OWN ("vehicletake"; user ruling 2026-07-21: valueless + freely spawnable, so the taker
+    /// keeps it — re-storing it into owner storage gifts it back).</summary>
+    [HarmonyPatch(typeof(UI.PlayerHUD.CargoItemUi), nameof(UI.PlayerHUD.CargoItemUi.SetUp))]
+    public static class Patch_CargoItemUi_HelperRoute
+    {
+        static void Postfix(UI.PlayerHUD.CargoItemUi __instance, BigAmbitions.Items.CargoItem cargoItem, ICargoHolder cargoHolder)
+        {
+            try
+            {
+                ICargoHolder? holder = cargoHolder;
+                if (holder == null)
+                    try { holder = InstanceBehavior<UI.UIs>.Instance?.playerHUD?.manageCargoUI?.currentCargoHolder; } catch { }
+                var ii = HelperStorageGuard.HelperBuildingHolder(holder, out var addr);
+                if (ii == null) return;
+                if (cargoItem?.cargoInstances == null || cargoItem.cargoInstances.Count == 0) return;
+                var first = cargoItem.cargoInstances[0];
+                if (first == null) return;
+
+                string name = first.itemName ?? "";
+                int amount = first.amount; bool paid = first.paid; float price = first.pricePerUnit;
+                int stackCount = cargoItem.cargoInstances.Count;
+                bool isSealed = first.IsSealed;
+                // Bundle rows (user-approved 2026-08-25): native grouping makes every nested-bearing
+                // row a SINGLETON (stackCount==1), and its sell price below is already
+                // nested-inclusive (first.GetSellingPrice includes contents) — only the ROUTE and
+                // the CREDIT needed the bundle channel (the plain stack matcher skips bundles,
+                // F-2026-08-25-H, which had turned bundle sells into refusals). Nested is STATE:
+                // read LIVE at click, like the take predicate below (review MINOR-3 — both
+                // directions of staleness fail safe to "gone", but the two predicates over one
+                // field must not disagree on when they read it).
+                System.Func<bool> isBundleRow = () =>
+                { try { return first.nestedCargoInstances != null && first.nestedCargoInstances.Count > 0; } catch { return false; } };
+                string itemId = ii.id?.ToString() ?? "";
+
+                // Round-47b (full parity): SELL/DISCARD stay visible per the native rules (paid→sell,
+                // unpaid→discard, sealed→neither) but the click routes the REMOVAL to the owner; on a
+                // sell the money credits the helper's own wallet at verdict time.
+                var sellBtn = Btn("sellButton");
+                if (sellBtn != null && sellBtn.gameObject.activeSelf)
+                {
+                    sellBtn.onClick.RemoveAllListeners();
+                    sellBtn.onClick.AddListener(delegate
+                    {
+                        try
+                        {
+                            float sellTotal = 0f;
+                            try { sellTotal = first.GetSellingPrice() * stackCount; } catch { }
+                            // Native confirm shape (user-approved 2026-08-25, the trunk panel's twins):
+                            // localized name + "(NxM) " prefix when the amount label shows (CargoItemUi
+                            // :112-116/:180-186 — nested rows hide the amount label, so name only).
+                            bool hasNested = false;
+                            try { hasNested = first.nestedCargoInstances != null && first.nestedCargoInstances.Count > 0; } catch { }
+                            string amtText = (!hasNested && stackCount * amount != 1) ? $"{stackCount}x{amount}" : "";
+                            string locName = VehicleStoragePanel.Localize(name);
+                            HudConfirm.Show(default, "itempanelui_hud_confirm_sellitem".Localize(new
+                            {
+                                type = string.IsNullOrEmpty(amtText) ? locName : "(" + amtText + ") " + locName,
+                                price = sellTotal.ToShortCurrencyFormat(),
+                            }), delegate
+                            {
+                                System.Action doSell = () =>
+                                {
+                                    if (isBundleRow())
+                                    {
+                                        BuildingStorageSync.RequestBundleOp(addr, itemId, name, amount, paid, price, sell: true);
+                                        Plugin.Logger.LogInfo($"[Business] helper bundle sell {name}×{amount} @'{addr}' → routed (nested-inclusive credit at verdict).");
+                                    }
+                                    else
+                                    {
+                                        BuildingStorageSync.RequestStackOp(addr, itemId, name, amount, paid, price, stackCount, sell: true);
+                                        Plugin.Logger.LogInfo($"[Business] helper stack sell {stackCount}×({name}×{amount}) @'{addr}' → routed.");
+                                    }
+                                };
+                                // Native second confirm for special gifts (CargoItemUi :189-196) —
+                                // the helper keeps the owner's friction (trunk twin, same day).
+                                bool gift = false;   // != null, not ?. — Unity fake-null (review NEW-6)
+                                try { var itemDef = first.ItemCached; gift = itemDef != null && itemDef.isSpecialGift; } catch { }
+                                if (gift) { try { VehicleStoragePanel.GiftConfirm(doSell); } catch { doSell(); } }   // JIT-contained (hardening)
+                                else doSell();
+                            });
+                        }
+                        catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] sell route: {ex.Message}"); }
+                    });
+                }
+                var discardBtn = Btn("discardButton");
+                if (discardBtn != null && discardBtn.gameObject.activeSelf)
+                {
+                    discardBtn.onClick.RemoveAllListeners();
+                    discardBtn.onClick.AddListener(delegate
+                    {
+                        try
+                        {
+                            // Count=1, NOT stackCount (F-2026-08-25-G, user-approved fix 2026-08-25):
+                            // native discard removes ONE instance per click (OnDiscardClick gets only
+                            // firstCargoInstance) — round-47b had copied sell's whole-group multiplicity
+                            // here, so one helper click destroyed the owner's entire unpaid group.
+                            if (isBundleRow())
+                            {
+                                BuildingStorageSync.RequestBundleOp(addr, itemId, name, amount, paid, price, sell: false);
+                                Plugin.Logger.LogInfo($"[Business] helper bundle discard {name}×{amount} @'{addr}' → routed.");
+                            }
+                            else
+                            {
+                                BuildingStorageSync.RequestStackOp(addr, itemId, name, amount, paid, price, count: 1, sell: false);
+                                Plugin.Logger.LogInfo($"[Business] helper stack discard 1×({name}×{amount}) @'{addr}' → routed.");
+                            }
+                        }
+                        catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] discard route: {ex.Message}"); }
+                    });
+                }
+                // Round-49 slice 2 — the ONLY native action for a building holder is PLACE (furniture on a
+                // delivery spot; the equip/read/consume family belongs to the vehicle-picker mode, decompile
+                // CargoItemUi.SetupActionButton :226-307). Native gates paid && isFurniture && owned-business
+                // && holder isdeliveryspot; for a helper the ownership term is the grant. Click = route the
+                // 1-unit reduce to the owner FIRST ("placereduce"); placement starts only on the owner's Ok
+                // (BuildingStorageSync.OnResult) so a lost race costs nothing. The placed item then forwards
+                // through the existing guest interior-edit flow on completion.
+                var actionBtn = Btn("actionButton");
+                bool canPlace = false;
+                try
+                {
+                    canPlace = paid && first.ItemCached != null && first.ItemCached.isFurniture
+                               && ii.ItemCached != null && ii.ItemCached.HasTag(BigAmbitions.Tags.TagRef.Itemtag.isdeliveryspot);
+                }
+                catch { }
+                if (actionBtn != null)
+                {
+                    if (canPlace)
+                    {
+                        try
+                        {
+                            var lbl = HarmonyLib.AccessTools.Field(typeof(UI.PlayerHUD.CargoItemUi), "actionButtonLabel")?.GetValue(__instance);
+                            if (lbl != null)
+                            {
+                                var t = HarmonyLib.Traverse.Create(lbl);
+                                if (t.Property("Key").PropertyExists()) t.Property("Key").SetValue("itempanelui_buttons_place");
+                                else t.Field("Key").SetValue("itempanelui_buttons_place");
+                            }
+                        }
+                        catch { }
+                        actionBtn.onClick.RemoveAllListeners();
+                        var placeSrc = first;
+                        actionBtn.onClick.AddListener(delegate
+                        {
+                            try
+                            {
+                                if (BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode) return;   // native early-out parity
+                                bool fits = true;
+                                try { fits = placeSrc.ItemCached.FitsInBuilding(); } catch { }
+                                if (!fits) { PassengerHud.Toast("That item is too tall for this building."); return; }
+                                BuildingStorageSync.SetPendingPlace(addr, itemId, placeSrc);
+                                BuildingStorageSync.RequestTake(addr, itemId, name, 1, paid, price, "placereduce");
+                                Plugin.Logger.LogInfo($"[Business] helper PLACE {name} from delivery spot @'{addr}' → reduce routed, placement starts on Ok.");
+                            }
+                            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] place route: {ex.Message}"); }
+                        });
+                        actionBtn.gameObject.SetActive(true);
+                    }
+                    else actionBtn.gameObject.SetActive(false);   // no other holder-context action exists natively
+                }
+
+                var itemBtn = Btn("itemButton");
+                if (itemBtn == null) return;
+                itemBtn.onClick.RemoveAllListeners();
+                bool isVehicleCargo = false;
+                try { isVehicleCargo = !string.IsNullOrEmpty(BigAmbitions.Items.ItemsGetter.GetByName(name)?.vehicleType); } catch { }
+                itemBtn.onClick.AddListener(delegate
+                {
+                    try
+                    {
+                        if (isVehicleCargo)
+                        {
+                            // Round-49 slice 4 — unpack a stored hand truck/flatbed. The owner's copy loses the
+                            // cargo (routed, "vehicletake"); the vehicle spawns LOCALLY on the owner's Ok and is
+                            // the HELPER'S OWN from birth (user ruling 2026-07-21) — same native spawn call the
+                            // owner's own unpack runs, so the normal local-vehicle sync picks it up.
+                            if (PlayerHelper.IsHoldingItem || PlayerHelper.IsUsingVehicle)
+                            { PassengerHud.Toast("Empty your hands to unpack that."); return; }
+                            BuildingStorageSync.RequestTake(addr, itemId, name, amount, paid, price, "vehicletake");
+                            Plugin.Logger.LogInfo($"[Business] helper stored-vehicle take {name} @'{addr}' → routed; spawns locally on Ok.");
+                            try { InstanceBehavior<UI.UIs>.Instance.playerHUD.manageCargoUI.Close(); } catch { }
+                            return;
+                        }
+                        if (PlayerHelper.IsHoldingItem || PlayerHelper.IsUsingVehicle)
+                        { PassengerHud.Toast("Empty your hands to take that."); return; }
+                        // "Moves whole" rides "boxtake" (whole instance + nested contents); loose
+                        // stacks ride the generic take (the fridge path). F-2026-08-25-I
+                        // (user-approved + field-confirmed): the predicate is sealed OR
+                        // nested-bearing — a filled UNSEALED bag routed through the generic take
+                        // had its contents annihilated (TakeLoose reduces 1→0, nested never
+                        // echoed). Nested is STATE, read LIVE at click (sealed is type-derived,
+                        // safe to capture).
+                        bool bundle = false;
+                        try { bundle = first.nestedCargoInstances != null && first.nestedCargoInstances.Count > 0; } catch { }
+                        bool whole = isSealed || bundle;
+                        BuildingStorageSync.RequestTake(addr, itemId, name, amount, paid, price, whole ? "boxtake" : "");
+                        Plugin.Logger.LogInfo($"[Business] helper {(whole ? (isSealed ? "box" : "bundle") : "stack")} take {name}×{amount} @'{addr}' → routed to owner.");
+                        try { InstanceBehavior<UI.UIs>.Instance.playerHUD.manageCargoUI.Close(); } catch { }
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] take route: {ex.Message}"); }
+                });
+
+                UnityEngine.UI.Button? Btn(string field)
+                {
+                    try { return HarmonyLib.AccessTools.Field(typeof(UI.PlayerHUD.CargoItemUi), field)?.GetValue(__instance) as UnityEngine.UI.Button; }
+                    catch { return null; }
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] cargo row rewire: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>Round-36d/e — when CashRegisterCtaBehavior.GetCta DOES run for a helper: an empty native
+    /// pick gets our routed deposit action when the cargo fits; a native "click_to_add_inventory" pick
+    /// (possible under the visibility flip's owner branch) keeps its label but has its action SWAPPED for
+    /// the routed one — the native action's walk+Interact dies on the unflipped Interact (falls into the
+    /// customer purchase flow). Other native picks (pay/work/order) keep priority.</summary>
+    [HarmonyPatch(typeof(Player.HUD.ItemInfoOverlays.CashRegisterCtaBehavior),
+                  nameof(Player.HUD.ItemInfoOverlays.CashRegisterCtaBehavior.GetCta))]
+    public static class Patch_RegisterCta_HelperRefill
+    {
+        static void Postfix(EntityController entityController, ref (string, Action) __result)
+        {
+            try
+            {
+                if (!BusinessHelperRoute.HelperHere(out var addr)) return;
+                var reg = entityController as Controllers.CashRegisterController;
+                if (reg == null) return;
+                bool nativeAddInventory = __result.Item1 == "click_to_add_inventory";
+                if (!string.IsNullOrEmpty(__result.Item1) && !nativeAddInventory) return;
+                if (!PlayerHelper.HasPaidForAllItems()) return;             // shopper flow first (native)
+                bool can = false;
+                try
+                {
+                    if (PlayerHelper.IsUsingVehicle && VehicleHelper.GetCurrentVehicle() != null)
+                        can = reg.CanAddAnyToInventory(VehicleHelper.GetCurrentVehicle().cargoInstances);
+                    else if (PlayerHelper.IsHoldingItem && PlayerHelper.ItemInstanceInHands != null)
+                        can = reg.CanAddAnyToInventory(PlayerHelper.ItemInstanceInHands.cargoInstances);
+                }
+                catch { }
+                if (!can) return;
+                var ec = entityController;
+                string a = addr;
+                __result = ("click_to_add_inventory", delegate
+                {
+                    try
+                    {
+                        // Same walk-to-the-register the owner's CTA does, then the routed refill.
+                        InstanceBehavior<GameManager>.Instance.playerController.SetGoal(ec, delegate
+                        {
+                            BusinessHelperRoute.RouteStationRefill(ec as ItemController, a);
+                        });
+                    }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] helper register refill: {ex.Message}"); }
+                });
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>Round-122 (user request) — the open/closed toggle reaches the other players IMMEDIATELY.
+    /// It used to ride the 2-second business change-detector, so a shop could read open on one screen for a
+    /// couple of seconds after being shut on another.  The routed-toggle path already existed for a MEMBER
+    /// closing an owner's shop (BusinessSync.ApplyRoutedTemporarilyClose); this covers the ordinary case of
+    /// whoever owns it flipping their own switch, on either role.  Postfix, so the flag is already written
+    /// when we read it; the sweep's sent-cache is seeded by the push so it then sees no change and stays quiet.</summary>
+    [HarmonyPatch(typeof(BuildingRegistration), nameof(BuildingRegistration.TemporarilyClose))]
+    public static class Patch_BuildingRegistration_TemporarilyClose_PushNow
+    {
+        static void Postfix(BuildingRegistration __instance, bool closed)
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+                if (__instance == null) return;
+                if (!MergerFlip.TrulyMine(__instance)) return;   // only the true owner announces its own shop
+                BusinessSync.PushBusinessNow(__instance, closed ? "shop closed" : "shop opened");
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[BusinessSync] close-toggle push: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>Round-144 - the last link of the "customers won't split between registers" chain, measured
+    /// end to end: a GUEST machine's till never binds its stand-in because UpdateEmployee's gate
+    /// (EmployeeStationController.ShouldUpdateEmployee :412) requires IsPlayerOwnedBusiness, which reads
+    /// false for a visitor in someone else's shop.  The [SynthStaff] sweep invoked the bind 23 times in one
+    /// run and every call silently no-opped ("station=found, employee=none - retrying each sweep"), so
+    /// whenever the GUEST machine simulates the customers it sees ONE staffed till and funnels everyone
+    /// there - the measured "no split" (client QueueProbe: 950 emp=NONE available=False on every decision
+    /// while the host's machine showed both tills available).  This file is the home of that gate's other
+    /// bypasses; this one is scoped to stations MPRegisterSync deliberately staffed with a stand-in.  The
+    /// postfix re-evaluates the native expression with ONLY the ownership term removed - every other check
+    /// kept (active, not-mid-update, assignable, valid address, not in placement mode) - and everything
+    /// downstream (shift lookup, availability, employee body spawn) stays native.</summary>
+    /// <summary>Field 20260830-150521: native OnNewHour schedules UpdateEmployee via a
+    /// one-frame-delayed lambda that CAPTURES the station reference; the mod's interior
+    /// re-applies destroy+recreate stations in exactly that window, so the lambda can run
+    /// on a husk — and native ShouldUpdateEmployee's FIRST read (base.gameObject, :433)
+    /// throws an NRE on a destroyed component (two confirmed stacks in the field log).
+    /// A call on a husk can never be meaningful — skip it. Unity's overloaded == on the
+    /// component reference is the liveness check (fake-null for destroyed objects; a plain
+    /// C# null never reaches a Harmony instance prefix). SP keeps native behavior.</summary>
+    [HarmonyPatch(typeof(EmployeeStationController), nameof(EmployeeStationController.UpdateEmployee))]
+    public static class Patch_UpdateEmployee_SkipDestroyedStation
+    {
+        static bool Prefix(EmployeeStationController __instance)
+        {
+            if (!MPServer.IsRunning && !MPClient.IsClientInWorld && !MPClient.OfflineFork) return true;   // SP → native; H-FORK-1: holds in the offline fork
+            if (__instance == null)   // UnityEngine.Object.== : destroyed husk
+            {
+                Plugin.Logger.LogInfo("[SynthStaff] UpdateEmployee on a DESTROYED station skipped (delayed native callback outlived an interior rebuild).");
+                return false;
+            }
+            return true;
+        }
+    }
+
+    [HarmonyPatch(typeof(EmployeeStationController), "ShouldUpdateEmployee")]
+    public static class Patch_ShouldUpdateEmployee_SyntheticStations
+    {
+        static readonly HarmonyLib.AccessTools.FieldRef<EmployeeStationController, bool> _updating =
+            HarmonyLib.AccessTools.FieldRefAccess<EmployeeStationController, bool>("_isUpdatingEmployee");
+        static readonly System.Reflection.MethodInfo _inPlacement =
+            HarmonyLib.AccessTools.Method(typeof(EmployeeStationController), "IsItemBeingModifiedInPlacementMode");
+
+        static void Postfix(EmployeeStationController __instance, ref bool __result)
+        {
+            try
+            {
+                if (__result) return;                                     // native already said yes
+                if (!MPServer.IsRunning && !MPClient.IsClientInWorld && !MPClient.OfflineFork) return;   // H-FORK-1: holds in the offline fork
+                if (__instance == null || !MPRegisterSync.HasSyntheticFor(__instance)) return;   // field 150521: identity-matched, no cross-building borrow
+                // 1.0 PORT (sweep-2 S6): the native gate now reads the STATION'S own BuildingContext,
+                // not the global BuildingManager (they diverge inside Hamptons houses) — mirror it.
+                var ctx = __instance.BuildingContext;
+                if (ctx?.Registration == null || !ctx.Registration.HasValidAddress) return;
+                if (!__instance.gameObject.activeInHierarchy) return;
+                if (_updating(__instance)) return;
+                try { if (__instance.Item == null || !__instance.Item.assignable) return; } catch { return; }
+                try { if (_inPlacement != null && (bool)_inPlacement.Invoke(__instance, null)) return; } catch { return; }
+                __result = true;                                          // ownership was the only blocker
+            }
+            catch { }
+        }
+    }
+}

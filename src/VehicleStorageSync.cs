@@ -1,0 +1,282 @@
+using System;
+using UnityEngine;
+using Helpers;
+using Vehicles.VehicleTypes;
+using BigAmbitions.Items;   // CargoInstance
+using BigAmbitions.Tags;    // TagRef.Itemtag.isbox — the native deposit rule is TAG-based (2026-08-26)
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Shared vehicle storage — pure per-container SENDER facade since unification Stage B
+    /// (2026-08, design: .modding/03-systems/storage-unification-2026-08.md). The request side
+    /// (capacity pre-check, deposit source resolution + dedup, Silent mirrors) lives here; the
+    /// wire is the unified StorageOp/StorageRes family (195/196, v16) and ALL apply/result logic
+    /// is StorageSync, the one engine both containers share (ruling 37).
+    ///
+    /// Host-authoritative request/grant: the owner's machine is the sole authority on its own
+    /// cargo — the take/put only commits once the owner confirms (first request wins; no
+    /// optimistic local edit to roll back). Relay: accessor → host → owner → host → accessor.
+    /// THREADING: the engine's OwnerApply()/OnResult() mutate game state and MUST run on the
+    /// Unity main thread; the network dispatch marshals them (see MPServer/MPClient).
+    /// </summary>
+    public static class VehicleStorageSync
+    {
+        public const byte OpTake     = 0;   // remove Amount of ItemName from the vehicle (accessor receives it)
+        public const byte OpPut      = 1;   // add Amount of ItemName to the vehicle (from the accessor)
+        public const byte OpMarkPaid = 2;   // flip Amount of unpaid ItemName stacks to paid (borrowed-vehicle checkout mirror)
+
+        // ── LOCAL byte → engine op string. The byte survives only as this facade's API surface
+        // (MirrorToOwner's five call sites keep their byte argument); the WIRE carries the string
+        // since Stage B. An unknown byte maps to "" and the engine refuses it "unsupported"
+        // (ruling 39) — the D-1 sentinel, now enforced engine-side. ──
+        private static string OpName(byte op) => op == OpTake     ? StorageSync.OpTake
+                                               : op == OpPut      ? StorageSync.OpPut
+                                               : op == OpMarkPaid ? StorageSync.OpMarkPaid
+                                               :                    "";
+
+        // ── Accessor side: start a take / put (unchanged) ────────────────────────
+
+        public static void RequestTake(string realVehicleId, string ownerId, string itemName, int amount, bool paid, float price, string ctx = "")
+        {
+            // Respect the taker's capacity BEFORE asking the owner to remove it — the owner is authoritative
+            // and drops the item on grant, so if we can't hold it we'd lose/overwrite it. Mirrors the host's
+            // own ClickItem: a pushed hand-truck/flatbed with room, else EMPTY hands (you carry one).
+            // ctx "boxtake" (Stage C / M5): the row is a SEALED box — the whole instance moves,
+            // contents echoed, exactly like the owner's native ClickItem (which has no seal check).
+            if (!AccessorCanHold()) { PassengerHud.Toast("No room to carry that."); return; }
+            Send(OpTake, realVehicleId, ownerId, itemName, amount, paid, price, ctx: ctx);
+        }
+
+        public static void RequestPut(string realVehicleId, string ownerId, string itemName, int amount, bool paid, float price)
+            => Send(OpPut, realVehicleId, ownerId, itemName, amount, paid, price);
+
+        /// <summary>Sell/discard parity (user 2026-08-25): the borrower's panel routes the native
+        /// card buttons — SELL removes the WHOLE grouped row (count = group size, native OnSellClick
+        /// loop) and the MONEY credits the requester's own wallet at verdict time (native
+        /// whoever-sells-pockets-it; risk R2 credit basis = Amount×Price×Count); DISCARD removes
+        /// exactly ONE instance per click (count = 1 — native OnDiscardClick passes only
+        /// firstCargoInstance; the sell/discard multiplicity asymmetry is native and deliberate).
+        /// No capacity pre-check — nothing is delivered.</summary>
+        public static void RequestStackOp(string realVehicleId, string itemName, int amount, bool paid, float price, int count, bool sell)
+        {
+            if (string.IsNullOrEmpty(realVehicleId) || string.IsNullOrEmpty(itemName) || count <= 0 || amount <= 0) return;
+            StorageSync.SendOp(new StorageOpPayload
+            {
+                Container = StorageSync.ContainerVehicle, VehicleId = realVehicleId, PlayerId = MPConfig.PlayerId,
+                Op = StorageSync.OpTake, Ctx = sell ? "stacksell" : "stackdiscard",
+                ItemName = itemName, Amount = amount, Paid = paid, PricePerUnit = price, Count = count,
+            });
+        }
+
+        // Deposit what the accessor is CARRYING into the vehicle — hands first, else a pushed hand-truck/
+        // flatbed (round-12 #1b). A carried item is wrapped in a closedcardboardbox, so we deposit the box's
+        // CONTENTS (the real item), not the wrapper. NOTHING is removed locally on send — the source stack
+        // leaves hands/hand-truck only when the owner CONFIRMS (OnResult), so a full trunk can never eat items.
+        // One deposit INTENT can reach here by two routes at once (the PassengerRide walk-deposit CTA and
+        // the native AddHeldItemToStorage redirect fired for the same box — 2026-07-07 field-confirmed
+        // duplication). Dedup at the single funnel both routes pass through, keyed on vehicle + CONTENT
+        // signature (risk R6: keep this construction byte-identical). Per-machine state.
+        private static string _lastDepositSig = "";
+        private static float  _lastDepositAt  = -999f;
+        private const  float  DepositDedupSeconds = 2.5f;
+
+        public static void RequestDeposit(string realVehicleId, string ownerId)
+        {
+            try
+            {
+                // Resolve the source FIRST (held container / bare held item / pushed hand-truck
+                // stacks), so the dedup can sign exactly what would be sent. NATIVE DEPOSIT RULE
+                // (AddHeldItemToStorage :517-522, user parity 2026-08-26): the rule is TAG-based —
+                // a held BOX (isbox) POURS its contents into the trunk as loose stacks; anything
+                // else (a filled BAG included) goes in WHOLE as one bundle instance
+                // (ConvertToCargoInstance — the same call native makes). The old blanket pour
+                // predates the nested wire band and flattened bags to loose stacks, destroying
+                // the wrapper. `whole` entries ride ctx "wholeput" with their contents: the owner
+                // adds the instance whole, and the confirm consumes the SOURCE whole (a plain
+                // confirm's consume would skip sealed stacks and duplicate them).
+                var toSend = new System.Collections.Generic.List<(CargoInstance c, bool whole)>();
+                var held = PlayerHelper.ItemInstanceInHands;
+                if (held != null)
+                {
+                    // Review 2026-08-26 MAJOR-1 (scoped per its follow-up MINOR-1): native
+                    // AddHeldItemToStorage REFUSES a held shopping basket or mop before any cargo
+                    // work (:501-515) — without this, the whole-put becomes a money exploit (a
+                    // basket of UNPAID groceries deposits as a paid=true bundle whose contents
+                    // carry no paid state — NestedCargoInstance has none — so the borrowed-cart
+                    // checkout could never bill it). HELD-source only: native's hand-truck deposit
+                    // (:540-546) has no such guard, so the truck branch below stays unrestricted.
+                    // Same native notification, same data shape.
+                    if (PlayerHelper.IsHoldingShoppingBasket || PlayerHelper.IsHoldingAMop)
+                    {
+                        try
+                        {
+                            var ndata = new System.Collections.Generic.Dictionary<string, string>
+                            {
+                                { "fromname", VehicleManager.TypeNameFor(realVehicleId) ?? "" },
+                                { "toname",   held.itemName ?? "" },
+                            };
+                            UI.Notification.Notifications.Show(UI.Notification.NotificationType.Warning, "notification_cant_interact_with_item_in_hand", ndata);
+                        }
+                        catch { }
+                        return;
+                    }
+                    bool isBox = false;
+                    try { var def = held.ItemCached; isBox = def != null && def.HasTag(TagRef.Itemtag.isbox); } catch { }
+                    var contents = held.cargoInstances;
+                    if (isBox && contents != null && contents.Count > 0)
+                    {
+                        foreach (var c in new System.Collections.Generic.List<CargoInstance>(contents))
+                            if (c != null && !string.IsNullOrEmpty(c.itemName) && c.amount > 0)
+                                toSend.Add((c, false));   // native box rule: pour
+                    }
+                    else   // bag / bare item — native whole-instance rule
+                    {
+                        var c = held.ConvertToCargoInstance();
+                        if (c != null && !string.IsNullOrEmpty(c.itemName) && c.amount > 0)
+                            toSend.Add((c, c.nestedCargoInstances != null && c.nestedCargoInstances.Count > 0));
+                    }
+                }
+                else
+                {
+                    // Hands empty → pushed hand-vehicle as the source. Sealed boxes and bundles
+                    // now deposit WHOLE with their contents (user parity item 2, 2026-08-26 —
+                    // the old skip predates the nested band and left them behind).
+                    var cur = VehicleHelper.GetCurrentVehicle();
+                    if (cur == null || cur.VehicleType == null || !cur.VehicleType.spawnInPlayerObject) return;
+                    var src = cur.cargoInstances;
+                    if (src == null || src.Count == 0) { PassengerHud.Toast("Nothing to store."); return; }
+                    foreach (var c in new System.Collections.Generic.List<CargoInstance>(src))
+                    {
+                        if (c == null || string.IsNullOrEmpty(c.itemName) || c.amount <= 0) continue;
+                        bool sealedC = c.IsSealed;
+                        bool bundleC = c.nestedCargoInstances != null && c.nestedCargoInstances.Count > 0;
+                        // Review MINOR-2: an UNSEALED bundle with amount>1 would be SPLIT by the
+                        // owner's TryToAddToCargo (Copy() drops nested → hollow copies, contents
+                        // destroyed) — native has the same hole, which is evidence the shape never
+                        // occurs; if it ever does, leaving it on the truck loses nothing.
+                        if (bundleC && !sealedC && c.amount > 1)
+                        {
+                            Plugin.Logger.LogWarning($"[VStore] deposit skipped an unsealed bundle {c.amount}×{c.itemName} (amount>1 would split hollow — left on the truck; MINOR-2 tripwire).");
+                            continue;
+                        }
+                        toSend.Add((c, sealedC || bundleC));
+                    }
+                }
+                if (toSend.Count == 0) return;
+
+                var sb = new System.Text.StringBuilder(realVehicleId).Append('|');
+                foreach (var e in toSend)   // the whole flag joins the sig (review MINOR-3: a filled bag then an empty same-name bag must not collide)
+                    sb.Append(e.c.itemName).Append('=').Append(e.c.amount).Append('=').Append(e.c.paid ? '1' : '0').Append('=').Append(e.whole ? 'w' : 'p').Append(';');
+                string sig = sb.ToString();
+                if (sig == _lastDepositSig && Time.unscaledTime - _lastDepositAt < DepositDedupSeconds)
+                {
+                    Plugin.Logger.LogInfo($"[VStore] duplicate deposit for '{realVehicleId}' suppressed ({Time.unscaledTime - _lastDepositAt:F1}s after the first, identical content — double-routed intent).");
+                    return;
+                }
+                _lastDepositSig = sig; _lastDepositAt = Time.unscaledTime;
+
+                foreach (var e in toSend)
+                    Send(OpPut, realVehicleId, ownerId, e.c.itemName, e.c.amount, e.c.paid, e.c.pricePerUnit,
+                         ctx: e.whole ? "wholeput" : "",
+                         nested: e.whole ? StorageSync.EncodeNested(e.c.nestedCargoInstances) : null);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[VStore] RequestDeposit: {ex.Message}"); }
+        }
+
+        // Can the accessor actually receive a taken item right now? Pushed hand-vehicle with a free slot,
+        // otherwise empty hands. (More restrictive than merging into a held box — matches "hands hold one".)
+        private static bool AccessorCanHold()
+        {
+            try
+            {
+                if (PlayerHelper.IsUsingVehicle)
+                {
+                    var cur = VehicleHelper.GetCurrentVehicle();
+                    if (cur != null && cur.VehicleType != null && cur.VehicleType.spawnInPlayerObject && cur.VehicleType.maxCargoCapacity > 0)
+                    {
+                        var cargo = cur.GetCargoInstances();
+                        return cargo == null || cargo.Count < cur.VehicleType.maxCargoCapacity;
+                    }
+                }
+                return PlayerHelper.ItemInstanceInHands == null;   // on foot → only with empty hands
+            }
+            catch { return false; }
+        }
+
+        // ownerId is NO LONGER on the wire — ruling 38 landed STRONGER than written: the claim is
+        // not "demoted to a logged cross-check", it is REMOVED from the wire entirely (the host
+        // resolves the owner from PassengerSync.OwnerOf; there is nothing authoritative on the
+        // sender side to cross-check against). The parameter survives only so the many call sites
+        // stay untouched; it is deliberately unused.
+        private static void Send(byte op, string vid, string ownerId, string itemName, int amount, bool paid, float price, bool silent = false, string ctx = "",
+                                 System.Collections.Generic.List<CargoNestedInfo>? nested = null)
+        {
+            if (string.IsNullOrEmpty(vid) || string.IsNullOrEmpty(itemName) || amount <= 0)
+                return;
+            _ = ownerId;
+            StorageSync.SendOp(new StorageOpPayload
+            {
+                Container = StorageSync.ContainerVehicle, VehicleId = vid, PlayerId = MPConfig.PlayerId,
+                Op = OpName(op), Ctx = ctx, ItemName = itemName, Amount = amount, Paid = paid, PricePerUnit = price, Silent = silent,
+                Nested = nested ?? new System.Collections.Generic.List<CargoNestedInfo>(),
+            });
+        }
+
+        /// <summary>Bundle sell/discard (user-approved 2026-08-25): remove ONE filled bag whole —
+        /// on a sell the money credits the requester at the NATIVE nested-inclusive basis
+        /// (computed from the owner's echoed contents at verdict time). Removal-only, no
+        /// capacity pre-check, no delivery.</summary>
+        public static void RequestBundleOp(string realVehicleId, string itemName, int amount, bool paid, float price, bool sell)
+        {
+            if (string.IsNullOrEmpty(realVehicleId) || string.IsNullOrEmpty(itemName) || amount <= 0) return;
+            StorageSync.SendOp(new StorageOpPayload
+            {
+                Container = StorageSync.ContainerVehicle, VehicleId = realVehicleId, PlayerId = MPConfig.PlayerId,
+                Op = StorageSync.OpTake, Ctx = sell ? "bundlesell" : "bundlediscard",
+                ItemName = itemName, Amount = amount, Paid = paid, PricePerUnit = price, Count = 1,
+            });
+        }
+
+        /// <summary>v17 (proposal 2): ask the owner for the trunk's FULL cargo detail — fired by
+        /// the panel on open and on manifest movement while open. Event-driven; the answer feeds
+        /// display only (StorageSync.OnTrunkDetail → panel), never game state.</summary>
+        public static void RequestTrunkDetail(string realVehicleId, string sig)
+        {
+            if (string.IsNullOrEmpty(realVehicleId)) return;
+            StorageSync.DebugWireCheck();   // MINOR-G: a detail-only session still self-tests its wire
+            var req = new TrunkDetailReqPayload { VehicleId = realVehicleId, PlayerId = MPConfig.PlayerId, Sig = sig ?? "" };
+            if (MPServer.IsRunning) MPServer.HandleTrunkDetailReq(req, MPConfig.PlayerId);
+            else                    MPClient.SendEnvelope(MessageEnvelope.Create(MessageType.TrunkDetailReq, MPConfig.PlayerId, req));
+        }
+
+        private static int _mirrorBundleLogged;   // CARTBAG-1 diagnostic budget (log-only, per session)
+
+        // ── Borrowed-cart shopping (Option A, user-approved 2026-07-07) ──────────────────────────
+        // MIRROR of a native cargo mutation that already ran on the possessed pushed proxy: replay the
+        // same change on the owner's REAL vehicle, fire-and-forget (Silent — the accessor consumed/placed
+        // the item natively; OnResult must not double-place, clear hands, or toast). The next fleet
+        // re-sync overwrites the replica with the owner's truth, which now matches — convergent.
+        internal static void MirrorToOwner(byte op, VehicleInstance proxyInst, string itemName, int amount, bool paid, float price,
+                                           System.Collections.Generic.List<CargoNestedInfo>? nested = null)
+        {
+            try
+            {
+                if (proxyInst == null || amount <= 0 || string.IsNullOrEmpty(itemName)) return;
+                string realVid = proxyInst.id != null && proxyInst.id.StartsWith("BAMP_") ? proxyInst.id.Substring(5) : proxyInst.id;
+                // Ruling 38 retired the old "no owner known → mirror LOST" failure: the HOST
+                // resolves the owner now, so a mirror routes even when this machine's owner map
+                // is momentarily cold (the fleet-note race that used to lose them).
+                // CARTBAG-1: a mirrored PUT of a FILLED container must carry its contents through
+                // THE codec. Without them the owner's real bag was rebuilt BARE on the far side —
+                // the reported "he bought fresh food onto his cart, she touched the cart, now both
+                // see 1 paper bag". The take mirror carries them for the diagnostic only (the
+                // owner's take matches the whole instance by name/amount/paid).
+                if (nested != null && nested.Count > 0 && _mirrorBundleLogged++ < 60)
+                    Plugin.Logger.LogInfo($"[Cargo] bundle '{itemName}' nested sent={nested.Count} — mirror {(op == OpPut ? "put" : "take")} to the owner of '{realVid}' (CARTBAG-1).");
+                Send(op, realVid, ownerId: "", itemName, amount, paid, price, silent: true, nested: nested);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[VStore] MirrorToOwner: {ex.Message}"); }
+        }
+    }
+}

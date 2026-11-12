@@ -1,0 +1,11 @@
+burst 2 2 900 560
+techpic 906 2 900 560
+cable 2 566 1260 360
+techicon 1266 566 160 160
+signal 1430 566 128 128
+sym_tv 1562 566 128 128
+sym_internet 1694 566 128 128
+sym_iptv 1826 566 128 128
+sym_phone 2 930 128 128
+sym_fiber 134 930 128 128
+sym_paytv 266 930 128 128

@@ -1,0 +1,59 @@
+[h1]Going Public Server – Dauer-Server für Big Ambitions[/h1]
+Spielt Big Ambitions gemeinsam auf einem dedizierten Server, der immer läuft: Die Welt bleibt, wenn ihr offline geht, pausiert, wenn niemand da ist, und ihr tretet mit Adresse und Server-Schlüssel bei. [b]Server und Spieler brauchen dieselbe Version (1.0.17).[/b]
+
+[h2]Wichtig[/h2]
+[list]
+[*][b]Keine anderen Mods benutzen[/b] – weder im Spiel noch auf dem Server. Die eingebauten Module ersetzen Immersion, BAScheduler, SmartSuite, VoogleRoute, Big Ambitions Radio, Alunas Phone Pages, IT Business Expansion mit Skill Kit und Spotless.
+[*][b]Der Server in mehreren Varianten[/b] auf [url=https://github.com/amaus1209/BigAmbitionsGoingPublicServer/releases]GitHub[/url]: für AMP (Linux), als Programm mit Weboberfläche für Windows und Linux und als Docker-Container.
+[*][b]Fehler bitte hier melden[/b] (Kommentare) – mit der Version (unten links im Spiel), was passiert ist und, wenn möglich, der Player.log.
+[*][b]Fehlerberichte:[/b] Auf Servern, die sie sammeln, fragt das Spiel einmal, ob es Fehlermeldungen an den Server schicken darf, auf dem du spielst – ohne Windows-Benutzernamen, IP-Adressen, Steam-IDs und Schlüssel; ändern unter Optionen, Reiter Mods. Nichts geht an andere.
+[*][b]Linux / Steam Deck:[/b] mit GE-Proton spielen (getestet: GE-Proton11-11).
+[/list]
+
+[h2]Beitreten[/h2]
+Abonnieren und in der Mod-Liste aktivieren, dann [b]Mehrspieler → Spiel beitreten[/b]: Host-Adresse und Server-Schlüssel vom Admin – oder „Spiel beitreten“ bei einem Steam-Freund. [b]Esc → Server verlassen[/b] speichert deinen Fortschritt auf dem Server.
+
+[h2]Im Spiel[/h2]
+[list]
+[*][b]Gemeinsame Welt[/b]: Die Autos einer Person bleiben stehen, wenn sie geht; nach einem Verbindungsabbruch tritt das Spiel selbst wieder bei.
+[*][b]Steam-Namen und Freunde[/b]: Namen über den Spielern, Freunde grün und auf der Karte, Freundschaftsanfragen im Handy, Beitreten und Einladen über Steam.
+[*][b]Fusion[/b]: Firmen mehrerer Spieler zu einer zusammenlegen.
+[*][b]Going Online[/b] (Umschalt+F12): ein eigener Kabelanbieter mit Büros, Hubs und Kundencentern in jedem Viertel – Häuser anschließen, Internet, Fernsehen und Telefon verkaufen, Personal in sechs Rollen, DOCSIS bis Glasfaser, gegen den Konkurrenten Skyline Cable; ein echtes Unternehmen in BizMan, Technik als Möbel mit eigenen Modellen und blinkenden LEDs, Servicewagen mit deinem Logo und Kennzeichen im Stadtverkehr, Laufkundschaft im Kundencenter, Verteilerkästen mit Firmenlogo und Baustellen in der Stadt (für alle sichtbar), Ereignisse mit Entscheidung. Spieler vermieten einander Leitungen in ihren Netzen. Die Rangliste zeigt die Kabelanbieter der Spieler.
+[*][b]Neue Unternehmen[/b]: IT-Firma (IT-Support, Softwareentwicklung, Cloud-Dienste mit Servern), Reinigungsfirma (putzt auch deine eigenen Geschäfte) und Waschsalon – gegründet in BizMan, mit Personal von den Personalagenturen.
+[*][b]Handy-Seiten[/b]: die Apps auf Seiten zu acht, auf Seite 2 Chat, Spieler, Radio, Navi, Planer, Auswertung, Kamera und Schilder; Apps per Ziehen umsortieren.
+[*][b]Internetradio[/b]: Sender des Spiels, des Servers und eigene, Favoriten und Suche; Radio zu Fuß, Laden-Lautsprecher; Mitfahrer hören den Sender des Fahrers.
+[*][b]Navigation[/b] (Umschalt+F11): Ziel suchen oder auf der Karte anklicken – dort gleich Hinlaufen, Hinfahren oder nur Navi; ein Navi im Handy mit Abbiegung, Straßen, Ankunft und Spurwahl.
+[*][b]Autopilot[/b]: fährt mit Blinker und Halt an Ampeln zum Ziel, parkt dort (abschaltbar) und folgt auf Wunsch einem Freund. Zu Fuß läuft die Figur selbst hin.
+[*][b]Zeit vorspulen[/b]: gemeinsam abstimmen – stimmen alle zu, läuft die Zeit schneller.
+[*][b]F6 RPG-Kamera[/b] (Einstellungen F8) und [b]F7 Ladenschilder[/b] mit eigenen Bildern.
+[*][b]Beklebung[/b]: Jedes eigene Fahrzeug bekommt seine Beklebung – links, rechts, hinten und vorne je eine Gestaltung, Farbe und einen Logo-Platz, dazu Logo und Name deiner Firma, Spruch, Kontaktzeile und eine neue Lackfarbe; alle sehen sie.
+[*][b]Umschalt+F9 Planer[/b] für Schichtpläne und Öffnungszeiten, [b]Umschalt+F10 Auswertung[/b] mit Gewinn, Verkäufen, Personal und Immobilien.
+[*][b]Chat-Übersetzung[/b]: Auf Servern, die übersetzen, liest du die deutschen oder englischen Zeilen der anderen in der Sprache deines Spiels, darunter klein das Original – übersetzt auf dem Server selbst, ohne Dienst im Internet; abschaltbar unter Optionen, Reiter Mods.
+[*][b]Zebrastreifen[/b]: Die Leute gehen an der Ampel nur bei genug Rot los, Autos halten für sie; eigene Fußgängerampeln an allen Übergängen der Stadt zeigen Grün.
+[*]Chat und Steuern per Telefon im Handy, Mitfahren mit Motor und Radio des Fahrers, eigene Mod-Tasten unter Optionen → Steuerung, 23 Sprachen.
+[/list]
+
+[h2]Auf dem Server[/h2]
+[list]
+[*]Läuft rund um die Uhr ohne Grafik, speichert automatisch und pausiert ohne Spieler; Bildrate und Netzwerk-Takt sind einstellbar.
+[*]Beitritt mit Server-Schlüssel; auf Wunsch nur Spieler mit gekauftem Spiel (Steam prüft es), Beitreten über Steam-Freunde.
+[*]Welt wählen oder neu anlegen (Schwierigkeit, eigene Werte), einen Spielstand einmal laden.
+[*]Jedes Modul einzeln an oder aus; Spielregeln für Miete, Gebäudepreise, Kredit und Geschäftsverkauf; Fusionen lösen sich nach einstellbaren Tagen Abwesenheit auf; Radio-Senderliste je Sprache.
+[*]Verwaltung: Admin-Seite im Browser (Spieler, Kicken, Bannen mit Grund, Chat, Bannliste, Ankündigungen, Neustart), in AMP Chat in der Konsole und Kick/Ban, Warnung an die Spieler vor dem Stopp.
+[*]Chat-Übersetzung Deutsch–Englisch direkt auf dem Server; Fehlerberichte der Spieler (nach Zustimmung) in bigambitions/player-reports, 14 Tage.
+[*]Rangliste mit den Gebäuden der Spieler (wer welches gekauft oder gemietet hat) und Serverwerten (Netzverkehr, FPS, Ping); Sicherungen der Spielstände.
+[/list]
+
+[h2]Herkunft[/h2]
+Inoffizieller Fork von [url=https://github.com/Melaus123/BigAmbitionMulti]Going Public[/url] von Melaus (MIT-Lizenz). Die Module sind eigene Umsetzungen nach dem Vorbild dieser Mods (nachgebaut, kein fremder Code) – danke an ihre Autoren:
+[list]
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3791985529]Immersion - RPG Camera[/url] von Chamiks
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3795741870]BAScheduler[/url] von Shanpapa
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3793254452]SmartSuite Empire Management[/url] von ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3740623471]Voogle Route[/url] mit LIB BA Player Location und LIB BA Unified UI von - Capitaine -
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3792403626]Big Ambitions Radio[/url] von Antegarr
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3739104140]Aluna's Phone Pages[/url] von aluna
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3741969623]IT Business Expansion[/url] und [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3795855100]Skill Kit[/url] von Cow a Bunga
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3833316897]Spotless: Cleaning Company & Laundromat[/url] von We1tall
+[/list]
+Big Ambitions gehört Hovgaard Games; jeder Spieler und auch der Server brauchen eine eigene Lizenz des Spiels.

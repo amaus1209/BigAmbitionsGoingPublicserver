@@ -1,0 +1,395 @@
+{
+    "_categories": {
+        "Big Ambitions": "Big Ambitions",
+        "Server": "Server",
+        "Updates": "Updates",
+        "Runtime Configuration": "Laufzeit-Konfiguration",
+        "Players": "Spieler",
+        "Modules": "Module",
+        "Game rules": "Spielregeln",
+        "New world": "Neue Welt",
+        "RPG camera": "RPG-Kamera",
+        "Custom": "Benutzerdefiniert"
+    },
+    "_ports": {
+        "GamePort": [
+            "Spiel-Port",
+            "Host-Port von Going Public Server (UDP). Spieler treten per IP auf diesem Port bei."
+        ]
+    },
+    "_enums": {
+        "Off": "Aus",
+        "Easy": "Einfach",
+        "Normal": "Normal",
+        "Hard": "Schwer",
+        "true": "ja",
+        "false": "nein",
+        "(world played last)": "(zuletzt gespielte Welt)",
+        "(newest save)": "(neuester Spielstand)",
+        "1x (game)": "1x (Spiel)",
+        "100% (game)": "100 % (Spiel)",
+        "75%": "75 %",
+        "50%": "50 %",
+        "35%": "35 %",
+        "25 days": "25 Tage",
+        "50 days": "50 Tage",
+        "75 days": "75 Tage",
+        "100 days": "100 Tage",
+        "30 days": "30 Tage",
+        "60 days": "60 Tage",
+        "1.5x": "1,5x",
+        "Custom": "Benutzerdefiniert",
+        "Normal (10 / 5 Hz)": "Normal (10 / 5 Hz)",
+        "High (20 / 10 Hz)": "Hoch (20 / 10 Hz)",
+        "Very high (30 / 15 Hz)": "Sehr hoch (30 / 15 Hz)",
+        "Maximum (60 / 30 Hz)": "Maximal (60 / 30 Hz)"
+    },
+    "$GamePort": [
+        "Spiel-Port",
+        "UDP-Port, auf dem Spieler beitreten"
+    ],
+    "ServerLanguage": [
+        "Server-Sprache",
+        "Sprache der Einstellungen hier in AMP und der Texte, die der Server selbst erzeugt. Die Spieler sehen die Mod in ihrer eigenen Spielsprache. Nach einer Änderung: install-into-amp.sh erneut ausführen (oder Instanz neu laden), damit AMP die Felder in der neuen Sprache zeigt."
+    ],
+    "DedicatedSession": [
+        "Welt",
+        "Die Welt, die der Server betreibt: die Welten auf diesem Server oder „(zuletzt gespielte Welt)“. Der Server füllt die Liste selbst; neue Welten zeigt AMP nach dem nächsten Neustart der Instanz. Eine neue Welt entsteht über „Neue Welt: Name“ (Reiter New world); gibt es noch keine Welt, legt „Neue Welt: Schwierigkeit“ eine Welt namens „Server“ an."
+    ],
+    "DedicatedLoadSave": [
+        "Spielstand einmal laden",
+        "Beim nächsten Start einmal diesen Spielstand statt des neuesten laden – spätere Neustarts laden wieder den neuesten. Die Liste zeigt die Spielstände auf diesem Server, neueste zuerst, mit Spieltag und Uhrzeit; der Server füllt sie selbst, neue Spielstände zeigt AMP nach dem nächsten Neustart der Instanz. „(neuester Spielstand)“ = immer den neuesten."
+    ],
+    "DedicatedNewGame": [
+        "Neue Welt: Schwierigkeit",
+        "Schwierigkeit einer neuen Welt: der unter „Neue Welt: Name“ oder der oben gewählten, solange es sie noch nicht gibt. Einfach, Normal und Schwer sind die Vorgaben des Spiels; „Custom“ nimmt die Werte im Reiter „Custom“, wie der Bildschirm „Benutzerdefiniertes Spiel“ im Spiel. Aus = keine neue Welt."
+    ],
+    "PlayerId": [
+        "Name der Server-Figur",
+        "Name der Host-Figur, die die Welt am Laufen hält. Spieler sehen sie als NPC."
+    ],
+    "DedicatedIdleGraceSeconds": [
+        "Pause, wenn leer, nach (s)",
+        "Sekunden nach dem Gehen des letzten Spielers, bis die Welt pausiert (0 = sofort)."
+    ],
+    "DedicatedAfkMinutes": [
+        "Pause, wenn alle inaktiv sind seit (Minuten)",
+        "Die Welt pausiert, solange kein verbundener Spieler so viele Minuten Tastatur oder Maus benutzt hat, und läuft bei der nächsten Eingabe weiter. 0 = aus. Eine laufende Zeitbeschleunigung wird nie pausiert."
+    ],
+    "DedicatedPauseInMenu": [
+        "Pause, solange alle im Pausenmenü sind",
+        "Die Welt pausiert, solange jeder verbundene Spieler das Pausenmenü (Esc) offen hat - bei einem Spieler wie im Einzelspieler."
+    ],
+    "DedicatedAutoAccept": [
+        "Beitritte automatisch annehmen",
+        "Spieler, die einer laufenden Welt beitreten, werden ohne Bestätigung hereingelassen"
+    ],
+    "AutosaveMinutes": [
+        "Autosave (Minuten)",
+        "Wie oft der Server die Welt automatisch speichert. Spieler sehen „Spielstand wird auf dem Server gespeichert…“ und danach, ob es geklappt hat."
+    ],
+    "HeadlessFps": [
+        "Bildrate im Betrieb",
+        "Bilder pro Sekunde des Servers, während Spieler da sind: 60, 120 oder 200. Mehr Bilder lassen die Welt schneller reagieren (mehr CPU); das Netzwerk sendet ohnehin in seinem eigenen Takt."
+    ],
+    "HeadlessIdleFps": [
+        "Bildraten-Grenze ohne Spieler",
+        "Bildraten-Grenze, während die Welt wartet (pausiert, keine Spieler): niedrig spart CPU, Beitritte reagieren trotzdem."
+    ],
+    "Headless": [
+        "Headless",
+        "Server-Modus"
+    ],
+    "DedicatedHost": [
+        "Dedizierter Host",
+        "Server-Modus"
+    ],
+    "TelemetryKey": [
+        "Server-Schlüssel",
+        "Spieler brauchen diesen Schlüssel zum Beitreten (Spiel beitreten > Server-Schlüssel) und für die Rangliste. Leer = beim ersten Start wird einer erzeugt, auf der Statusseite angezeigt und in telemetry-data/key.txt gespeichert."
+    ],
+    "SpecificReleaseVersion": [
+        "Proton-GE-Version (Linux)",
+        "Legt die zu installierende Proton-GE-[Version](https://github.com/GloriousEggroll/proton-ge-custom/releases) fest. Leer = neueste. Beispiel: GE-Proton9-1"
+    ],
+    "DedicatedRequireKey": [
+        "Beitritt nur mit Server-Schlüssel",
+        "Spieler ohne den Server-Schlüssel werden abgewiesen. Aus = jeder, der den Server erreicht, kann beitreten."
+    ],
+    "StopWarnSeconds": [
+        "Vorwarnung, bevor AMP den Server stoppt",
+        "Stoppt, startet oder aktualisiert AMP den Server (über seine Knöpfe oder den Zeitplan), während Spieler da sind, werden sie erst gewarnt – bei 60, 30 und 10 Sekunden – und danach wird gespeichert. 0 = sofort. Höchstens 90 (AMP wartet 150 Sekunden auf den Server). Für eine längere Vorwarnung in der Konsole oder im Zeitplan „restart <Minuten>“ senden."
+    ],
+    "SteamOwnerCheck": [
+        "Steam: nur mit gekauftem Spiel",
+        "Lässt nur Spieler herein, deren Steam-Konto Big Ambitions besitzt: Der Server fragt Steam nach einem Ticket, das das Spiel jedes Spielers beim Beitreten mitschickt – ein Steam-Emulator kann keines ausstellen; die Steam-Familienbibliothek zählt. Braucht den Steam-Web-API-Schlüssel darunter. Antwortet Steam nicht, kommt der Spieler herein, und das Log sagt es."
+    ],
+    "SteamWebApiKey": [
+        "Steam-Web-API-Schlüssel",
+        "Für die Besitzprüfung: ein Schlüssel von steamcommunity.com/dev/apikey (jedes Steam-Konto, das schon etwas auf Steam gekauft hat, kann einen erstellen; als Domain geht ein beliebiger Name). Er bleibt auf diesem Server und geht nie an die Spieler."
+    ],
+    "SteamFriendJoin": [
+        "Steam: Freunde können beitreten",
+        "Spieler auf diesem Server melden Steam, wo sie spielen: Ihre Steam-Freunde sehen „Spiel beitreten“ und „Zum Spiel einladen“ und kommen mit einem Klick auf diesen Server – Adresse und Server-Schlüssel gehen dabei über Steam an sie. Nicht bei Spielern, die über eine lokale Adresse (LAN) verbunden sind. Aus = kein „Spiel beitreten“ für diesen Server."
+    ],
+    "AutosaveSlots": [
+        "Anzahl Autosaves",
+        "Wie viele automatische Spielstände der Server pro Welt behält; der älteste wird überschrieben. Manuelle und Verbindungsabbruch-Spielstände kommen dazu."
+    ],
+    "$MaxUsers": [
+        "Max. Spieler",
+        "Wie viele Spieler gleichzeitig auf dem Server sein dürfen (die Server-Figur zählt nicht). AMP zeigt das als Benutzer-Grenze auf der Statusseite."
+    ],
+    "PlayerWebUrl": [
+        "Web-Adresse für Spieler",
+        "Unter welcher Adresse Spieler dieses AMP erreichen, z. B. https://amp.example.org oder http://203.0.113.5:8080 – für die Mod-Liste des Servers. Leer = https://<Adresse, mit der Spieler beitreten>."
+    ],
+    "ModuleIrsPhone": [
+        "Steuern per Telefon",
+        "Modul 1: Spieler können im Handy unter Kontakte das Finanzamt anrufen und dort ihre Steuern bezahlen."
+    ],
+    "ModuleShopSigns": [
+        "Ladenschilder (F7)",
+        "Modul 2: Spieler setzen eigene Bilder auf ihre Ladenschilder und Werbetafeln; die anderen Spieler sehen sie."
+    ],
+    "ModuleCamera": [
+        "RPG-Kamera (F6, F8)",
+        "Modul 3: eine Third-Person-Kamera zu Fuß und im Auto. Auf diesem Server bekommt jeder Spieler die Einstellungen aus „RPG-Kamera“; das Einstellungsfenster der Kamera zeigt sie nur an."
+    ],
+    "ModulePlanner": [
+        "Planer (Umschalt+F9)",
+        "Modul 4: Prüfung der Schichtpläne, automatisches Füllen des Spiels und Öffnungszeiten nach Kundenandrang für die eigenen Geschäfte der Spieler."
+    ],
+    "ModuleInsights": [
+        "Auswertung (Umschalt+F10)",
+        "Modul 5: die Bücher der Geschäfte und Gebäude der Spieler - Gewinn, Verlauf, Personal, Verkäufe und Immobilien."
+    ],
+    "RuleRentReturn": [
+        "Miete aus eigenen Gebäuden",
+        "SmartRent: vervielfacht die tägliche Miete, die die Mieter in den eigenen Gebäuden der Spieler zahlen. 1x ist der Wert des Spiels."
+    ],
+    "RuleBuildingPrice": [
+        "Gebäudepreise",
+        "SmartRent: der Marktwert aller Gebäude in Prozent - Kauf, Verkauf und der angezeigte Wert folgen ihm. 100 % ist der Wert des Spiels."
+    ],
+    "RuleBusinessSale": [
+        "Geschäftsverkauf",
+        "SmartRent: Spieler können ein Geschäft in der Auswertung (Umschalt+F10) verkaufen. Der Mietvertrag endet wie in BizMan (Einrichtung, Fahrzeuge und Kaution zurück), dazu gibt es einen Firmenwert von 30 Tagen Durchschnittsgewinn."
+    ],
+    "RuleBusinessSaleMinDays": [
+        "Geschäftsverkauf: Mindestalter",
+        "Wie viele Tage ein Geschäft bestehen muss, bevor es verkauft werden kann."
+    ],
+    "RuleBusinessSaleProfitDays": [
+        "Geschäftsverkauf: Tage mit Gewinn",
+        "Wie viele Tage mit Gewinn ein Geschäft in den Büchern des Spiels braucht (sie reichen ein Spieljahr zurück), bevor es verkauft werden kann."
+    ],
+    "RuleLoanLimit": [
+        "Kreditrahmen der Bank",
+        "SmartRent: vervielfacht, wie viel eine Bank auf Vermögen und Einkommen des Spielers leiht. Das Höchstlimit jeder Bank gilt weiter. 1x ist der Wert des Spiels."
+    ],
+    "MergerAutoDissolveDays": [
+        "Fusion: auflösen nach Tagen Abwesenheit",
+        "Ein Mitglied einer Fusion, das so viele Tage nicht auf dem Server war (gezählt nur, solange der Server läuft, ab diesem Update), scheidet von selbst aus - ohne Abstimmung und ohne Verkauf: Alle behalten ihr Eigentum, das Geld der Firma wird gleichmäßig geteilt, und eine Fusion aus zwei Spielern endet. Nur solange ein anderes Mitglied in dieser Zeit da war. 0 = nie."
+    ],
+    "NewGameDaysPerYear": [
+        "Tage pro Jahr",
+        "Wie viele Tage ein Spieljahr hat: 30-365. Nur bei „Benutzerdefiniert“. Normal: 60."
+    ],
+    "NewGameStartingMoney": [
+        "Startkapital",
+        "Geld, mit dem jede neue Figur beginnt. Nur bei „Benutzerdefiniert“. Einfach 15000, Normal 10000, Schwer 4200."
+    ],
+    "NewGameRivalAttacks": [
+        "Multiplikator für Rivalenangriffe",
+        "Dies wirkt sich auf die Schwere der Rivalenangriffe aus. Auf 0 setzen, um alle Rivalenangriffe zu deaktivieren. In Prozent, 0-150. Nur bei „Benutzerdefiniert“. Normal: 100."
+    ],
+    "NewGameStartingAge": [
+        "Startalter",
+        "18-65. Nur bei „Benutzerdefiniert“. Normal: 18."
+    ],
+    "NewGameDisableAging": [
+        "Altern deaktivieren",
+        "Die Figuren werden nicht älter. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameDisableHappiness": [
+        "Zufriedenheit deaktivieren",
+        "Die Zufriedenheit spielt keine Rolle. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameDisableEnergy": [
+        "Energie deaktivieren",
+        "Die Energie spielt keine Rolle. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameAllCoursesUnlocked": [
+        "Alle Kurse freigeschaltet",
+        "Alle Kurse der Business School automatisch abgeschlossen. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameAllContactsUnlocked": [
+        "Alle Kontakte freischalten",
+        "Alle Kontakte sind von Anfang an im Handy. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameDisableVehicleDamage": [
+        "Fahrzeugschäden deaktivieren",
+        "Fahrzeuge nehmen keinen Schaden. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameDisableVehicleFuel": [
+        "Kraftstoffverbrauch deaktivieren",
+        "Fahrzeuge verbrauchen keinen Kraftstoff. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameTaxPercentage": [
+        "Steuersatz",
+        "Beeinflusst den jährlichen Steuersatz der IRS: 0-100. Nur bei „Benutzerdefiniert“. Normal: 5."
+    ],
+    "NewGameSalary": [
+        "Multiplikator für den Stundenlohn der Mitarbeitenden",
+        "In Prozent, 50-130. Nur bei „Benutzerdefiniert“. Normal: 70."
+    ],
+    "NewGamePublicPrices": [
+        "Multiplikator der öffentlichen Preise",
+        "Beeinflusst die Kosten verschiedener öffentlicher Ausgaben wie Großhandels-/Importwaren, Krankenhausgebühren usw. In Prozent, 70-130. Nur bei „Benutzerdefiniert“. Normal: 70."
+    ],
+    "NewGameBankInterest": [
+        "Multiplikator für Bankzinsen",
+        "Beeinflusst Zinszahlungen für Kredite und Investitionen. In Prozent, 70-130. Nur bei „Benutzerdefiniert“. Normal: 70."
+    ],
+    "NewGameCustomerPromotion": [
+        "Basis-Multiplikator für Kundenwerbung",
+        "Beeinflusst die Basisanzahl an Kunden ohne Laufkundschaft oder Marketing. In Prozent, 10-100. Nur bei „Benutzerdefiniert“. Normal: 55."
+    ],
+    "NewGameWholesaleUrgentFee": [
+        "Multiplikator für Dringlichkeitsgebühr (Großhandel)",
+        "Beeinflusst den Preis der Dringlichkeitsgebühr beim Einkauf bei Großhändlern. In Prozent, 0-200. Nur bei „Benutzerdefiniert“. Normal: 20."
+    ],
+    "NewGameImporterUrgentFee": [
+        "Multiplikator für Dringlichkeitsgebühr (Importeur)",
+        "Beeinflusst den Preis der Dringlichkeitsgebühr beim Einkauf bei Importeuren. In Prozent, 0-200. Nur bei „Benutzerdefiniert“. Normal: 75."
+    ],
+    "NewGameDisableImportLimits": [
+        "Großhandels-/Importlimits deaktivieren",
+        "Deaktiviert das Wochenlimit für Großhändler und Importeure. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameAllProductsFromImporters": [
+        "Alle Produkte bei Importeuren verfügbar",
+        "Ermöglicht den Kauf aller Produkte bei Importeuren. Nur bei „Benutzerdefiniert“."
+    ],
+    "NewGameExportPrices": [
+        "Exportpreis-Multiplikator",
+        "Beeinflusst den Preis, den Exporteure für in Fabriken produzierte Waren zahlen. In Prozent, 10-130. Nur bei „Benutzerdefiniert“. Normal: 65."
+    ],
+    "NewGameResaleValue": [
+        "Wiederverkaufswert",
+        "Prozentsatz des Werts eines Gegenstands oder Fahrzeugs, der beim Verkauf erhalten wird: 10-100. Nur bei „Benutzerdefiniert“. Normal: 75."
+    ],
+    "ModuleNavigation": [
+        "Navigation (Umschalt+F11)",
+        "Modul 6: ein Ziel aus der Suche, den eigenen Orten, Lesezeichen oder per Klick auf der Stadtkarte, mit Routenlinie zu Fuß und im Auto. Nur die eigene Ansicht jedes Spielers."
+    ],
+    "ModulePhonePages": [
+        "Handy-Seiten",
+        "Modul 7: die Apps des BizPhones auf Seiten zu acht mit Pfeilen und Punkten - die des Spiels auf der ersten Seite, die der Mod auf den nächsten (Chat, Spieler, Radio, Navi, Planer, Auswertung, Kamera, Schilder). Nachgebaut nach Alunas Phone Pages. Aus = das Handy wie bisher: die Apps des Spiels, Chat und Spieler."
+    ],
+    "ModuleGoingOnline": [
+        "Going Online (Kabelanbieter)",
+        "Modul 8: Alle können einen Kabelnetzbetreiber gründen - ein Unternehmen des Spiels („Kabelanbieter“ im Lagerhaus, „Kabel-Kundencenter“ im Büro, gegründet in BizMan), gegen den Konkurrenten Skyline Cable: Bandbreite einkaufen, Häuser anschließen, Internet, Fernsehen (Kabel und IPTV) und Telefon verkaufen, mit Tarifen, Miet- oder Kaufgeräten und Rufnummernportierung. Die Technik (CMTS, OLT, Sat-Kopfstelle ...) sind Möbel aus dem Möbelladen, die Geräte Ware bei Großhändlern und Importeuren, das Personal in sechs Rollen kommt von den Personalagenturen; Gestattungsverträge mit den Eigentümern, Störungen und Kundenzufriedenheit; DOCSIS 3.0, später 3.1 und Glasfaser mit XGS-PON. Die App ist im Handy und im großen Menü (Umschalt+F12), Hilfe unter F1; die Rangliste zeigt die Kabelanbieter der Spieler. Der Anbieter steckt im Spielstand der jeweiligen Person. Aus = die App ist weg; ein schon gegründeter Anbieter bleibt in den Spielständen."
+    ],
+    "ModuleItFirm": [
+        "IT-Firma",
+        "Modul 9: drei Büro-Unternehmen des Spiels - IT-Support, Softwareentwicklung, Cloud-Dienste. Das Personal (IT-Support, Softwareentwicklung, Cloud-Engineering von City Workforce Inc.) rechnet Stunden an IT-Arbeitsplätzen ab; Server (Blade, Rack, Großrechner) aus dem Möbelladen müssen im Büro stehen und kosten jeden Tag Strom. Preise und Schichten in BizMan, Hilfe unter F1. Nachgebaut nach IT Business Expansion von Cow a Bunga (eigener Code). Aus = diese Unternehmen verdienen nichts."
+    ],
+    "ModuleCleaning": [
+        "Reinigungsfirma",
+        "Modul 10: eine Reinigungsfirma (Büro) des Spiels. Ihre Reinigungskräfte und Objektleitungen putzen zuerst die eigenen anderen Geschäfte der Person, dann zahlt Kundschaft der Stadt nach Stunden; Scheuersaugmaschinen, Teppichreiniger und Fensterputz-Sets machen schneller. Preise und Schichten in BizMan, Hilfe unter F1. Nachgebaut nach Spotless von We1tall (eigener Code). Aus = die Reinigung ruht."
+    ],
+    "ModuleLaundromat": [
+        "Waschsalon",
+        "Modul 11: ein Waschsalon (Laden) des Spiels: Waschmaschinen (8, 12 und 27 kg) und Trockner (15 und 30 kg) aus dem Elektrogerätegeschäft, die Leute des Viertels waschen und trocknen, mit einer Aufsicht geben sie ihre Wäsche zum Waschen und Falten ab. Wasser, Strom und Waschmittel kosten etwas je Ladung. Preise und Schichten in BizMan, Hilfe unter F1. Nachgebaut nach Spotless von We1tall (eigener Code). Aus = niemand wäscht."
+    ],
+    "CamFootPitch": [
+        "Winkel zu Fuß",
+        "Anfangswinkel der Kamera zu Fuß in Grad, 5-75; neigen können die Spieler weiter mit der rechten Maustaste. Diese Kamera-Einstellungen gelten für jeden Spieler auf diesem Server. Standard: 20."
+    ],
+    "CamFootDist": [
+        "Abstand zu Fuß",
+        "Anfangsabstand zu Fuß in Metern, 2,5-40; zoomen können die Spieler weiter mit dem Mausrad. Standard: 8."
+    ],
+    "CamCarPitch": [
+        "Winkel im Auto",
+        "Anfangswinkel im Auto in Grad, 3-60. Standard: 18."
+    ],
+    "CamCarDist": [
+        "Abstand im Auto",
+        "Anfangsabstand im Auto in Metern, 5-45. Standard: 15."
+    ],
+    "CamHeight": [
+        "Zielhöhe",
+        "Wie hoch über den Füßen die Kamera zielt, in Metern, 0-3. Standard: 1,5."
+    ],
+    "CamShoulder": [
+        "Schulterversatz",
+        "-1 (Figur links) bis 1 (rechts); 0 = mittig."
+    ],
+    "CamSensitivity": [
+        "Mausempfindlichkeit",
+        "Für Drehen und Neigen, 0,2-3; 1 = normal."
+    ],
+    "CamFov": [
+        "Sichtfeld",
+        "In Grad, 30-90. Standard: 55."
+    ],
+    "CamViewDistance": [
+        "Sichtweite",
+        "Vielfaches der Sichtweite des Spiels, 0,5-3; 1 = wie im Spiel, mehr kostet Leistung."
+    ],
+    "CamDeadZone": [
+        "Totzone Rechtsklick",
+        "Wie viele Pixel sich die Maus bewegt, bevor Ziehen mit rechts die Kamera dreht, 0-30. Standard: 3."
+    ],
+    "CamRecenter": [
+        "Hinter das Auto zurückschwenken",
+        "Fährt man weiter, dreht die Kamera zurück hinter das Auto."
+    ],
+    "CamIndoors": [
+        "Auch in Gebäuden",
+        "Die RPG-Kamera auch in Gebäuden und Garagen (aus = dort die Ansicht des Spiels)."
+    ],
+    "NavRouteLine": [
+        "Navigation: Routenlinie",
+        "Zeigt die Routenlinie für jeden Spieler auf diesem Server. Aus = nur die Nadel mit Entfernung und das Ziel oben am Bildschirm."
+    ],
+    "NavPhone": [
+        "Navigation: Navi im Handy",
+        "Ist ein Ziel gesetzt, füllt das Navi den Bildschirm des BizPhones unterhalb des Musik-Players - mit der Maus darüber scheinen die Apps des Handys durch und lassen sich anklicken; zugeklappt zeigt das Handy kein Navi. Aus = es steht über dem Handy."
+    ],
+    "DedicatedNewWorld": [
+        "Neue Welt: Name",
+        "Legt eine neue Welt mit diesem Namen an: Beim nächsten Start erstellt der Server sie mit der Schwierigkeit darunter, bestätigt die Charaktererstellung mit dem Namen der Server-Figur und spielt sie. Danach ist sie eine Welt wie jede andere – „Welt“ auf „(zuletzt gespielte Welt)“ lassen, um in ihr zu bleiben. Leer = keine neue Welt; ein Name, den es schon gibt, behält einfach diese Welt, also für jede neue Welt einen neuen Namen nehmen."
+    ],
+    "NetRate": [
+        "Netzwerk-Takt",
+        "Wie oft Positionen, Autos und Verkehr über das Netz gehen: Normal (Positionen 10 Hz, Verkehr 5 Hz, wie vor 1.0.14), Hoch (20 / 10 Hz), Sehr hoch (30 / 15 Hz) oder Maximal (60 / 30 Hz). Höher fährt sich flüssiger; der Strom jedes Spielers geht an jeden anderen, mit mehr Spielern wächst die Datenmenge also schnell. Die Spieler bekommen den Takt des Servers beim Beitritt."
+    ],
+    "DisconnectPause": [
+        "Pause bei Verbindungsabbruch",
+        "Was die Welt tut, wenn ein Spieler die Verbindung verliert (Timeout, kein normales Verlassen): Aus - die anderen spielen weiter, seine Autos bleiben stehen; Bis zu 60 Sekunden - sie wartet eine Minute auf ein schnelles Wiederverbinden; Bis der Spieler zurück ist - wie vor 1.0.16."
+    ],
+    "SameVersionOnly": [
+        "Nur dieselbe Mod-Version",
+        "Spieler, deren Going-Public-Server-Version von der des Servers abweicht, werden mit einer Meldung abgewiesen, die beide Versionen nennt. Aus: Sie können beitreten und bekommen im Chat den Hinweis, das Abo zu aktualisieren."
+    ],
+    "LogLevel": [
+        "Log-Umfang",
+        "Normal: Die Konsole zeigt das Wichtige (Beitritte, Speichern, Warnungen, Fehler) - die häufigen Statuszeilen der Systeme fallen weg. Ausführlich: alles, zur Fehlersuche."
+    ],
+    "RadioList": [
+        "Radio-Senderliste",
+        "Internetradio für alle Spieler dieses Servers: Die Senderliste dieser Sprache kommt von GitHub (radio/<Sprache>.txt unter github.com/amaus1209/BigAmbitionsGoingPublicServer) und erscheint in der Radio-App des Handys und im Autoradio - MP3-Streams, http und https. Die eigene streams.txt der Spieler steht davor. Aus = nur die eigenen."
+    ],
+    "PlayerReports": [
+        "Fehlerberichte der Spieler",
+        "Die Spiele der Leute auf diesem Server schicken ihm beim Spielen ihre Fehler, Warnungen und die Prüfzeilen des Mods – erst nachdem jede Person einmal zugestimmt hat (Frage beim Beitreten, änderbar unter Optionen, Reiter Mods), ohne Windows-Benutzernamen, IP-Adressen, Steam-IDs und Schlüssel. Nach einem Absturz oder auf den Konsolenbefehl playerlog <Name> auch die ganze Player.log. Die Dateien liegen in bigambitions/player-reports (summary.json, eine Datei je Person und Tag, logs/) und bleiben 14 Tage; alle 10 Minuten eine Zeile in der Konsole, der Konsolenbefehl reports zeigt die häufigsten Fehler. Aus = nichts wird geschickt."
+    ],
+    "ChatTranslate": [
+        "Chat-Übersetzung",
+        "Übersetzt den Chat der Spieler zwischen Deutsch und Englisch, direkt auf diesem Server: kein Konto, kein Dienst im Internet – der Chat verlässt den Server nicht. Jede Person liest fremdsprachige Zeilen in der Sprache ihres Spiels, darunter klein das Original; abschaltbar für jede Person unter Optionen, Reiter Mods. Der erste Start richtet den Übersetzer einmalig in bigambitions/bamp-translate ein (etwa 550 MB Download, außerhalb des Spielordners, daher nicht in den Sicherungen) – das Spiel startet sofort, die Übersetzung folgt nach wenigen Minuten. Etwa 400 MB Arbeitsspeicher, solange der Server läuft. Konsolenbefehl translate <Text> zum Testen. Aus = Chat wie geschrieben, nichts wird eingerichtet oder gestartet."
+    ]
+}

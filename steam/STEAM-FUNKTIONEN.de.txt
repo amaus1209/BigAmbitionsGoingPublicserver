@@ -1,0 +1,78 @@
+[h1]Going Public Server – die eingebauten Module[/h1]
+Going Public Server bringt nachgebaute Fassungen beliebter Mods gleich mit: eigener Code nach ihrem Vorbild, gebaut für den gemeinsamen Server. Hier steht, was die Module können und was sie im Mehrspieler besser machen.
+
+[h2]Für alle Module[/h2]
+[list]
+[*][b]Ein Abo statt elf:[/b] keine Zusatz-Mods und keine Bibliotheken – Kamera, Planer, Auswertung, Navi, Radio, Handy-Seiten und die neuen Unternehmen stecken im Mod.
+[*][b]Immer passend:[/b] Server und alle Mitspielenden haben dieselbe Version – nach einem Update läuft kein Modul auseinander oder stört ein anderes.
+[*][b]Für den Mehrspieler gebaut:[/b] Was andere sehen sollen, geht an alle – Ladenschilder, der Sender der Laden-Lautsprecher, das Autoradio für Mitfahrende, Öffnungszeiten und Schichten. Was nur dich angeht, bleibt auf deinem Rechner: Kamera, Navi und Auswertung.
+[*][b]Der Server entscheidet:[/b] Jedes Modul lässt sich in AMP einzeln abschalten – seine App verschwindet dann auch aus dem Handy.
+[*][b]23 Sprachen:[/b] alle Texte in jeder Sprache des Spiels.
+[*][b]Eigene Tasten[/b] für die Module unter Optionen → Steuerung.
+[*][b]Linux und Steam Deck:[/b] getestet mit GE-Proton.
+[/list]
+
+[h2]RPG-Kamera (F6, Einstellungen F8) – nach Immersion[/h2]
+[list]
+[*]Third-Person-Kamera zu Fuß und im Auto: Blickwinkel und Abstand mit rechter Maustaste und Mausrad; im Auto dreht sie um den Wagen und schwenkt beim Weiterfahren zurück.
+[*]Einstellbar: Höhe, Schulter, Empfindlichkeit, Totzone, Sichtfeld und Sichtweite – auf Wunsch auch in Gebäuden.
+[*]Der Server kann die Kamera für alle vorgeben (in AMP, Abschnitt RPG-Kamera).
+[/list]
+
+[h2]Planer (Umschalt+F9) – nach BAScheduler[/h2]
+[list]
+[*]Prüft jeden Schichtplan mit den Regeln des Spiels: offene Stunden ohne Personal, Schichten bei geschlossenem Geschäft, Doppelbelegungen, mehr als 12 Stunden am Tag, verschwundene Arbeitsplätze, Leute ohne Schicht und unerfüllte Wünsche des Personals.
+[*]Schätzt je Fertigkeit, ob das Personal reicht.
+[*]„Automatisch füllen“ mit dem eigenen Planer des Spiels, Geschäft für Geschäft, mit „Rückgängig“.
+[*][b]Öffnungszeiten nach Nachfrage:[/b] ein Wochenraster (7 × 24 Stunden) mit der Kundennachfrage des Geschäftstyps, ein Vorschlag und Stunden per Klick.
+[*]Im Mehrspieler sehen alle, was der Planer ändert; gemeinsame und fusionierte Geschäfte fasst er nicht an.
+[/list]
+
+[h2]Auswertung (Umschalt+F10) – nach SmartSuite[/h2]
+[list]
+[*]Überblick mit den Warnungen der letzten 7 Tage, Gewinn je Geschäft, Verlauf als Balken, Personal, Verkäufe je Produkt und Immobilien – gelesen aus den Büchern des Spiels, nichts wird verändert.
+[*][b]Geschäft verkaufen[/b], wenn der Server es erlaubt: mit einem Firmenwert aus 30 Tagen Durchschnittsgewinn; Mindestalter und Gewinntage legt der Server fest.
+[*][b]Gleiche Regeln für alle:[/b] Mieteinnahmen, Gebäudepreise, Kreditrahmen und Geschäftsverkauf stellt der Server ein – ein Gebäude kostet für jede Person dasselbe.
+[/list]
+
+[h2]Navigation (Umschalt+F11) und Autopilot – nach Voogle Route[/h2]
+[list]
+[*]Ziel suchen – jedes Geschäft nach Name oder Straße, eigene Orte, Lesezeichen – oder auf der Karte anklicken; dort gleich Hinlaufen, Hinfahren oder nur Navi.
+[*]Die Route als Linie im Bild und auf der Karte, im Auto über das Straßennetz des Spiels; ein Navi im Handy mit Abbiegung, Straßen, Ankunft und Spurwahl.
+[*][b]Autopilot:[/b] blinkt, hält an roten Ampeln, bremst für Autos, Leute zu Fuß und Mitspielende, fährt auf langen Geraden 60 und auf Brücken bis 90 km/h.
+[*][b]Parkt am Ziel selbst ein[/b] (abschaltbar) – oder fährt ins Parkhaus.
+[*][b]Folgt auf Wunsch Leuten aus deiner Steam-Freundesliste[/b] durch die Stadt.
+[*]Ohne Zusatz-Bibliotheken.
+[/list]
+
+[h2]Radio – nach Big Ambitions Radio[/h2]
+[list]
+[*]Eine eigene Radio-App im Handy: die Sender des Spiels, eigene Streams und die Senderliste des Servers, mit Favoriten, Suche und dem Titel, der gerade läuft.
+[*]Radio auch zu Fuß und über die Lautsprecher deiner Geschäfte.
+[*][b]Im Mehrspieler:[/b] Mitfahrende hören den Sender der Person am Steuer, und den Sender der Laden-Lautsprecher hören alle im Laden.
+[/list]
+
+[h2]Handy-Seiten – nach Aluna's Phone Pages[/h2]
+[list]
+[*]Die Apps auf Seiten zu acht, mit Pfeilen, Seitenzahl und Punkten; Apps per Ziehen umsortieren.
+[*]Die Apps der Module stehen gleich mit drin; Apps von Modulen, die der Server abschaltet, bleiben draußen.
+[/list]
+
+[h2]Neue Unternehmen – nach IT Business Expansion, Skill Kit und Spotless[/h2]
+[list]
+[*][b]IT-Firma[/b] im Büro: IT-Support, Softwareentwicklung und Cloud-Dienste, mit Blade-Servern, Rack-Servern und Großrechnern, die jeden Tag Strom kosten.
+[*][b]Reinigungsfirma[/b] im Büro: Die Teams putzen zuerst deine eigenen Geschäfte, dann zahlende Kundschaft der Stadt; Scheuersaugmaschine, Teppichreiniger und Fensterputz-Set machen sie schneller.
+[*][b]Waschsalon[/b] im Laden: Waschmaschinen und Trockner; die Leute aus dem Viertel waschen, trocknen oder geben ihre Wäsche ab.
+[*]Gegründet in BizMan, Personal von den Personalagenturen – ohne Skill Kit. Im Mehrspieler rechnet jedes Geschäft auf dem Rechner der Person, der es gehört.
+[/list]
+
+[h2]Dazu eigene Module[/h2]
+[list]
+[*][b]Going Online[/b] (Umschalt+F12): ein eigener Kabelanbieter mit Internet, Fernsehen und Telefon.
+[*][b]Ladenschilder[/b] (F7): eigene Bilder, das Firmenlogo neben dem Namen und Leuchteffekte – alle sehen sie.
+[*][b]Beklebung[/b] (im Fahrzeug neben „Fahrzeug parken“): jede Seite deines Fahrzeugs mit eigener Gestaltung, Farbe und deinem Logo – alle sehen sie.
+[*]Steuern per Telefon, Chat-Übersetzung Deutsch–Englisch, Fusionen: Firmen von mehreren Mitspielenden zu einer zusammenlegen.
+[/list]
+
+[h2]Danke[/h2]
+Alle Module sind eigene Umsetzungen, kein fremder Code. Danke an alle, die die Vorbilder gebaut haben – die Links stehen in der Beschreibung unter „Herkunft“.

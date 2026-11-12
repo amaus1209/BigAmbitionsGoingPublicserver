@@ -1,0 +1,1298 @@
+"""rigrun.py - scenario driver for the two-instance MP test rig (Agent economy, 2026-09-10).
+
+Runs a JSON scenario end to end: pre-flight, arm the TestDrive file-drop channel, launch the
+scenario's instances (top-level "instances": 2 or 3, default 2) with local\\launch-mp-test.bat, wait for each instance's ARMED line, send the scenario's
+commands as <role>-<seq>.cmd files, match each .result, grep each role's log from that role's last
+mark, then write a verdict report to .modding\\work\\runs\\.
+
+EVENTS OVER TIMERS: nothing ever "waits N seconds for state" - every wait is for a concrete event
+(a .result file, a log line) with a deadline, and a deadline that expires is a loud logged FAILURE.
+The only sleeps are steps that explicitly declare "sleep_s" (a scenario saying "now do nothing for
+N s", e.g. the 120 s heartbeat window).
+
+Usage:
+  python tools/rigrun.py tools/scenarios/t-p0-merger.json --session "TESTBATCH-0813"
+  python tools/rigrun.py <scenario.json> [--session NAME] [--var k=v ...] [--keep-open]
+  python tools/rigrun.py <scenario.json> --dry-run     # parse + print the step table, exit 0
+  python tools/rigrun.py --selftest                    # regex/capture machinery only, exit 0/1
+
+--dry-run and --selftest touch no process, no game folder and no channel.
+
+Rules this script encodes (from .modding/08-testdrive.md - the notes win over anything else):
+  * launcher: local\\launch-mp-test.bat is THE launcher; never bare-start the Steam exe.
+  * freshness: a failed launch does not recreate a log. Gate on mtime > launch time AND on log
+    IDENTITY (exactly one "channel ARMED" line; this run's marker present) - the stale-log trap.
+  * client logs Player-instance2/3.log truncate on relaunch with no -prev sibling: snapshot first.
+  * grep mod lines on the emitter prefix "[BAMP] [Tag]", never a bare tag.
+  * teardown via CloseMainWindow (WM_CLOSE), not taskkill /f - it exercises the real quit path;
+    taskkill by PID is the fallback only. Never kill by image name (that kills both instances).
+  * focus by WINDOW HANDLE, never PID/title, and only for the ONE sanctioned boot-focus flick.
+  * SAVE ROOT (RIG-SAVEROOT, 2026-09-26): every run exports BAMP_RIG_SAVEROOT=<LocalLow>\\...\\BAMP_RigSaves
+    before launching, so each DEV instance keeps its whole save root in BAMP_RigSaves\\<role> instead of the
+    Steam-Cloud-synced SaveGames (src/RigSaveRoot.cs). Before launch the fixture is re-copied there from
+    SaveGames (tools/fixture_reset.py prepare + reset - SaveGames is only read), and SaveGames is snapshotted
+    before launch and compared after teardown: a change is reported, and FAILS a scenario that declares
+    "savegames_untouched": true.
+"""
+
+import argparse
+import atexit
+import ctypes
+import ctypes.wintypes as wt
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import winreg
+
+ROOT = r"C:\code\BigAmbitionsMP"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fixture_reset                          # RIG-SAVEROOT: prepare + reset of the rig's own save roots
+LOCALLOW = r"C:\Users\allsc\AppData\LocalLow\Hovgaard Games\Big Ambitions"
+DEPLOYED = os.path.join(LOCALLOW, r"ModsLocal\BigAmbitionsMP\BigAmbitionsMP.dll")
+CHANNEL = os.path.join(LOCALLOW, r"BigAmbitionsMP\testdrive")
+ROLES = ["h", "c", "d"]                       # h = Steam install (host), c/d = the client installs
+INSTALLS = {"c": r"C:\BigAmbitions2", "d": r"C:\BigAmbitions3"}   # role by install path; else "h"
+LOGS = {"h": os.path.join(LOCALLOW, "Player.log"),
+        "c": os.path.join(LOCALLOW, "Player-instance2.log"),
+        "d": os.path.join(LOCALLOW, "Player-instance3.log")}
+LAUNCHER = os.path.join(ROOT, r"local\launch-mp-test.bat")
+RUNS = os.path.join(ROOT, r".modding\work\runs")   # LOCAL-FOLDER-1: local\ holds only the user's launch .bat files
+GAME_EXE = "Big Ambitions.exe"
+SAVEGAMES = os.path.join(LOCALLOW, "SaveGames")          # Steam-Cloud synced - the rig must never write here
+RIG_SAVEROOT = os.path.join(LOCALLOW, "BAMP_RigSaves")   # = fixture_reset.RIG; one sub-folder per role
+RIG_SAVEROOT_ENV = "BAMP_RIG_SAVEROOT"                   # read by src/RigSaveRoot.cs (DEV builds)
+
+ARMED_RE = {r: re.compile(r"\[BAMP\] \[TestDrive\] channel ARMED \(dev build, role '%s'\)" % r) for r in ROLES}
+RESULT_TIMEOUT_S = 60.0
+POLL_S = 0.5
+DEFAULT_WITHIN_S = 10.0
+BOOT_FREEZE_S = 60.0
+BOOT_FREEZE_LINES = 40
+ROLE_NAME = {"h": "host", "c": "client", "d": "client2"}
+# ONE role's own launcher, for a mid-scenario relaunch (launch-mp-test.bat starts the whole rig):
+INTERNAL_LAUNCHER = {r: os.path.join(ROOT, "local", "_launch_%s_internal.bat" % n) for r, n in ROLE_NAME.items()}
+DROP_GONE_S = 60.0          # a dropped instance has this long to exit after WM_CLOSE
+DROP_KILL_AFTER_S = 30.0    # ... after this, taskkill BY PID (never by image name)
+RELAUNCH_PROBE = 4096       # log-head bytes compared after a relaunch: did the log truncate or append?
+
+
+# ---------------------------------------------------------------- small helpers
+
+def now():
+    return time.time()
+
+
+def stamp(t=None):
+    return datetime.datetime.fromtimestamp(t or now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def say(msg):
+    text = "[%s] %s" % (stamp(), msg)
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:   # T-P3-3 run 2: a game log line with a non-cp1252 glyph crashed the driver BEFORE teardown
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(enc, "replace").decode(enc, "replace"), flush=True)
+
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True, shell=isinstance(cmd, str))
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
+def md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def dev_marker_count(path):
+    return open(path, "rb").read().replace(b"\x00", b"").count(b"DEV build")
+
+
+def head_commit():
+    rc, out, _ = run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"])
+    return out.strip() or "(unknown)"
+
+
+def image_running(name):
+    rc, out, _ = run(["tasklist", "/FI", "IMAGENAME eq %s" % name])
+    return name.lower() in out.lower()
+
+
+def build_running():
+    """A LIVE build, not a leftover build server.
+
+    MSBuild node reuse and the Roslyn compiler server leave `dotnet.exe` (VBCSCompiler.dll)
+    alive for a long time after a build finishes - measured on this machine 2026-09-10 - so a
+    bare 'is dotnet.exe running' test refuses forever. Gate on the command line instead.
+    """
+    if image_running("MSBuild.exe"):
+        return "MSBuild.exe is running (a build is in progress)"
+    rc, out, _ = run(["powershell", "-NoProfile", "-Command",
+                      "(Get-CimInstance Win32_Process -Filter \"Name='dotnet.exe'\").CommandLine"])
+    for line in out.splitlines():
+        low = line.lower()
+        if "vbcscompiler" in low or "nodemode" in low:
+            continue          # idle compiler/build server, not a build
+        if re.search(r"\bbuild\b|\bmsbuild\.dll\b", low):
+            return "a dotnet build is running: %s" % line.strip()[:120]
+    return None
+
+
+def tree_snapshot(top):
+    """{relative path: (size, mtime_ns)} for every file under `top` (RIG-SAVEROOT before/after check)."""
+    out = {}
+    for dp, dn, fn in os.walk(top):
+        for f in fn:
+            fp = os.path.join(dp, f)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            out[os.path.relpath(fp, top)] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def newest(snap):
+    return stamp(max(v[1] for v in snap.values()) / 1e9) if snap else "(empty)"
+
+
+# ---------------------------------------------------------------- log reading
+# The game holds Player*.log open for writing. Plain Python open() on Windows uses the CRT's
+# _SH_DENYNO share mode, so it does not deny the writer and is not denied by it; the ctypes
+# CreateFileW path below is the explicit FILE_SHARE_READ|WRITE|DELETE fallback in case a build
+# ever opens the log more restrictively.
+
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_u32 = ctypes.WinDLL("user32", use_last_error=True)
+
+
+def read_bytes_shared(path, offset=0):
+    """Read a live log from `offset` to EOF; returns b'' when the file is absent."""
+    if not os.path.exists(path):
+        return b""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            return f.read()
+    except PermissionError:
+        GENERIC_READ, OPEN_EXISTING = 0x80000000, 3
+        SHARE_ALL = 0x1 | 0x2 | 0x4
+        _k32.CreateFileW.restype = wt.HANDLE
+        h = _k32.CreateFileW(path, GENERIC_READ, SHARE_ALL, None, OPEN_EXISTING, 0x80, None)
+        if h == wt.HANDLE(-1).value:
+            return b""
+        try:
+            buf, out, got = ctypes.create_string_buffer(1 << 20), [], wt.DWORD(0)
+            _k32.SetFilePointerEx(h, ctypes.c_longlong(offset), None, 0)
+            while _k32.ReadFile(h, buf, len(buf), ctypes.byref(got), None) and got.value:
+                out.append(buf.raw[: got.value])
+            return b"".join(out)
+        finally:
+            _k32.CloseHandle(h)
+
+
+def read_text_from(path, offset=0):
+    return read_bytes_shared(path, offset).decode("utf-8", "replace")
+
+
+_LINEBREAK = re.compile(r"\r\n|\r|\n")
+
+
+def log_lines(path, start_off=0):
+    """(file line number of the first line, lines) of `path` from byte `start_off` on. Numbers count from
+    the top of the FILE, so an oracle hit can be opened straight from the report. Breaks are \r\n, \n AND a
+    lone \r (Unity logs carry some), the same count an editor or Select-String shows."""
+    data = read_bytes_shared(path, 0)
+    start_off = min(max(int(start_off or 0), 0), len(data))
+    head = data[:start_off].decode("utf-8", "replace")
+    return (len(_LINEBREAK.findall(head)) + 1,
+            _LINEBREAK.split(data[start_off:].decode("utf-8", "replace")))
+
+
+def absent_rows(patterns, sources):
+    """RIG-ORACLE-CLOSED-1: oracles_absent over EVERY source log - one FAIL row per (pattern, file) with
+    hits, naming the file and the first hit's line (plus the next line numbers). sources are
+    (path, start byte, role, file name shown in the report); each file is read once."""
+    texts = [(role, name) + log_lines(path, off) for path, off, role, name in sources]
+    rows = []
+    for pat in patterns:
+        rx = re.compile(pat)
+        for role, name, first, lines in texts:
+            hits = [(first + i, l.strip()[:200]) for i, l in enumerate(lines) if rx.search(l)]
+            if not hits:
+                continue
+            more = ""
+            if len(hits) > 1:
+                more = " (lines %s%s)" % (",".join(str(n) for n, _ in hits[:8]), ",..." if len(hits) > 8 else "")
+            rows.append(("FAIL", "%s: /%s/ x%d -> %s:%d: %s%s" % (ROLE_NAME.get(role, role), pat, len(hits), name,
+                                                                 hits[0][0], hits[0][1], more)))
+    return rows
+
+
+def log_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def log_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+# ---------------------------------------------------------------- processes / windows
+
+def game_processes():
+    """[(pid, path, role)] for every running Big Ambitions.exe, role by install PATH."""
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    arr = (wt.DWORD * 4096)()
+    got = wt.DWORD()
+    if not psapi.EnumProcesses(ctypes.byref(arr), ctypes.sizeof(arr), ctypes.byref(got)):
+        return []
+    out = []
+    for pid in arr[: got.value // ctypes.sizeof(wt.DWORD)]:
+        if not pid:
+            continue
+        h = _k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            continue
+        try:
+            buf, size = ctypes.create_unicode_buffer(32768), wt.DWORD(32768)
+            if _k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                path = buf.value
+                if os.path.basename(path).lower() == GAME_EXE.lower():
+                    role = "h"
+                    for rl, inst in INSTALLS.items():
+                        if path.lower().startswith(inst.lower()):
+                            role = rl
+                            break
+                    out.append((pid, path, role))
+        finally:
+            _k32.CloseHandle(h)
+    return out
+
+
+def windows_of_pid(pid):
+    hwnds = []
+    CB = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+    def cb(hwnd, _):
+        p = wt.DWORD()
+        _u32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if p.value == pid and _u32.IsWindowVisible(hwnd):
+            hwnds.append(hwnd)
+        return True
+
+    _u32.EnumWindows(CB(cb), 0)
+    return hwnds
+
+
+def boot_focus_flick(role, report):
+    """The ONE sanctioned focus steal (08-testdrive.md 'No-takeover exception'), by WINDOW HANDLE."""
+    target = [p for p in game_processes() if p[2] == role]
+    if not target:
+        say("FLICK %s: no process found - cannot flick" % ROLE_NAME[role])
+        return False
+    hwnds = windows_of_pid(target[0][0])
+    if not hwnds:
+        say("FLICK %s: process %d has no visible window yet" % (ROLE_NAME[role], target[0][0]))
+        return False
+    hwnd, prev = hwnds[0], _u32.GetForegroundWindow()
+    say("FLICK %s (announced per 08-testdrive.md): hwnd=%s pid=%d" % (ROLE_NAME[role], hwnd, target[0][0]))
+    _u32.keybd_event(0x12, 0, 0, 0)   # ALT down - defeats the foreground lock
+    _u32.keybd_event(0x12, 0, 2, 0)   # ALT up
+    _u32.SetForegroundWindow(hwnd)
+    time.sleep(0.4)
+    ok = _u32.GetForegroundWindow() == hwnd
+    if prev:
+        _u32.SetForegroundWindow(prev)
+    report.append("FLICK %s at %s (verified=%s, foreground restored)" % (ROLE_NAME[role], stamp(), ok))
+    say("FLICK %s verified=%s; previous foreground restored" % (ROLE_NAME[role], ok))
+    return ok
+
+
+def close_instances(report):
+    """Teardown the way the notes require: WM_CLOSE (the real quit path), taskkill by PID last."""
+    procs = game_processes()
+    if not procs:
+        return
+    for pid, path, role in procs:
+        say("teardown: WM_CLOSE %s pid=%d (%s)" % (ROLE_NAME[role], pid, path))
+        for hwnd in windows_of_pid(pid):
+            _u32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE == CloseMainWindow
+    deadline = now() + 120
+    while now() < deadline and game_processes():
+        time.sleep(1.0)
+    left = game_processes()
+    for pid, path, role in left:
+        say("teardown: %s pid=%d survived WM_CLOSE - taskkill by PID (never by image name)" % (ROLE_NAME[role], pid))
+        run(["taskkill", "/PID", str(pid), "/F"])
+        report.append("teardown: %s pid=%d needed taskkill /PID after WM_CLOSE" % (ROLE_NAME[role], pid))
+
+
+# ---------------------------------------------------------------- host window prefs (the user's REAL install)
+# 2026-09-28: the host instance is the user's own Steam install, and Unity saves its window size in the registry, so a
+# run with a window size left the user's game opening at that size. A run WITH a window size saves every
+# 'Screenmanager*' value (with its type) at launch and puts them back exactly - values the run created are deleted - when
+# the run ends: normal end, failure, abort, Ctrl+C (try/finally in main + atexit). Runs without a window size touch nothing.
+UNITY_PREFS_KEY = r"Software\Hovgaard Games\Big Ambitions"
+UNITY_SCREEN_VALUES = ("Screenmanager Resolution Width_h182942802", "Screenmanager Resolution Height_h2627697771",
+                       "Screenmanager Resolution Window Width_h2524650974", "Screenmanager Resolution Window Height_h1684712807",
+                       "Screenmanager Fullscreen mode_h3630240806", "Screenmanager Resolution Use Native_h1405027254")
+
+
+class HostWindowPrefs:
+    def __init__(self):
+        self.saved = None          # {name: (value, type)}; a listed name missing here was absent
+        self.names = list(UNITY_SCREEN_VALUES)
+        self.done = False
+
+    @staticmethod
+    def _read():
+        vals = {}
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, UNITY_PREFS_KEY, 0, winreg.KEY_READ) as k:
+                i = 0
+                while True:
+                    try:
+                        name, value, typ = winreg.EnumValue(k, i)
+                    except OSError:
+                        break
+                    if name.startswith("Screenmanager"):
+                        vals[name] = (value, typ)
+                    i += 1
+        except FileNotFoundError:
+            pass
+        return vals
+
+    @staticmethod
+    def _fmt(vals, names):
+        out = []
+        for n in names:
+            v = vals.get(n)
+            short = n.split("_h")[0].replace("Screenmanager ", "")
+            out.append("%s=%s" % (short, "absent" if v is None else
+                                  (v[0].hex() if isinstance(v[0], bytes) else v[0])))
+        return ", ".join(out)
+
+    def save(self):
+        if self.saved is not None:
+            return
+        self.saved = self._read()
+        self.names = sorted(set(self.saved) | set(UNITY_SCREEN_VALUES))
+        atexit.register(self.restore)
+        say("host window prefs SAVED at launch (HKCU\\%s): %s" % (UNITY_PREFS_KEY, self._fmt(self.saved, self.names)))
+
+    def restore(self):
+        if self.saved is None or self.done:
+            return
+        self.done = True
+        try:
+            after = self._read()
+            names = sorted(set(self.saved) | set(after) | set(UNITY_SCREEN_VALUES))
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, UNITY_PREFS_KEY, 0, winreg.KEY_SET_VALUE) as k:
+                for n in names:
+                    before = self.saved.get(n)
+                    if before is None:
+                        if n in after:
+                            winreg.DeleteValue(k, n)
+                    elif after.get(n) != before:
+                        winreg.SetValueEx(k, n, 0, before[1], before[0])
+            back = self._read()
+            exact = all(back.get(n) == self.saved.get(n) for n in names)
+            running = game_processes()
+            say("host window prefs RESTORED%s (HKCU\\%s): after the run %s -> now %s%s"
+                % ("" if exact else " - MISMATCH", UNITY_PREFS_KEY, self._fmt(after, names), self._fmt(back, names),
+                   " - WARNING: the game is still running and may write its size again when it quits" if running else ""))
+        except Exception as e:
+            say("host window prefs restore FAILED: %s - the values saved at launch were %s" % (e, self._fmt(self.saved, self.names)))
+
+
+_WINPREFS = HostWindowPrefs()
+
+
+# ---------------------------------------------------------------- scenario machinery
+
+VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+class Unresolved(Exception):
+    pass
+
+
+def subst(text, vars_, escape=False):
+    """${var} substitution. Pass escape for REGEX fields (expect/refute/log patterns): captured values are
+    literal data (an employee id can start with '+', addresses hold '.'), so they are re.escape'd there -
+    run T-P0-2 2026-09-10 died on a '+lRSN...' id used as a pattern (nothing to repeat)."""
+    if text is None:
+        return None
+
+    def one(m):
+        k = m.group(1)
+        if k not in vars_ or vars_[k] is None:
+            raise Unresolved(k)
+        v = str(vars_[k])
+        return re.escape(v) if escape else v
+
+    return VAR_RE.sub(one, text)
+
+
+def apply_captures(capture, result_text, vars_):
+    """A step's capture map: regex -> first group of the match against the step's .result text."""
+    got = {}
+    for name, pattern in (capture or {}).items():
+        pattern = subst(pattern, vars_, escape=True)   # T-P1-3 run 2 lesson: captures carried a raw ${dPid} into re.search
+        m = re.search(pattern, result_text)
+        if not m:
+            return None, "capture '%s' did not match /%s/" % (name, pattern)
+        got[name] = (m.group(1) if m.groups() else m.group(0)).strip()
+    vars_.update(got)
+    return got, None
+
+
+def apply_derives(derive, vars_):
+    """A step's derive map: name -> [sourceVar, delta]. Decimal arithmetic on a captured number, written back with two
+    decimals (the money verbs print F2). Exists so an oracle can accept 'B minus one legitimate fee' (t-walletdupe)."""
+    from decimal import Decimal
+    got = {}
+    for name, spec in (derive or {}).items():
+        try:
+            src, delta = spec
+            got[name] = "%.2f" % (Decimal(str(vars_[src])) + Decimal(str(delta)))
+        except Exception as e:
+            return None, "derive '%s' failed: %s" % (name, e)
+    vars_.update(got)
+    return got, None
+
+
+def validate_scenario(sc):
+    """Shape rules for a scenario dict. load_scenario applies them to a parsed file; --selftest calls
+    this directly on in-memory dicts. drop/relaunch are cmd-less step kinds, exactly like sleep_s."""
+    steps = sc.get("steps") or []
+    inst = sc.get("instances", 2)
+    if inst not in (2, 3):
+        raise ValueError('"instances" must be 2 or 3 (absent = 2, the old two-instance rig)')
+    active = ROLES[:inst]
+    for i, s in enumerate(steps, 1):
+        s.setdefault("seq", i)
+        if s.get("role") not in tuple(ROLES) + ("both", "all"):
+            raise ValueError("step %d: role must be %s|both|all" % (i, "|".join(ROLES)))
+        if s.get("role") in ROLES and s["role"] not in active:
+            raise ValueError("step %d: role '%s' needs instances=%d"
+                             % (i, s["role"], ROLES.index(s["role"]) + 1))
+        if s.get("drop") and s.get("relaunch"):
+            raise ValueError("step %d: drop and relaunch are separate steps" % i)
+        if (s.get("drop") or s.get("relaunch")) and (s.get("cmd") or s.get("sleep_s")):
+            raise ValueError("step %d: a drop/relaunch step is cmd-less (like sleep_s)" % i)
+        if (s.get("drop") or s.get("relaunch")) and s.get("role") not in active:
+            raise ValueError("step %d: drop/relaunch needs ONE concrete role (%s), not '%s'"
+                             % (i, "|".join(active), s.get("role")))
+        if not s.get("cmd") and not s.get("sleep_s") and not s.get("drop") and not s.get("relaunch"):
+            raise ValueError("step %d: needs cmd, sleep_s, drop or relaunch" % i)
+    return sc
+
+
+def load_scenario(path):
+    with open(path, "r", encoding="utf-8") as f:
+        sc = json.load(f)
+    return validate_scenario(sc)
+
+
+def step_label(s):
+    """The 'cmd' column for any step, including the cmd-less kinds (sleep_s / drop / relaunch)."""
+    if s.get("cmd"):
+        return s["cmd"]
+    if s.get("drop"):
+        return "(drop %s)" % ROLE_NAME.get(s.get("role"), s.get("role"))
+    if s.get("relaunch"):
+        return "(relaunch %s)" % ROLE_NAME.get(s.get("role"), s.get("role"))
+    return "(wait %ss)" % s.get("sleep_s")
+
+
+# ---------------------------------------------------------------- the runner
+
+class Run:
+    def __init__(self, sc, args):
+        self.sc, self.args = sc, args
+        self.vars = dict(sc.get("vars") or {})
+        if args.session:
+            self.vars["session"] = args.session
+        for kv in args.var or []:
+            k, _, v = kv.partition("=")
+            self.vars[k.strip()] = v
+        self.rows, self.notes, self.seq = [], [], 0
+        self.instances = int(sc.get("instances", 2) or 2)
+        self.active = ROLES[: self.instances]           # 2 -> h,c (unchanged); 3 -> h,c,d
+        self.mark_off = {r: 0 for r in ROLES}
+        self.prev_mark_off = {r: 0 for r in ROLES}
+        self.run_start_off = {r: 0 for r in ROLES}
+        self.flicked = {r: False for r in ROLES}
+        self.down = set()                            # roles DROPPED right now (D3: all/both skip them)
+        self.drops = 0                               # drop counter -> <role>-drop-<k>-<log name>.log
+        self.snaps = []                              # (path, run-start byte, role) of every drop snapshot: oracles_absent scans them
+        self.drop_off = {r: 0 for r in ROLES}        # each role's log size at its drop
+        self.drop_head = {r: b"" for r in ROLES}     # log head at drop: truncated-or-appended test
+        self.launch_t = None
+        self.id = sc.get("id", "run")
+        self.rundir = os.path.join(RUNS, "%s-%s" % (self.id, datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
+
+    # ---- channel
+    def send(self, role, cmd):
+        self.seq += 1
+        base = "%s-%03d.cmd" % (role, self.seq)
+        p = os.path.join(CHANNEL, base)
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write(cmd + "\n")
+        say("-> %s: %s  (%s)" % (ROLE_NAME[role], cmd, base))
+        deadline = now() + RESULT_TIMEOUT_S
+        rp = p + ".result"
+        while now() < deadline:
+            if os.path.exists(rp):
+                time.sleep(0.05)
+                try:
+                    txt = open(rp, "r", encoding="utf-8", errors="replace").read().strip()
+                except OSError:
+                    time.sleep(POLL_S)
+                    continue
+                say("<- %s: %s" % (ROLE_NAME[role], txt.splitlines()[0][:160] if txt else "(empty)"))
+                return txt, None
+            time.sleep(POLL_S)
+        msg = "TIMEOUT: no %s.result after %.0fs (instance not polling the channel, or the verb hung)" % (
+            base, RESULT_TIMEOUT_S)
+        say("FAIL " + msg)
+        return "", msg
+
+    def mark(self, role, text):
+        size = log_size(LOGS[role])
+        # expect_log entries with "since_prev_step": true search from the mark BEFORE this one: evidence a
+        # game-clock event may log while the previous step is still waiting (t-rivals-c step 19).
+        self.prev_mark_off[role] = self.mark_off[role]
+        res, err = self.send(role, "mark " + text)
+        if err:
+            return err
+        deadline = now() + DEFAULT_WITHIN_S
+        pat = re.compile(r"\[BAMP\] \[TestDrive\].*MARK .*" + re.escape(text))
+        while now() < deadline:
+            if pat.search(read_text_from(LOGS[role], size)):
+                # bracket from the byte offset captured BEFORE the mark was sent: strictly at or
+                # before the mark line, so a step's expect_log can never miss its own evidence.
+                self.mark_off[role] = size
+                return None
+            time.sleep(POLL_S)
+        self.mark_off[role] = size
+        return "mark '%s' never appeared in the %s log within %.0fs" % (text, ROLE_NAME[role], DEFAULT_WITHIN_S)
+
+    def wait_log(self, role, pattern, within_s, from_off=None):
+        deadline = now() + within_s
+        rx = re.compile(pattern)
+        while True:
+            text = read_text_from(LOGS[role], self.mark_off[role] if from_off is None else from_off)
+            for line in text.splitlines():
+                if rx.search(line):
+                    return line.strip()[:200], None
+            if now() >= deadline:
+                return "", "TIMEOUT: %s log never showed /%s/ within %.0fs (searched from this step's mark)" % (
+                    ROLE_NAME[role], pattern, within_s)
+            time.sleep(POLL_S)
+
+    # ---- pre-flight
+    def preflight(self):
+        problems = []
+        if image_running(GAME_EXE):
+            problems.append("%s is already running - the rig must start from a cold pair" % GAME_EXE)
+        b = build_running()
+        if b:
+            problems.append("never run the rig over a build - " + b)
+        if not os.path.exists(DEPLOYED):
+            problems.append("deployed DLL missing: %s" % DEPLOYED)
+        else:
+            mk = dev_marker_count(DEPLOYED)
+            if mk == 0:
+                problems.append("deployed DLL has 0 'DEV build' markers - the command channel is dev-only "
+                                "(a Release build is in the mod slot)")
+            self.deployed_md5, self.markers = md5(DEPLOYED), mk
+        if not os.path.exists(LAUNCHER):
+            problems.append("launcher missing: %s" % LAUNCHER)
+        self.head = head_commit()
+        return problems
+
+    def prepare_saves(self):
+        """RIG-SAVEROOT: rebuild the rig's own save roots from the fixture, point the launch at them, and
+        snapshot SaveGames. Returns an error string, or None."""
+        v = self.vars
+        session = str(v.get("session", "save1"))
+        pt = str(v.get("playthrough") or "*")
+        keep = str(v.get("keepMerger", "")).strip().lower() in ("1", "true", "yes")
+        lines = []
+        try:
+            n = fixture_reset.prepare(session, pt, log=lines.append)
+            dirty, _, seen = fixture_reset.reset(session, pt, check=False, keep_merger=keep, log=lines.append)
+        except Exception as e:
+            return "rig save root preparation failed: %s: %s" % (type(e).__name__, e)
+        for l in lines:
+            say("fixture: " + l)
+        os.environ[RIG_SAVEROOT_ENV] = RIG_SAVEROOT       # inherited by the launcher, its bats and every relaunch
+        self.notes.append("save root: %s=%s (fixture '%s': %d session folder(s) copied from SaveGames, "
+                          "%d manifest(s) in the rig root, %d reset)" % (RIG_SAVEROOT_ENV, RIG_SAVEROOT, session,
+                                                                         n, seen, dirty))
+        self.sg_before = tree_snapshot(SAVEGAMES)
+        self.notes.append("SaveGames before launch: %d file(s), newest %s" % (len(self.sg_before), newest(self.sg_before)))
+        return None
+
+    def savegames_check(self):
+        """Compare SaveGames with the pre-launch snapshot. One oracle row: FAIL when the scenario declares
+        "savegames_untouched": true and anything changed, else REPORT."""
+        before = getattr(self, "sg_before", None)
+        if before is None:
+            return []
+        after = tree_snapshot(SAVEGAMES)
+        added = sorted(set(after) - set(before))
+        gone = sorted(set(before) - set(after))
+        changed = sorted(k for k in set(after) & set(before) if after[k] != before[k])
+        self.notes.append("SaveGames after teardown: %d file(s), newest %s" % (len(after), newest(after)))
+        if not (added or gone or changed):
+            return [("REPORT", "SaveGames UNTOUCHED: %d file(s) before and after, newest %s both times"
+                     % (len(after), newest(after)))]
+        # Review MEDIUM-2: EVERY rig run must leave SaveGames untouched (a silently failed redirect would
+        # otherwise write into the Steam-synced folder and still PASS). A scenario may opt out only explicitly.
+        kind = "FAIL" if self.sc.get("savegames_untouched", True) else "REPORT"
+        sample = (["+" + a for a in added] + ["-" + g for g in gone] + ["~" + c for c in changed])[:5]
+        return [(kind, "SaveGames CHANGED: %d added, %d removed, %d modified (files %d -> %d, newest %s -> %s): %s"
+                 % (len(added), len(gone), len(changed), len(before), len(after), newest(before), newest(after),
+                    "; ".join(sample)))]
+
+    def arm_channel(self):
+        os.makedirs(CHANNEL, exist_ok=True)
+        stale = [f for f in os.listdir(CHANNEL) if f.endswith(".cmd") or f.endswith(".result")]
+        for f in stale:
+            try:
+                os.remove(os.path.join(CHANNEL, f))
+            except OSError:
+                pass
+        if stale:
+            self.notes.append("cleared %d stale channel file(s) before arming" % len(stale))
+        os.makedirs(self.rundir, exist_ok=True)
+        # a client log truncates on relaunch with no -prev sibling: snapshot EVERY one that exists
+        for role in ROLES[1:]:
+            if os.path.exists(LOGS[role]):
+                shutil.copy2(LOGS[role], os.path.join(
+                    self.rundir, "pre-launch-%s-%s" % (ROLE_NAME[role], os.path.basename(LOGS[role]))))
+        self.pre_mtime = {r: log_mtime(LOGS[r]) for r in ROLES}
+
+    def launch(self):
+        self.launch_t = now()
+        say("launching %d instance(s) [%s] via %s" % (self.instances, ",".join(self.active), LAUNCHER))
+        # Per-scenario HOST window size (2026-09-28, screenshot checks at two sizes): scenario "window": "1280x720", or the
+        # BAMP_RIG_WINDOW environment variable (wins). Passed as Unity's own -screen-* switches through BAMP_SCREEN_ARGS,
+        # which local\_launch_host_internal.bat appends to the game's command line. Unset = the game's own size.
+        env = dict(os.environ)
+        win = (os.environ.get("BAMP_RIG_WINDOW") or str(self.sc.get("window") or "")).lower().strip()
+        env.pop("BAMP_SCREEN_ARGS", None)
+        if win:
+            ww, _, wh = win.partition("x")
+            env["BAMP_SCREEN_ARGS"] = "-screen-width %d -screen-height %d -screen-fullscreen 0" % (int(ww), int(wh))
+            self.notes.append("host window %sx%s (BAMP_SCREEN_ARGS=%s)" % (ww, wh, env["BAMP_SCREEN_ARGS"]))
+            _WINPREFS.save()   # the user's own window size goes back when the run ends (HostWindowPrefs)
+        subprocess.Popen(["cmd", "/c", "start", "", "/D", os.path.dirname(LAUNCHER), "cmd", "/c", LAUNCHER,   # cmd /c: the launcher window closes when the batch ends (2026-09-11: `start x.bat` runs it under /K and left one console per run)
+                          str(self.instances)], creationflags=0x00000008, env=env)
+        self.notes.append("launch at %s via local\\launch-mp-test.bat %d" % (stamp(self.launch_t), self.instances))
+
+    def relaunch_offset(self, role):
+        """Byte offset where a RELAUNCHED instance's log starts: 0 when the log was recreated (the usual
+        case - Player-instance*.log truncates with no -prev sibling), else the size captured at the drop,
+        so the 'exactly one ARMED line' rule counts only the new instance's lines. A log that truncated
+        and already grew past the old size is caught by comparing its head with the head kept at drop."""
+        off = self.drop_off.get(role, 0)
+        if off <= 0 or log_size(LOGS[role]) < off:
+            return 0
+        return off if read_bytes_shared(LOGS[role], 0)[:RELAUNCH_PROBE] == self.drop_head.get(role) else 0
+
+    def wait_armed(self, role, timeout_s=300.0, since_t=None, relaunch=False):
+        """Freshness: mtime newer than the launch this wait belongs to (the rig launch, or a relaunch's
+        own start time). Identity: exactly one ARMED line for this role, counted from relaunch_offset."""
+        path = LOGS[role]
+        launch_t = self.launch_t if since_t is None else since_t
+        deadline, last_size, last_growth = now() + timeout_s, -1, now()
+        while now() < deadline:
+            off = self.relaunch_offset(role) if relaunch else 0
+            if log_mtime(path) > launch_t:
+                text = read_text_from(path, off)
+                hits = ARMED_RE[role].findall(text)
+                if len(hits) == 1:
+                    self.run_start_off[role] = off
+                    self.mark_off[role] = off
+                    say("%s ARMED (fresh log, exactly one ARMED line%s)"
+                        % (ROLE_NAME[role], (" after byte %d" % off) if off else ""))
+                    return None
+                if len(hits) > 1:
+                    return ("%s log carries %d 'channel ARMED' lines (from byte %d) - that is a stale/shared "
+                            "log, not this run's (08-testdrive.md stale-log trap)"
+                            % (ROLE_NAME[role], len(hits), off))
+                size, lines = log_size(path), text.count("\n")
+                if size != last_size:
+                    last_size, last_growth = size, now()
+                elif (now() - last_growth) > BOOT_FREEZE_S and lines < BOOT_FREEZE_LINES and not self.flicked[role]:
+                    self.flicked[role] = True
+                    boot_focus_flick(role, self.notes)
+                    last_growth = now()
+            time.sleep(1.0)
+        return "%s never logged its ARMED line within %.0fs of launch (log mtime fresh=%s)" % (
+            ROLE_NAME[role], timeout_s, log_mtime(path) > launch_t)
+
+    # ---- drop / relaunch of ONE instance mid-scenario
+    def cmdless_row(self, seq, role, label, expected, verdict, evidence):
+        self.rows.append((seq, role, label, "-", expected, verdict, evidence[:200]))
+        say(("" if verdict == "PASS" else "FAIL ") + "step %d (%s): %s" % (seq, ROLE_NAME[role], evidence))
+        return verdict == "PASS"
+
+    def drop_role(self, step):
+        """D1: WM_CLOSE exactly ONE role, wait for its process to be GONE (never a fixed sleep), then
+        snapshot that role's log because the relaunch truncates it. Never kills by image name."""
+        seq, role, label = step["seq"], step["role"], step_label(step)
+        exp, note = "process gone", step.get("note", "")
+        if role in self.down:
+            return self.cmdless_row(seq, role, label, exp, "FAIL", "role %s is already dropped" % role)
+        mine = [p for p in game_processes() if p[2] == role]
+        if not mine:
+            return self.cmdless_row(seq, role, label, exp, "FAIL",
+                                    "no %s process is running to drop" % ROLE_NAME[role])
+        pid, t0, killed = mine[0][0], now(), False
+        say("drop %s: WM_CLOSE pid=%d%s" % (ROLE_NAME[role], pid, (" - " + note) if note else ""))
+        for hwnd in windows_of_pid(pid):
+            _u32.PostMessageW(hwnd, 0x0010, 0, 0)      # WM_CLOSE == CloseMainWindow, the real quit path
+        while now() - t0 < DROP_GONE_S:
+            if not [p for p in game_processes() if p[0] == pid]:
+                break
+            if not killed and (now() - t0) > DROP_KILL_AFTER_S:
+                killed = True
+                say("drop %s: pid=%d survived WM_CLOSE %.0fs - taskkill by PID (never by image name)"
+                    % (ROLE_NAME[role], pid, DROP_KILL_AFTER_S))
+                run(["taskkill", "/PID", str(pid), "/F"])
+                self.notes.append("drop step %d: %s pid=%d needed taskkill /PID after %.0fs"
+                                  % (seq, ROLE_NAME[role], pid, DROP_KILL_AFTER_S))
+            time.sleep(POLL_S)
+        took = now() - t0
+        if [p for p in game_processes() if p[0] == pid]:
+            return self.cmdless_row(seq, role, label, exp, "FAIL",
+                                    "%s pid=%d still alive %.0fs after WM_CLOSE (+taskkill)"
+                                    % (ROLE_NAME[role], pid, took))
+        self.drops += 1
+        self.drop_off[role] = log_size(LOGS[role])
+        data = read_bytes_shared(LOGS[role], 0)
+        self.drop_head[role] = data[:RELAUNCH_PROBE]
+        # RIG-ORACLE-CLOSED-1: the name carries the log's own name (c-drop-1-Player-instance2.log) so the
+        # per-log exception / patch-failure summary in tools/regress.py ('*Player*.log') counts it too.
+        snap = os.path.join(self.rundir, "%s-drop-%d-%s" % (role, self.drops, os.path.basename(LOGS[role])))
+        try:
+            os.makedirs(self.rundir, exist_ok=True)
+            with open(snap, "wb") as f:
+                f.write(data)
+            self.snaps.append((snap, self.run_start_off[role], role))
+        except OSError as e:
+            self.notes.append("drop step %d: could not snapshot the %s log: %s" % (seq, ROLE_NAME[role], e))
+        self.down.add(role)
+        self.notes.append("DROP step %d: %s pid=%d WM_CLOSE at %s, gone after %.1fs, snapshot %s (%d bytes)"
+                          % (seq, ROLE_NAME[role], pid, stamp(t0), took, os.path.basename(snap),
+                             self.drop_off[role]))
+        ok, ev = self.check_logs_from_last_mark(step, role)
+        if not ok:
+            say("FAIL step %d (%s): %s" % (seq, ROLE_NAME[role], ev))
+            return self.cmdless_row(seq, role, label, exp, "FAIL", ev)
+        return self.cmdless_row(seq, role, label, exp, "PASS",
+                                ("dropped pid=%d after %.1fs" % (pid, took)) + ((" | " + ev) if ev else ""))
+
+    def relaunch_role(self, step):
+        """D2: start ONLY this role's internal launcher, then wait for a FRESH ARMED line from the new
+        process and rebase its marks. join/acceptjoin afterwards are scenario business, not the driver's."""
+        seq, role, label = step["seq"], step["role"], step_label(step)
+        exp = "fresh ARMED line"
+        if role not in self.down:
+            return self.cmdless_row(seq, role, label, exp, "FAIL",
+                                    "role %s is not dropped - nothing to relaunch" % role)
+        bat = INTERNAL_LAUNCHER[role]
+        if not os.path.exists(bat):
+            return self.cmdless_row(seq, role, label, exp, "FAIL", "internal launcher missing: %s" % bat)
+        t0 = now()
+        say("relaunch %s via %s" % (ROLE_NAME[role], os.path.basename(bat)))
+        subprocess.Popen(["cmd", "/c", "start", "", "/D", os.path.dirname(bat), "cmd", "/c", bat], creationflags=0x00000008)   # cmd /c: no console left behind
+        err = self.wait_armed(role, since_t=t0, relaunch=True)
+        if err:
+            return self.cmdless_row(seq, role, label, exp, "FAIL", err)
+        took, off = now() - t0, self.mark_off[role]
+        self.down.discard(role)
+        self.drop_off[role], self.drop_head[role] = 0, b""
+        self.notes.append("RELAUNCH step %d: %s started at %s via %s, ARMED at %s (%.1fs); marks rebased to byte %d"
+                          % (seq, ROLE_NAME[role], stamp(t0), os.path.basename(bat), stamp(), took, off))
+        ok, ev = self.check_logs_from_last_mark(step, role)
+        if not ok:
+            say("FAIL step %d (%s): %s" % (seq, ROLE_NAME[role], ev))
+            return self.cmdless_row(seq, role, label, exp, "FAIL", ev)
+        return self.cmdless_row(seq, role, label, exp, "PASS",
+                                ("relaunched pid fresh, ARMED after %.1fs (log offset %d)" % (took, off)) + ((" | " + ev) if ev else ""))
+
+    # ---- steps
+    def roles_of(self, step):
+        if step["role"] in ("both", "all"):
+            want = ["h", "c"] if step["role"] == "both" else list(self.active)
+            live = [r for r in want if r not in self.down]
+            if len(live) != len(want):
+                self.notes.append("step %s ('%s'): skipped dropped role(s) %s"
+                                  % (step.get("seq"), step["role"], ",".join(r for r in want if r in self.down)))
+            return live
+        return [step["role"]]
+
+    def check_logs_from_last_mark(self, step, default_role):
+        """expect_log for a cmd-less step (drop/relaunch): searched from each role's LAST mark, because
+        the evidence (a take-over on disconnect) can precede any mark sent after the step itself."""
+        evidence = ""
+        for el in step.get("expect_log") or []:
+            lrole = el.get("role", default_role)
+            try:
+                pat = subst(el["regex"], self.vars, escape=True)
+            except Unresolved as u:
+                return False, "expect_log has unresolved ${%s}" % u
+            line, lerr = self.wait_log(lrole, pat, float(el.get("within_s", DEFAULT_WITHIN_S)),
+                                          self.prev_mark_off[lrole] if el.get("since_prev_step") else None)
+            if lerr:
+                return False, lerr
+            evidence = (evidence + " | " if evidence else "") + "%s: %s" % (ROLE_NAME[lrole], line)
+        return True, evidence
+
+    def do_step(self, step):
+        seq, verdicts = step["seq"], []
+        if step.get("drop"):
+            return self.drop_role(step)
+        if step.get("relaunch"):
+            return self.relaunch_role(step)
+        if not step.get("cmd"):
+            say("step %d: declared wait of %ss (%s)" % (seq, step["sleep_s"], step.get("note", "")))
+            time.sleep(float(step["sleep_s"]))
+            self.rows.append((seq, step["role"], "(wait %ss)" % step["sleep_s"], "-", "declared wait", "PASS", ""))
+            return True
+        ok_all = True
+        for role in self.roles_of(step):
+            if role in self.down:                       # explicitly addressed, so it cannot be skipped
+                self.rows.append((seq, role, step["cmd"], "-", step.get("expect_result", ""), "FAIL",
+                                  "role %s is dropped" % role))
+                say("FAIL step %d: role %s is dropped" % (seq, role))
+                return False
+            try:
+                cmd = subst(step["cmd"], self.vars)
+                exp = subst(step.get("expect_result"), self.vars, escape=True)
+                refute = subst(step.get("refute_result"), self.vars, escape=True)
+            except Unresolved as u:
+                self.rows.append((seq, role, step["cmd"], "-", step.get("expect_result", ""), "FAIL",
+                                  "unresolved variable ${%s} (pass --var %s=... or fix the capture)" % (u, u)))
+                say("FAIL step %d: unresolved variable ${%s}" % (seq, u))
+                return False
+            err = self.mark(role, "TEST %s STEP %d" % (self.id, seq))
+            if err:
+                self.notes.append("step %d (%s): %s" % (seq, role, err))
+            res, terr = self.send(role, cmd)
+            verdict, evidence = "PASS", ""
+            if terr:
+                verdict, evidence = "FAIL", terr
+            elif exp and not re.search(exp, res, re.S):
+                verdict, evidence = "FAIL", "result did not match /%s/" % exp
+            elif refute and re.search(refute, res, re.S):
+                verdict, evidence = "FAIL", "result still matches the refuted /%s/" % refute
+            if verdict == "PASS" and step.get("capture"):
+                got, cerr = apply_captures(step["capture"], res, self.vars)
+                if cerr:
+                    verdict, evidence = "FAIL", cerr
+                else:
+                    evidence = "captured " + ", ".join("%s=%s" % kv for kv in got.items())
+            if verdict == "PASS" and step.get("derive"):
+                dgot, derr = apply_derives(step["derive"], self.vars)
+                if derr:
+                    verdict, evidence = "FAIL", derr
+                else:
+                    evidence = (evidence + "; " if evidence else "") + "derived " + ", ".join("%s=%s" % kv for kv in dgot.items())
+            if verdict == "PASS" and step.get("expect_gt"):
+                # H-SALEHOLE-1 part 2: "this number ROSE since an earlier checkpoint". A regex cannot express
+                # greater-than, so the check is spelled out: {"field-regex": "...", ...} -> the regex's first
+                # group is compared numerically against the (substituted) baseline value.
+                from decimal import Decimal
+                for gpat, gthan in (step["expect_gt"] or {}).items():
+                    try:
+                        gp = subst(gpat, self.vars, escape=True)   # a regex field: substituted values are escaped, like every other one
+                        gt_base = subst(str(gthan), self.vars)
+                    except Unresolved as u:
+                        verdict, evidence = "FAIL", "expect_gt has unresolved ${%s}" % u
+                        break
+                    gm = re.search(gp, res, re.S)
+                    if not gm:
+                        verdict, evidence = "FAIL", "expect_gt: /%s/ did not match the result" % gp
+                        break
+                    try:
+                        gnow, gbase = Decimal(gm.group(1)), Decimal(gt_base)
+                    except Exception as e:
+                        verdict, evidence = "FAIL", "expect_gt: not a number (%s)" % e
+                        break
+                    if not gnow > gbase:
+                        verdict, evidence = "FAIL", "expect_gt: %s is not greater than %s" % (gnow, gbase)
+                        break
+                    evidence = (evidence + "; " if evidence else "") + "%s > %s" % (gnow, gbase)
+            if verdict == "PASS":
+                for el in step.get("expect_log") or []:
+                    lrole = el.get("role", role)
+                    try:
+                        pat = subst(el["regex"], self.vars, escape=True)
+                    except Unresolved as u:
+                        verdict, evidence = "FAIL", "expect_log has unresolved ${%s}" % u
+                        break
+                    line, lerr = self.wait_log(lrole, pat, float(el.get("within_s", DEFAULT_WITHIN_S)),
+                                          self.prev_mark_off[lrole] if el.get("since_prev_step") else None)
+                    if lerr:
+                        verdict, evidence = "FAIL", lerr
+                        break
+                    evidence = (evidence + " | " if evidence else "") + "%s: %s" % (ROLE_NAME[lrole], line)
+            self.rows.append((seq, role, cmd, res.splitlines()[0][:160] if res else "-",
+                              exp or refute or "(no result assertion)", verdict, evidence[:200]))
+            if verdict == "FAIL":
+                ok_all = False
+                say("FAIL step %d (%s): %s" % (seq, ROLE_NAME[role], evidence))
+        return ok_all
+
+    def oracles(self):
+        """Whole-log absence greps (FAIL if present) + presence greps (FAIL if absent) + the notes' passive
+        greps (report only). oracles_present entries are a regex (every active role must show it) or
+        {"role": r, "regex": ...} for one role; they cover start-up lines no step's mark can bracket."""
+        out = []
+        for ent in self.sc.get("oracles_present") or []:
+            pat = ent["regex"] if isinstance(ent, dict) else ent
+            for role in ([ent["role"]] if isinstance(ent, dict) and ent.get("role") else self.active):
+                hits = [l.strip()[:200] for l in read_text_from(LOGS[role], self.run_start_off[role]).splitlines()
+                        if re.search(pat, l)]
+                out.append(("REPORT", "%s: present /%s/ x%d -> %s" % (ROLE_NAME[role], pat, len(hits), hits[0]))
+                           if hits else ("FAIL", "%s: /%s/ never appeared (oracles_present)" % (ROLE_NAME[role], pat)))
+        out += absent_rows(self.sc.get("oracles_absent") or [], self.oracle_sources())
+        for pat in self.sc.get("oracles_report") or []:
+            for role in self.active:
+                hits = [l.strip()[:200] for l in read_text_from(LOGS[role], self.run_start_off[role]).splitlines()
+                        if re.search(pat, l)]
+                if hits:
+                    out.append(("REPORT", "%s: /%s/ x%d -> %s" % (ROLE_NAME[role], pat, len(hits), hits[0])))
+        return out
+
+    def oracle_sources(self):
+        """RIG-ORACLE-CLOSED-1: every instance log THIS run produced - each drop snapshot (an instance closed
+        mid-run), scanned from that role's run start, plus the live log of every active role. A role still
+        dropped at the end is skipped only while its log is byte-identical to its snapshot (a failed relaunch
+        that wrote a new log is still scanned). pre-launch-*.log copies are NOT sources: arm_channel copies
+        them BEFORE launch(), so every byte in them belongs to the PREVIOUS run."""
+        src = [(p, off, role, os.path.basename(p)) for p, off, role in self.snaps]
+        for role in self.active:
+            off = self.run_start_off[role]
+            if role in self.down:
+                if (log_size(LOGS[role]) == self.drop_off[role]
+                        and read_bytes_shared(LOGS[role], 0)[:RELAUNCH_PROBE] == self.drop_head[role]):
+                    continue
+                off = self.relaunch_offset(role)
+            src.append((LOGS[role], off, role, "%s-%s" % (ROLE_NAME[role], os.path.basename(LOGS[role]))))
+        return src
+
+    # ---- report
+    def write_report(self, passed, total, oracle_rows, blocked=None):
+        os.makedirs(self.rundir, exist_ok=True)
+        for role in self.active:
+            name = "%s-%s" % (ROLE_NAME[role], os.path.basename(LOGS[role]))
+            try:
+                if os.path.exists(LOGS[role]):
+                    shutil.copy2(LOGS[role], os.path.join(self.rundir, name))
+            except OSError as e:
+                self.notes.append("could not copy the %s log: %s" % (ROLE_NAME[role], e))
+        path = os.path.join(self.rundir, "report.md")
+        L = ["# rig run %s - %s" % (self.id, stamp()), "",
+             "- scenario: `%s` (%s)" % (self.args.scenario, self.sc.get("title", "")),
+             "- HEAD commit: `%s`" % getattr(self, "head", "?"),
+             "- deployed DLL md5: `%s` (DEV markers %s)" % (getattr(self, "deployed_md5", "?"),
+                                                            getattr(self, "markers", "?")),
+             "- instances: %d (roles %s)" % (self.instances, ",".join(self.active)),
+             "- launch: %s" % (stamp(self.launch_t) if self.launch_t else "(not launched)"),
+             "- variables: %s" % json.dumps(self.vars, sort_keys=True), ""]
+        if blocked:
+            L += ["**BLOCKED before the scenario ran:**"] + ["- " + b for b in blocked] + [""]
+        L += ["| step | role | cmd | result | expected | verdict | log evidence |",
+              "|---|---|---|---|---|---|---|"]
+        for r in self.rows:
+            L.append("| %s | %s | `%s` | %s | `%s` | %s | %s |" % tuple(
+                str(x).replace("|", "\\|").replace("\n", " ") for x in r))
+        L += ["", "## oracles"] + (["- %s %s" % o for o in oracle_rows] or ["- (none fired)"])
+        L += ["", "## run notes"] + (["- " + n for n in self.notes] or ["- (none)"])
+        L += ["", "RESULT: %s (%d/%d steps)" % ("PASS" if passed == total and not blocked and
+                                                not any(o[0] == "FAIL" for o in oracle_rows) else "FAIL",
+                                                passed, total)]
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(L) + "\n")
+        say("report: %s" % path)
+        return path
+
+
+# ---------------------------------------------------------------- dry run / selftest
+
+def dry_run(sc, args):
+    print("scenario %s - %s" % (sc.get("id"), sc.get("title", "")))
+    print("instances: %s (roles %s)" % (sc.get("instances", 2), ",".join(ROLES[: int(sc.get("instances", 2) or 2)])))
+    print("preconditions: %s" % sc.get("preconditions", "(none stated)"))
+    print("%-4s %-5s %-44s %-34s %s" % ("step", "role", "cmd", "expect_result", "expect_log / note"))
+    for s in sc["steps"]:
+        extra = "; ".join("%s[%s] %s" % (e.get("role", s["role"]), e.get("within_s", DEFAULT_WITHIN_S), e["regex"])
+                          for e in (s.get("expect_log") or []))
+        if s.get("capture"):
+            extra = (extra + " | " if extra else "") + "capture " + ",".join(s["capture"])
+        if s.get("note"):
+            extra = (extra + " | " if extra else "") + s["note"]
+        cmd = step_label(s)
+        exp = s.get("expect_result") or (("NOT " + s["refute_result"]) if s.get("refute_result") else "-")
+        print("%-4s %-5s %-44s %-34s %s" % (s["seq"], s["role"], cmd[:44], exp[:34], extra))
+    names = sorted({m.group(1) for s in sc["steps"]
+                    for txt in [s.get("cmd") or "", s.get("expect_result") or "", s.get("refute_result") or ""]
+                    + [e["regex"] for e in (s.get("expect_log") or [])]
+                    + list((s.get("expect_gt") or {}).keys()) + [str(v) for v in (s.get("expect_gt") or {}).values()]
+                    for m in VAR_RE.finditer(txt)})
+    captured = sorted({k for s in sc["steps"] for k in (s.get("capture") or {})})
+    supplied = sorted(set(sc.get("vars") or {}) | {kv.partition("=")[0].strip() for kv in (args.var or [])}
+                      | ({"session"} if args.session else set()))
+    print("\nvariables used: %s" % (", ".join(names) or "(none)"))
+    print("  captured in-run: %s" % (", ".join(captured) or "(none)"))
+    print("  must be supplied (--var / --session): %s" %
+          (", ".join(n for n in names if n not in captured and n not in supplied) or "(none)"))
+    print("oracles ABSENT (FAIL if present): %s" % ", ".join(sc.get("oracles_absent") or []) or "(none)")
+    print("oracles PRESENT (FAIL if absent): %s" % ", ".join(
+        ("%s:%s" % (e.get("role", "*"), e["regex"])) if isinstance(e, dict) else e
+        for e in (sc.get("oracles_present") or [])) or "(none)")
+    if sc.get("savegames_untouched"):
+        print("savegames_untouched: SaveGames must be byte-for-byte unchanged (size + mtime) after teardown")
+    print("oracles REPORT-only: %s" % ", ".join(sc.get("oracles_report") or []) or "(none)")
+    print("\n%d steps. DRY RUN - nothing launched, no channel touched." % len(sc["steps"]))
+    return 0
+
+
+SELFTESTS = [
+    # (label, sample .result text, expect_result regex, refute regex or None, capture map, expected vars)
+    # every sample below is the LITERAL shape src/TestDrive.cs builds (read 2026-09-10)
+    ("merge propose", "OK merge propose sent -> 'Client1'", r"OK merge (propose|accept) sent", None, {}, {}),
+    ("mergestatus member", "OK member=True group='g-1' members=[Host,Client1] flipped=3 "
+     "keys=['12 ba:street_5thave','3 ba:street_wallst']", r"member=True.*flipped=[1-9]", None,
+     {"hostShop": r"keys=\['([^']+)'"}, {"hostShop": "12 ba:street_5thave"}),
+    ("mergestatus off", "OK member=False group='' members=[] flipped=0 keys=[]", r"member=False", None, {}, {}),
+    ("regstate flipped", "OK rented=True stamp='' forRent=False type=ba:businesstype_shop name='Deli' days=5 "
+     "shifts=2 flipped=True parked='Host'", r"rented=True stamp='' .*flipped=True", None,
+     {"shifts": r"shifts=(\d+)"}, {"shifts": "2"}),
+    ("employees list", "OK 2 employee(s) @ '12 ba:street_5thave': 7f3a-11|Ann Smith|assigned=12 "
+     "ba:street_5thave|injected=False ; 9c2b-42|Bo Jones|assigned=1 ba:street_hq|injected=True",
+     r"employee\(s\)", None, {"hostEmployee": r"employee\(s\)(?: @ '[^']*')?: ([^|]+)\|"}, {"hostEmployee": "7f3a-11"}),
+    ("fired employee gone", "OK 1 employee(s) @ '12 ba:street_5thave': 9c2b-42|Bo Jones|assigned=12 "
+     "ba:street_5thave|injected=False", None, r"7f3a-11", {}, {}),
+    ("money merged", "OK money=125000.50 merged=True wallet=125000.50 (mirror)",
+     r"money=125000\.50\b.*merged=True", None, {"hostMoney": r"money=([0-9.]+)"}, {"hostMoney": "125000.50"}),
+    ("autofill", "OK AutoFillSchedule invoked for '12 ba:street_5thave'; the week now holds 14 shift(s)",
+     r"^OK ", None, {}, {}),
+    ("fire", "OK RemoveEmployee invoked for '7f3a-11' ('Ann Smith', injected=True)", r"^OK ", None, {}, {}),
+    ("err is not ok", "ERR merge: no partner", r"^OK ", None, {}, None),  # None = the assertion must FAIL
+]
+
+LOGTESTS = [
+    ("armed h", "[Warning: BigAmbitionsMP] [BAMP] [TestDrive] channel ARMED (dev build, role 'h') - watching ...",
+     ARMED_RE["h"].pattern, True),
+    ("armed h not c", "[Warning: BigAmbitionsMP] [BAMP] [TestDrive] channel ARMED (dev build, role 'c') - watching",
+     ARMED_RE["h"].pattern, False),
+    ("bracket tag is literal", "[Info   : BigAmbitionsMP] [BAMP] [Merger] flip OFF 'Wall St 3' (left merger)",
+     r"\[BAMP\] \[Merger\] flip OFF", True),
+    ("bare tag in a result is not a log line", "OK result text mentioning [Merger] flip OFF",
+     r"\[BAMP\] \[Merger\] flip OFF", False),
+    ("formed", "[Info   : BigAmbitionsMP] [BAMP] [Merger] FORMED group 'Merger-1' (2 members)",
+     r"\[BAMP\] \[Merger\].*(FORMED|GROWN)", True),
+    ("refused oracle", "[Warning: BigAmbitionsMP] [BAMP] [Merger] accept from 'c' REFUSED: already merged",
+     r"\[Merger\] accept .* REFUSED", True),
+]
+
+
+SHAPETESTS = [
+    # (label, scenario dict, must load_scenario accept it?) - the cmd-less step kinds
+    ("cmd step", {"steps": [{"role": "h", "cmd": "mergestatus"}]}, True),
+    ("sleep step", {"steps": [{"role": "h", "sleep_s": 5}]}, True),
+    ("drop step", {"instances": 3, "steps": [{"role": "d", "drop": True, "note": "sim window"}]}, True),
+    ("relaunch step", {"steps": [{"role": "c", "relaunch": True}]}, True),
+    ("drop+relaunch pair", {"steps": [{"role": "c", "drop": True}, {"role": "c", "relaunch": True},
+                                      {"role": "c", "cmd": "join ${session}"}]}, True),
+    ("empty step", {"steps": [{"role": "h"}]}, False),
+    ("drop needs one role", {"steps": [{"role": "all", "drop": True}]}, False),
+    ("drop d needs instances=3", {"steps": [{"role": "d", "drop": True}]}, False),
+    ("drop is cmd-less", {"steps": [{"role": "c", "drop": True, "cmd": "mergestatus"}]}, False),
+    ("drop is not relaunch", {"steps": [{"role": "c", "drop": True, "relaunch": True}]}, False),
+]
+
+
+def selftest():
+    fails = []
+    for label, sample, exp, refute, cap, want in SELFTESTS:
+        v = {}
+        ok = True
+        if exp:
+            ok = bool(re.search(exp, sample, re.S))
+        if ok and refute:
+            ok = not re.search(refute, sample, re.S)
+        if want is None:
+            status = "PASS" if not ok else "FAIL"
+            if ok:
+                fails.append(label)
+            print("  %-28s expected-to-fail assertion -> %s" % (label, status))
+            continue
+        if not ok:
+            fails.append(label)
+            print("  %-28s ASSERTION FAILED against /%s/" % (label, exp))
+            continue
+        got, err = apply_captures(cap, sample, v)
+        if err or got != want:
+            fails.append(label)
+            print("  %-28s CAPTURE FAILED: %s (got %s want %s)" % (label, err, got, want))
+        else:
+            print("  %-28s PASS%s" % (label, (" " + json.dumps(want)) if want else ""))
+    print("  -- log matchers (emitter prefix '[BAMP] [Tag]') --")
+    for label, line, pat, want in LOGTESTS:
+        got = bool(re.search(pat, line))
+        if got != want:
+            fails.append(label)
+        print("  %-28s %s (match=%s want=%s)" % (label, "PASS" if got == want else "FAIL", got, want))
+    print("  -- variable substitution --")
+    try:
+        s = subst("shift ${hostShop} 1 ${hostEmployee} 9 17", {"hostShop": "5th Ave 12", "hostEmployee": "7f3a-11"})
+        print("  %-28s %s" % ("subst", "PASS -> " + s))
+    except Unresolved as u:
+        fails.append("subst")
+        print("  %-28s FAIL unresolved %s" % ("subst", u))
+    try:
+        subst("regstate ${nope}", {})
+        fails.append("subst-missing")
+        print("  %-28s FAIL (a missing variable must raise)" % "subst missing")
+    except Unresolved:
+        print("  %-28s PASS (missing variable raises, step fails loudly)" % "subst missing")
+    print("  -- scenario step shapes (drop/relaunch are cmd-less, like sleep_s) --")
+    for label, sc, want in SHAPETESTS:
+        try:
+            validate_scenario(json.loads(json.dumps(sc)))
+            got, why = True, ""
+        except ValueError as e:
+            got, why = False, str(e)
+        if got != want:
+            fails.append(label)
+        print("  %-28s %s (accepted=%s want=%s)%s" % (label, "PASS" if got == want else "FAIL", got, want,
+                                                      ("  <- " + why) if why else ""))
+    print("  -- oracles_absent: every source file, hit names file:line, scan starts at the run's own byte --")
+    import tempfile
+    td = tempfile.mkdtemp(prefix="rigrun-selftest-")
+    try:
+        snap, live = os.path.join(td, "c-drop-1-Player-instance2.log"), os.path.join(td, "Player-instance2.log")
+        prev = b"PREVIOUS RUN NullReferenceException\r\n"
+        with open(snap, "wb") as f:
+            f.write(prev + b"boot\r\nNullReferenceException: flood\r\nok\rNullReferenceException: again\r\n")
+        with open(live, "wb") as f:
+            f.write(b"fresh\nquiet\n")
+        got = absent_rows(["NullReferenceException", "never-there"],
+                          [(snap, len(prev), "c", "c-drop-1-Player-instance2.log"),
+                           (live, 0, "c", "client-Player-instance2.log")])
+        want = [("FAIL", "client: /NullReferenceException/ x2 -> c-drop-1-Player-instance2.log:3: "
+                         "NullReferenceException: flood (lines 3,5)")]
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    if got != want:
+        fails.append("oracle sources")
+    print("  %-28s %s%s" % ("closed-instance snapshot", "PASS" if got == want else "FAIL", ("" if got == want else
+                                                                                         "  got %r" % (got,))))
+    print("SELFTEST: %s (%d check groups, %d failed)" % ("PASS" if not fails else "FAIL - " + ", ".join(fails),
+                                                         len(SELFTESTS) + len(LOGTESTS) + len(SHAPETESTS) + 3,
+                                                         len(fails)))
+    return 0 if not fails else 1
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    try:
+        return _main()
+    finally:
+        _WINPREFS.restore()   # no-op unless this run set a window size
+
+
+def _main():
+    ap = argparse.ArgumentParser(description="two-instance rig scenario driver")
+    ap.add_argument("scenario", nargs="?", help="path to a scenario .json")
+    ap.add_argument("--session", help="value for ${session}")
+    ap.add_argument("--var", action="append", help="k=v for a scenario variable (repeatable)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--keep-open", action="store_true", help="leave both games running at the end")
+    args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+    if not args.scenario:
+        ap.error("a scenario .json is required (or --selftest)")
+    sc = load_scenario(args.scenario)
+    if args.dry_run:
+        return dry_run(sc, args)
+
+    r = Run(sc, args)
+    problems = r.preflight()
+    if problems:
+        for p in problems:
+            say("REFUSED: " + p)
+        r.write_report(0, len(sc["steps"]), [], blocked=problems)
+        return 1
+    say("pre-flight OK - HEAD %s, deployed md5 %s, DEV markers %d" % (r.head, r.deployed_md5, r.markers))
+    perr = r.prepare_saves()
+    if perr:
+        say("REFUSED: " + perr)
+        r.write_report(0, len(sc["steps"]), [], blocked=[perr])
+        return 1
+    r.arm_channel()
+    r.launch()
+    for role in r.active:
+        err = r.wait_armed(role)
+        if err:
+            say("FAIL " + err)
+            if not args.keep_open:
+                close_instances(r.notes)
+            r.write_report(0, len(sc["steps"]), r.savegames_check(), blocked=[err])
+            return 1
+
+    passed, total, aborted = 0, len(sc["steps"]), False
+    for step in sc["steps"]:
+        if r.do_step(step):
+            passed += 1
+        elif step.get("abort_on_fail", True):
+            say("aborting the scenario at step %d (abort_on_fail) - no improvised recovery" % step["seq"])
+            aborted = True
+            break
+    oracle_rows = r.oracles()
+    # RIG-SAVEROOT: tear down BEFORE the report, so the SaveGames comparison also covers the quit-path saves
+    if args.keep_open:
+        say("--keep-open: both instances left running (the SaveGames check below cannot see their quit)")
+    else:
+        close_instances(r.notes)
+    oracle_rows += r.savegames_check()
+    for kind, line in oracle_rows:
+        say("ORACLE %s %s" % (kind, line))
+    r.write_report(passed, total, oracle_rows, blocked=["scenario aborted early"] if aborted else None)
+    ok = passed == total and not aborted and not any(k == "FAIL" for k, _ in oracle_rows)
+    print("RESULT: %s (%d/%d steps)" % ("PASS" if ok else "FAIL", passed, total))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

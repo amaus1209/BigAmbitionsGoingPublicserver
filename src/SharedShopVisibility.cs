@@ -1,0 +1,895 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using BigAmbitions.Tags;                       // TagRef
+using Buildings;                               // BuildingRegistration
+using HarmonyLib;
+using Helpers;                                 // BuildingHelper, BusinessTypeHelper, BuildingTypeHelper
+using UI.Smartphone.Apps.BizMan;               // BusinessScrollerController
+using UI.Smartphone.Apps.BizMan.Schedule;      // ScheduleHelper, ScheduleDaySelectionController, ScheduleDayButton, ScheduleCellView
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// SHARED-SHOP MANAGEMENT (the Business PERMISSION feature) — slice 2: visibility, tint, guards.
+    /// Plan: .modding/03-systems/shared-shop-management-plan.md §2.1 / §2.2 / §4 (rulings 12, 14).
+    ///
+    /// THIS IS NOT THE MERGER. Merger-flipped shops are excluded from everything here (they have their own feature);
+    /// the player's own shops, AI shops and single-player are untouched — every patch keys on "another player's
+    /// shop" and most on "another player's shop that is SHARED with me through a Business grant".
+    ///
+    /// What it does, and nothing more:
+    ///  • VISIBILITY (call-scoped, never an ownership flag): the shared shops are APPENDED to the BizMan main list
+    ///    (BusinessScrollerController.PopulateAllModels), to the BizMan page's business dropdown
+    ///    (GetPlayerBuildingRegistrations while BizManBusiness.RefreshData runs) and — D9 r3 — to the business picker
+    ///    of the TWO NPC contacts whose follow-up is already inside what a Business grant allows: the wholesale
+    ///    manager (a delivery contract = the "Deliveries" tab) and the marketing agency (a campaign = the "Marketing"
+    ///    tab), and there ORDINARY shops only, since a shared warehouse or factory gets neither tab. Recruitment,
+    ///    moving, the interior firm, the import manager, food delivery and the furniture store now ANSWER an access
+    ///    holder (src/AccessGates.cs) but their pickers keep hiding shared shops — as do employee assignment, mass
+    ///    actions, logistics and purchasing — so the player's own employees can never be pointed at a shared shop and
+    ///    no out-of-access contract can be opened on one. Every appended entry also has to pass the caller's own
+    ///    filter delegate, and the list is re-sorted the way the native helper sorts it (D9 r3).
+    ///  • TINT: the list card and the page's business-type label are coloured with the SHOP OWNER'S OWN PLAYER
+    ///    COLOUR (PlayerColours.TryColourFor, and TryColourForOwnerOf for a merger-flipped shop, whose registration
+    ///    no longer names its owner). The teal HousingMapCues.SharedColor is only the FALLBACK, for a surface that
+    ///    cannot name the owner (the list card and the warehouse row); the page's business-type label falls back to
+    ///    its own default colour instead, because a wrong player colour reads as somebody else's shop. So the player
+    ///    can see it is someone else's. No text is added (ruling 17).
+    ///  • TAB SET (allow-list): a shared shop's page shows Presentation + Schedule (factories too); warehouses and
+    ///    headquarters show Presentation only in this slice. Any OTHER player's shop that is NOT shared (e.g. the
+    ///    owner just went offline while the page was open) collapses to Presentation — the page can never show the
+    ///    full native tab set for a shop the player does not own.
+    ///  • GREYED CONTROLS (ruling 14: blocked = greyed, never a live control that does nothing): on another player's
+    ///    shop — the contract-termination button, the rival "show employees" panel button, "open in EconoView"; on
+    ///    a shared shop's Schedule tab — the week and per-day auto-fill buttons (slice 3 wires auto-fill to the
+    ///    owner's staff) and the cinema licensing-fee toggles (money). Copy / paste / paste-to-all / clear keep
+    ///    working (ruling 14 d). The temporarily-closed toggle was already routed to the owner for helpers.
+    ///  • Nothing is put on screen beyond colour and greying (user ruling: no messages from this feature).
+    /// </summary>
+    public static class SharedShopVisibility
+    {
+        private const string Tag = "[SharedShop]";
+
+        /// <summary>Another player's shop on this machine — shared or not — that is not merger-flipped. The fail-closed
+        /// predicate for tab pruning and greying. (Offline MP saves still carry ownership stamps; pruning is the safe
+        /// direction there, so there is deliberately no connection gate — same as the 2026-07-16 hide patches.)</summary>
+        public static bool IsOtherPlayersShop(BuildingRegistration reg, string addr)
+        {
+            if (reg == null || string.IsNullOrEmpty(addr)) return false;
+            try
+            {
+                if (MergerFlip.IsFlipped(addr)) return false;
+                if (GameStatePatcher.IsForeignPlayerBusiness(reg)) return true;   // the contaminated case (rented here + stamped to another player)
+                // The normal case: another SESSION player is stamped as the runner and this machine does not rent it.
+                // (An AI rival's stamp is not a player — AI shop pages keep their native takeover controls.)
+                string stamp = ""; try { stamp = reg.businessOwnerRivalId?.ToString() ?? ""; } catch { }
+                return !string.IsNullOrEmpty(stamp) && stamp != MPConfig.PlayerId && GameStatePatcher.IsSessionPlayerRivalId(stamp);   // review r6 #2: roster-inclusive — the live-only test let the whole lock (incl. the terminate-contract hard stop) lapse while the owner was disconnected
+            }
+            catch { return false; }
+        }
+
+        // ── Call-scoped tenancy (plan §2.1 item 2) ────────────────────────────
+        // A shared shop's replica is NOT RentedByPlayer on this machine, and the page's native code keys its tab set
+        // (SetUpTabs) and its Presentation view (OnEnable → SetActiveView / SetAiOwned) on exactly that flag. For the
+        // duration of those two synchronous calls ONLY, the flag is raised on THAT registration and lowered again in
+        // the finalizer — it can never span a tick, a save, or a publish (the binding rule on ownership flips).
+        // Second caller since 2026-08-22: SharedShopStaff.ScopeToOwnerShops, around the game's own "can an employee be
+        // assigned to this business" filter, which is gated on the same flag. Internal, not private, so there is ONE
+        // raise/lower pair in the mod rather than a copy per surface.
+        internal static bool RaiseTenancy(BuildingRegistration reg, string addr)
+        {
+            try
+            {
+                if (reg == null || reg.RentedByPlayer) return false;
+                if (!SharedShopSchedule.IsSharedShop(reg, addr)) return false;
+                reg.RentedByPlayer = true;
+                return true;
+            }
+            catch { return false; }
+        }
+        internal static void LowerTenancy(BuildingRegistration reg, bool raised)
+        {
+            if (!raised || reg == null) return;
+            try { reg.RentedByPlayer = false; } catch { }
+        }
+
+        private static string AddrOf(BuildingRegistration reg)
+        {
+            try { return reg != null ? GameStateReader.AddressKey(reg) : ""; } catch { return ""; }
+        }
+
+        /// <summary>The FALLBACK colour only: the teal the mod uses for "shared with me" on the city map and the
+        /// building hover (HousingMapCues.SharedColor). A shared or merger-flipped shop is normally coloured with
+        /// its OWNER'S PLAYER COLOUR (PlayerColours.TryColourFor / TryColourForOwnerOf); this is what a surface
+        /// uses when the owner cannot be named at all.</summary>
+        private static Color Tint => HousingMapCues.SharedColor;
+
+        /// <summary>The same fallback, for the other shared-shop surfaces that need it (7c colours the agency
+        /// call's business dropdown with it).</summary>
+        internal static Color SharedTint => HousingMapCues.SharedColor;
+
+        // ── Tab allow-list ────────────────────────────────────────────────────
+
+        /// <summary>The tabs another player's shop page may show in this slice, by business type. RealEstate is the
+        /// LOCAL player's own deed (the game adds it from the local realEstate list — a bought building can host another
+        /// player's tenant shop) and stays native whenever the local player holds it.</summary>
+        private static List<string> AllowedTabs(BuildingRegistration reg, bool shared)
+        {
+            var list = new List<string> { "Presentation" };
+            try
+            {
+                var addr = reg.Address;
+                if (SaveGameManager.Current?.realEstate != null && SaveGameManager.Current.realEstate.Exists(x => x != null && x.address == addr))
+                    list.Add("RealEstate");
+            }
+            catch { }
+            if (!shared) return list;
+            string type = ""; try { type = reg.businessTypeName ?? ""; } catch { }
+            switch (type)
+            {
+                case "ba:businesstype_headquarters":  // ruling 27: HQ stays out of the permission feature
+                case "ba:businesstype_empty":
+                case "":
+                    break;
+                case "ba:businesstype_warehouse":
+                    list.Add("Drivers");              // slice 6b: carried slot info + routed assignment
+                    list.Add("Inventory");            // slice 6a: owner-computed figures; Sell All greyed (ruling 29)
+                    list.Add("Settings");             // slice 7d (user 2026-08-26): rename + logo routed, type/shutdown greyed
+                    break;
+                case "ba:businesstype_factory":
+                    list.Add("Factory");              // slice 6c: carried config/state + routed edits (rename allowed, 2026-08-24)
+                    list.Add("Schedule");
+                    list.Add("Drivers");              // slice 6b
+                    list.Add("Inventory");            // slice 6a — no pricing tab natively (ruling 30)
+                    list.Add("Settings");             // slice 7d (user 2026-08-26): rename + logo routed, type/shutdown greyed
+                    break;
+                default:
+                    list.Add("Schedule");             // every ordinary business
+                    list.Add("InventoryPricing");     // slice 4: the helper sets this shop's retail prices
+                    list.Add("Insight");              // slice 7a: read-only dashboard, owner-carried figures
+                    list.Add("Deliveries");           // slice 7b: carried contracts + routed edits (ruling 33: billed-on-delivery = allowed)
+                    list.Add("Marketing");            // slice 7c: carried campaigns + routed toggles/cancel (ruling 33/40: a daily expense, never a click-time cost)
+                    list.Add("Settings");             // slice 7d: rename + logo routed (ruling 42); type change and shutdown greyed (ruling 34)
+                    break;
+            }
+            return list;
+        }
+
+        /// <summary>D9 r3: the same discriminator AllowedTabs's switch uses (:126-152) to tell an ORDINARY shop from a
+        /// warehouse / factory / headquarters / empty shell. Ordinary = the switch's `default:` arm — the only one
+        /// that grants "Deliveries" (:148) and "Marketing" (:149), which are the two things the widened NPC pickers
+        /// let a helper start. Anything else is held out of those pickers.</summary>
+        private static bool IsOrdinaryBusinessType(BuildingRegistration reg)
+        {
+            string type = ""; try { type = reg?.businessTypeName ?? ""; } catch { }
+            switch (type)
+            {
+                case "ba:businesstype_headquarters":
+                case "ba:businesstype_empty":
+                case "":
+                case "ba:businesstype_warehouse":
+                case "ba:businesstype_factory":
+                    return false;
+                default:
+                    return true;
+            }
+        }
+
+        /// <summary>BuildingHelper.DefaultBuildingRegistrationSort (BuildingHelper.cs:839-842) is a PRIVATE STATIC
+        /// method, so the fallback the native helper installs at :769-770 is bound once by reflection rather than
+        /// re-implemented. Null if the method is ever renamed — the re-sort is then skipped, which is what the list
+        /// did before r3.
+        ///
+        /// HARMONYVER-1 (field 20260919-081216: BizMan and the rent/buy lists dead for both players). This used to be
+        /// a STATIC FIELD INITIALISER calling AccessTools.MethodDelegate. Another workshop mod ships Harmony 2.3.3 and
+        /// the game loads THAT copy, while we compile against 2.4.2, where MethodDelegate has a fourth (delegateArgs)
+        /// parameter — the overload the compiler picked does not exist in 2.3.3, so this class's TYPE INITIALISER
+        /// threw MissingMethodException and every later call into the class threw TypeInitializationException.
+        /// Two changes stop that: the delegate is built with the BCL only (Delegate.CreateDelegate — the native method
+        /// is `static int (BuildingRegistration, BuildingRegistration)`, identical to the delegate), and the bind is
+        /// LAZY, inside a NON-INLINED helper whose CALLER holds the try/catch. The caller is the point: a missing
+        /// method is raised when the method CONTAINING the call is JIT-compiled, so a try/catch around the call in the
+        /// same method would never get to run.</summary>
+        private static BuildingHelper.BuildingRegistrationSortDelegate? _nativeSort;
+        private static bool _nativeSortTried;
+
+        private static BuildingHelper.BuildingRegistrationSortDelegate? NativeSort()
+        {
+            if (_nativeSortTried) return _nativeSort;
+            _nativeSortTried = true;
+            try { _nativeSort = BindNativeSort(); }
+            catch (Exception ex) { _nativeSort = null; Plugin.Logger.LogWarning($"{Tag} native picker sort unavailable ({ex.GetType().Name}: {ex.Message}) — appended shops sort last."); }
+            return _nativeSort;
+        }
+
+        /// <summary>NoInlining is load-bearing — see NativeSort: the guard has to sit in the CALLER's frame.</summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static BuildingHelper.BuildingRegistrationSortDelegate? BindNativeSort()
+        {
+            var mi = AccessTools.Method(typeof(BuildingHelper), "DefaultBuildingRegistrationSort");
+            return mi == null ? null
+                              : (BuildingHelper.BuildingRegistrationSortDelegate)Delegate.CreateDelegate(
+                                    typeof(BuildingHelper.BuildingRegistrationSortDelegate), mi);
+        }
+
+        /// <summary>D9 r3: re-sort exactly the way BuildingHelper.GetPlayerBuildingRegistrations does
+        /// (BuildingHelper.cs:758-774) — the caller's own sortDelegate when it passed one, else the native default —
+        /// so an appended shop lands in the picker's alphabetical place instead of at the bottom of the list.</summary>
+        private static void SortLikeNative(List<BuildingRegistration> list, BuildingHelper.BuildingRegistrationSortDelegate sortDelegate)
+        {
+            try
+            {
+                var cmp = sortDelegate ?? NativeSort();
+                if (cmp == null || list == null) return;
+                list.Sort((x, y) => cmp(x, y));
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} picker re-sort: {ex.Message}"); }
+        }
+
+        private static readonly System.Reflection.FieldInfo _fTabs        = AccessTools.Field(typeof(BizManBusiness), "_tabs");
+        private static readonly System.Reflection.FieldInfo _fMenu        = AccessTools.Field(typeof(BizManBusiness), "menu");
+        private static readonly System.Reflection.FieldInfo _fSelectedTab = AccessTools.Field(typeof(BizManBusiness), "_selectedTab");
+        private static readonly System.Reflection.FieldInfo _fTypeLabel   = AccessTools.Field(typeof(BizManBusiness), "businessTypeLabel");
+        private static readonly HashSet<string> _prunedLogged = new();
+
+        /// <summary>After the game builds the tab list for the page's registration: another player's shop keeps only
+        /// the allowed tabs, the tab buttons are re-shown accordingly, and the selected tab is moved onto an allowed
+        /// one (the game's own dropdown handler indexes _tabs[1] when the current tab is gone — a one-tab list would
+        /// throw, so the selection is fixed HERE, before that line runs).</summary>
+        [HarmonyPatch(typeof(BizManBusiness), "SetUpTabs")]
+        public static class Patch_BizManBusiness_SetUpTabs_Prune
+        {
+            static void Prefix(BizManBusiness __instance, out bool __state)
+            {
+                __state = false;
+                try { __state = RaiseTenancy(__instance.buildingRegistration, AddrOf(__instance.buildingRegistration)); } catch { }
+            }
+            static void Finalizer(BizManBusiness __instance, bool __state)
+            {
+                try { LowerTenancy(__instance.buildingRegistration, __state); } catch { }
+            }
+            static void Postfix(BizManBusiness __instance)
+            {
+                try
+                {
+                    var reg = __instance.buildingRegistration;
+                    string addr = AddrOf(reg);
+                    if (!IsOtherPlayersShop(reg, addr)) return;
+                    bool shared = SharedShopSchedule.IsSharedShop(reg, addr);
+                    var allowed = AllowedTabs(reg, shared);
+                    if (_fTabs?.GetValue(__instance) is not List<string> tabs) return;
+                    tabs.RemoveAll(t => !allowed.Contains(t));
+                    if (_fMenu?.GetValue(__instance) is Transform menu)
+                        foreach (Transform item in menu)
+                            item.gameObject.SetActive(tabs.Contains(item.name));
+                    string sel = _fSelectedTab?.GetValue(__instance) as string ?? "";
+                    if (!tabs.Contains(sel))
+                        _fSelectedTab?.SetValue(__instance, tabs.Contains("Schedule") ? "Schedule" : "Presentation");
+                    if (_prunedLogged.Add(addr + (shared ? "|s" : "|u")))
+                        Plugin.Logger.LogInfo($"{Tag} '{addr}' is {(shared ? "shared with me" : "another player's, not shared")} — management tabs limited to: {string.Join(", ", tabs)}.");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} tab prune: {ex.Message}"); }
+            }
+        }
+
+        /// <summary>The initial tab the game picks (Insight / Factory / Drivers …) may not be allowed on another
+        /// player's shop — land on Schedule when it is allowed, else Presentation. Runs before SetUpTabs on the
+        /// BizMan.Open route, so it derives the allow-list directly.</summary>
+        [HarmonyPatch(typeof(BizManBusiness), nameof(BizManBusiness.SetInitialTab))]
+        public static class Patch_BizManBusiness_SetInitialTab_Allowed
+        {
+            static void Postfix(BizManBusiness __instance)
+            {
+                try
+                {
+                    var reg = __instance.buildingRegistration;
+                    string addr = AddrOf(reg);
+                    if (!IsOtherPlayersShop(reg, addr)) return;
+                    var allowed = AllowedTabs(reg, SharedShopSchedule.IsSharedShop(reg, addr));
+                    string sel = _fSelectedTab?.GetValue(__instance) as string ?? "";
+                    // Native defaults gate on RentedByPlayer (false on a replica) and land on Presentation —
+                    // re-derive them for a shared building so the page opens where the owner's would
+                    // (field 2026-08-24): factory → Factory, warehouse → Drivers, ordinary → Insight
+                    // (allowed since slice 7a — before that Schedule stood in; the fallback chain still
+                    // lands there when Insight is pruned). An explicitly requested tab was vetted above.
+                    string type = ""; try { type = reg.businessTypeName ?? ""; } catch { }
+                    string want = type == "ba:businesstype_factory" ? "Factory"
+                                : type == "ba:businesstype_warehouse" ? "Drivers"
+                                : "Insight";
+                    if (sel == "Presentation" && allowed.Contains(want)) { _fSelectedTab?.SetValue(__instance, want); return; }
+                    if (!allowed.Contains(sel))
+                        _fSelectedTab?.SetValue(__instance, allowed.Contains(want) ? want : allowed.Contains("Schedule") ? "Schedule" : "Presentation");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} initial tab: {ex.Message}"); }
+            }
+        }
+
+        // ── Call-scoped visibility: the BizMan dropdown and the BizMan main list ──
+
+        private static int _bizManRefreshDepth;   // > 0 only while BizManBusiness.RefreshData runs (its dropdown read)
+        public static bool InBizManRefresh => _bizManRefreshDepth > 0;
+
+        [HarmonyPatch(typeof(BizManBusiness), nameof(BizManBusiness.RefreshData))]
+        public static class Patch_BizManBusiness_RefreshData_Scope
+        {
+            [HarmonyPriority(Priority.First)]   // the increment must run even if a later prefix cancels the method
+            static void Prefix() { _bizManRefreshDepth++; }
+            static void Finalizer(BizManBusiness __instance)
+            {
+                if (_bizManRefreshDepth > 0) _bizManRefreshDepth--;   // never latch negative
+                try { ApplyPageTintAndGuards(__instance); } catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} page tint: {ex.Message}"); }
+            }
+        }
+
+        /// <summary>GrantSync calls this when the host's shared-manage set changes (owner offline/online, grant
+        /// revoked/given): if the BizMan page is open on an affected shop, rebuild it so the tab set and the greying
+        /// follow the new truth at once (ruling 5 — the shop drops out when its owner leaves).</summary>
+        public static void OnSharedManageChanged(HashSet<string> changedAddressKeys)
+        {
+            if (changedAddressKeys == null || changedAddressKeys.Count == 0) return;
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                try
+                {
+                    var ui = InstanceBehavior<UI.UIs>.Instance;
+                    var page = ui != null && ui.fullMenu != null && ui.fullMenu.bizMan != null ? ui.fullMenu.bizMan.business : null;
+                    if (page == null || !page.gameObject.activeInHierarchy) return;
+                    string addr = AddrOf(page.buildingRegistration);
+                    if (addr.Length == 0 || !changedAddressKeys.Contains(addr)) return;
+                    Plugin.Logger.LogInfo($"{Tag} '{addr}' changed sharing state while its page was open — rebuilding the page.");
+                    page.RefreshData();
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} page rebuild on sharing change: {ex.Message}"); }
+            });
+        }
+
+        private static readonly System.Reflection.FieldInfo _fClosedToggle = AccessTools.Field(typeof(BizManBusiness), "temporarilyClosedToggle");
+
+        /// <summary>The shop's open/closed flag changed on THIS machine because of the OTHER side — a helper's routed
+        /// toggle applied here as the owner, or the owner's push applied here as a helper. The game's BizMan page reads
+        /// that flag only when it (re)opens (it has no change listener), so an open page kept showing the old switch and
+        /// security line (field test 2026-08-21: the helper's click closed the owner's gym, but no open page showed it).
+        /// Any thread — the work is queued onto the main thread.</summary>
+        public static void RefreshOpenStateIfPageOpen(string addressKey)
+        {
+            if (string.IsNullOrEmpty(addressKey)) return;
+            GameStatePatcher.EnqueueOnMainThread(() =>
+            {
+                try
+                {
+                    var ui = InstanceBehavior<UI.UIs>.Instance;
+                    var page = ui != null && ui.fullMenu != null && ui.fullMenu.bizMan != null ? ui.fullMenu.bizMan.business : null;
+                    if (page == null || !page.gameObject.activeInHierarchy) return;
+                    var reg = page.buildingRegistration;
+                    if (reg == null || AddrOf(reg) != addressKey) return;
+                    bool closed = false; try { closed = reg.temporarilyClosed; } catch { }
+                    if (_fClosedToggle?.GetValue(page) is Toggle t && t.isOn != closed) t.SetIsOnWithoutNotify(closed);
+                    try { page.UpdateSecurityInfo(); } catch { }
+                    Plugin.Logger.LogInfo($"{Tag} '{addressKey}' is now {(closed ? "closed" : "open")} — the open BizMan page's switch was updated.");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} open-state refresh: {ex.Message}"); }
+            });
+        }
+
+        /// <summary>The game's "my businesses" helper — APPEND the shared shops, but ONLY for the BizMan page's own
+        /// dropdown, or (D9 r2/r3) while the wholesale manager or the marketing agency is the dialog the game ITSELF
+        /// has open — that dialog's business picker reads this same helper about a second after the NPC answered.
+        /// The other six contacts answer an access holder but are NOT widened here (AccessGates.cs, R1 table).
+        /// D9 r3, BOTH branches — the BizMan dropdown included, which was appending unfiltered since the feature
+        /// landed: the native method applies its filterDelegate to its own entries and THEN sorts
+        /// (BuildingHelper.cs:733-748), so an appended entry has to clear the same filter and the list has to be
+        /// re-sorted, or the picker shows a shop its own filter had excluded, at the bottom of the list. The
+        /// dialog branch additionally lists ORDINARY shops only. Runs after the 2026-07-16 hide postfix
+        /// (Priority.Low), which keeps removing them everywhere else.</summary>
+        [HarmonyPatch(typeof(BuildingHelper), nameof(BuildingHelper.GetPlayerBuildingRegistrations))]
+        [HarmonyPriority(Priority.Low)]
+        public static class Patch_GetPlayerBuildingRegistrations_AppendSharedForBizMan
+        {
+            static void Postfix(List<BuildingRegistration> __result,
+                                BuildingHelper.BuildingRegistrationFilterDelegate filterDelegate,
+                                BuildingHelper.BuildingRegistrationSortDelegate sortDelegate)
+            {
+                try
+                {
+                    if (__result == null) return;
+                    string dialogType = null;
+                    if (_bizManRefreshDepth <= 0)
+                    {
+                        dialogType = AccessGates.ActiveAccessDialogType();   // the GAME's DialogController.current.dialog — never a timer
+                        if (dialogType == null) return;
+                    }
+                    if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return;   // same gate as the list append
+                    if (GrantSync.SharedManageCount == 0) return;
+                    var gi = SaveGameManager.Current;
+                    if (gi?.BuildingRegistrations == null) return;
+                    int listed = 0, appended = 0;
+                    foreach (var reg in gi.BuildingRegistrations)
+                    {
+                        if (reg == null) continue;
+                        string addr = AddrOf(reg);
+                        if (!SharedShopSchedule.IsSharedShop(reg, addr)) continue;
+                        string name = ""; try { name = reg.BusinessName?.ToString() ?? ""; } catch { }
+                        if (name.Length == 0) continue;                      // the page's own filter: established businesses only
+                        // r3: an NPC picker may only offer what the grant already allows — ordinary shops.
+                        if (dialogType != null && !IsOrdinaryBusinessType(reg)) continue;
+                        // r3: the caller's own filter, the one the native method applied to its entries at :739.
+                        if (filterDelegate != null)
+                        {
+                            bool keep = false;
+                            try { keep = filterDelegate(reg); } catch { keep = false; }
+                            if (!keep) continue;
+                        }
+                        if (!__result.Contains(reg)) { __result.Add(reg); appended++; }
+                        listed++;
+                    }
+                    if (appended > 0) SortLikeNative(__result, sortDelegate);   // r3: the native order, not "appended last"
+                    if (dialogType != null) AccessGates.LogPickerScopeOnce(dialogType, listed);   // R5
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} dropdown append: {ex.Message}"); }
+            }
+        }
+
+        /// <summary>The BizMan main list — APPEND a card for each shared shop (the game's own visibility rule applied:
+        /// revenue-generating, or an empty building flagged to show). Runs after the hide postfix.</summary>
+        [HarmonyPatch(typeof(BusinessScrollerController), "PopulateAllModels")]
+        [HarmonyPriority(Priority.Low)]
+        public static class Patch_BizManBusinessList_AppendShared
+        {
+            private static int _logged;
+            static void Postfix(List<BusinessCellView.BusinessModel> allModels)
+            {
+                try
+                {
+                    if (allModels == null) return;
+                    if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return;
+                    if (GrantSync.SharedManageCount == 0) return;
+                    var gi = SaveGameManager.Current;
+                    if (gi?.BuildingRegistrations == null) return;
+                    int added = 0;
+                    foreach (var reg in gi.BuildingRegistrations)
+                    {
+                        if (reg == null) continue;
+                        string addr = AddrOf(reg);
+                        if (!SharedShopSchedule.IsSharedShop(reg, addr)) continue;
+                        bool visible = false;
+                        try
+                        {
+                            if (BusinessTypeHelper.GetData(reg).HasTag(TagRef.Businesstag.generatesrevenue)) visible = true;
+                            else if (reg.businessTypeName == "ba:businesstype_empty") visible = BuildingTypeHelper.GetData(reg).HasTag(TagRef.Buildingtypetag.showinbusinesslist);
+                        }
+                        catch { }
+                        if (!visible) continue;
+                        bool present = false;
+                        foreach (var m in allModels) if (m != null && m.Address == reg.Address) { present = true; break; }
+                        if (present) continue;
+                        allModels.Add(new BusinessCellView.BusinessModel(reg));
+                        added++;
+                    }
+                    if (added > 0 && _logged++ < 3)
+                        Plugin.Logger.LogInfo($"{Tag} business list: showing {added} shop(s) shared with me by other players.");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} list append: {ex.Message}"); }
+            }
+        }
+
+        // ── Tint ──────────────────────────────────────────────────────────────
+
+        private sealed class CardColors { public Color Name; public Color Type; public bool Captured; }
+        private static readonly ConditionalWeakTable<BusinessCellView, CardColors> _cardDefaults = new();
+        private static readonly System.Reflection.FieldInfo _fCardType = AccessTools.Field(typeof(BusinessCellView), "businessType");
+
+        /// <summary>List card: colour the name and type of a shared shop; restore the card's own colours otherwise
+        /// (cells are recycled between rows).</summary>
+        [HarmonyPatch(typeof(BusinessCellView), nameof(BusinessCellView.SetData))]
+        public static class Patch_BusinessCellView_SetData_Tint
+        {
+            static void Postfix(BusinessCellView __instance, BusinessCellView.BusinessModel data)
+            {
+                try
+                {
+                    if (__instance == null || data == null || __instance.businessName == null) return;
+                    // businessType is a TextLocalizationComponent (Localizor — an un-referenced assembly): reach its
+                    // TextContainer by reflection, the way HousingMapCues does.
+                    var typeText = HousingMapCues.GetMember(_fCardType?.GetValue(__instance), "TextContainer") as TMPro.TMP_Text;
+                    var def = _cardDefaults.GetOrCreateValue(__instance);
+                    if (!def.Captured) { def.Name = __instance.businessName.color; def.Type = typeText != null ? typeText.color : Color.white; def.Captured = true; }
+                    bool shared = false;
+                    BuildingRegistration reg = null;   // 2026-09-05 colours: hoisted so the owner is still nameable below
+                    string cardAddr = "";
+                    if (!data.IsRealEstate && data.Address != null)
+                    {
+                        try { reg = BuildingHelper.GetBuildingRegistration(data.Address); } catch { }
+                        cardAddr = AddrOf(reg);
+                        // MERGER PHASE 4d (R4-3): IsSharedShop returns FALSE on a merger-flipped shop by design
+                        // (SharedShopSchedule.cs:84 — the merger is not the permission feature), so this card was
+                        // drawn in the member's own colours on every company shop. A flipped shop is a partner's
+                        // shop; tint it too, by the OWNER, never by the flip-blanked rival id (MergerFlip.cs:135).
+                        shared = SharedShopSchedule.IsSharedShop(reg, cardAddr) || MergerFlip.IsFlipped(cardAddr);
+                    }
+                    // 2026-09-05 colours: the shop's runner names the colour; unknown owner keeps the old teal.
+                    // 4d: the flip-proof lookup answers for a company shop, whose rival id the flip blanked.
+                    string cardOwner = reg?.businessOwnerRivalId?.ToString() ?? "";
+                    if (string.IsNullOrEmpty(cardOwner)) cardOwner = PlayerColours.FlipProofOwner(cardAddr);
+                    Color ownerTint = PlayerColours.TryColourFor(cardOwner, out var c) ? (Color)c : Tint;
+                    __instance.businessName.color = shared ? ownerTint : def.Name;
+                    if (typeText != null) typeText.color = shared ? ownerTint : def.Type;
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} card tint: {ex.Message}"); }
+            }
+        }
+
+        // ── MERGER PHASE 4d (R1): the phone's PRIVATE RESIDENCE list ─────────
+        //
+        // PrivateResidenceScrollerController.Load lists every RentedByPlayer residential building (decompile
+        // :12-15), so a partner's home is ALREADY in a member's list — the flip put it there and entry/sleep
+        // work (D22). It was indistinguishable from the member's own homes. Colour only, no wording (D18):
+        // the row's address + size take the OWNER's colour. Cells are recycled, so the prefab's own colours are
+        // captured once per cell and restored on every non-company row (the pattern above, :465-471).
+
+        private sealed class ResidenceRowColors { public Color Addr; public Color Size; public bool Captured; }
+        private static readonly ConditionalWeakTable<PrivateResidenceCellView, ResidenceRowColors> _residenceDefaults = new();
+
+        [HarmonyPatch(typeof(PrivateResidenceCellView), nameof(PrivateResidenceCellView.SetData))]
+        public static class Patch_PrivateResidenceCellView_SetData_OwnerTint
+        {
+            static void Postfix(PrivateResidenceCellView __instance, PrivateResidenceCellView.PrivateResidenceModel data)
+            {
+                try
+                {
+                    if (__instance == null || data == null) return;
+                    if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+                    // address is a TextLocalizationComponent (Localizor — un-referenced): reach its TextContainer
+                    // by reflection, exactly as the card tint above does.
+                    var addrText = HousingMapCues.GetMember(__instance.address, "TextContainer") as TMPro.TMP_Text;
+                    var sizeText = __instance.size;
+                    var def = _residenceDefaults.GetOrCreateValue(__instance);
+                    if (!def.Captured)
+                    {
+                        def.Addr = addrText != null ? addrText.color : Color.white;
+                        def.Size = sizeText != null ? sizeText.color : Color.white;
+                        def.Captured = true;
+                    }
+                    string key = "";
+                    try { key = GameStateReader.AddressKey(data.Address); } catch { }
+                    bool company = !string.IsNullOrEmpty(key) && MergerFlip.IsFlipped(key);
+                    Color32 c32 = default;
+                    bool paint = company && PlayerColours.TryColourForOwnerOf(key, out c32);
+                    if (addrText != null) addrText.color = paint ? (Color)c32 : def.Addr;
+                    if (sizeText != null) sizeText.color = paint ? (Color)c32 : def.Size;
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} residence row tint: {ex.Message}"); }
+            }
+        }
+
+        // ── Warehouses and factories (the BizMan page's SECOND list) ──────────
+        // WarehouseList.Load enumerates `RentedByPlayer && GetBuildingType() == "ba:buildingtype_warehouse"`. It keys
+        // on the BUILDING type, not the business type, which is why FACTORIES appear in it alongside storage
+        // warehouses — one list, one fix. Two reasons the owner's never showed (field 2026-08-22): the tenancy filter
+        // excludes them, and the teal above only ever covered BusinessCellView cards, which these entries are not.
+        // Tenancy is raised for the duration of Load so the game's own code builds the entries (icons, inventory
+        // read-outs and all), then lowered in the finalizer — it may never outlive the call.
+
+        private static readonly System.Reflection.FieldInfo _fWarehouseEntry = AccessTools.Field(typeof(WarehouseList), "warehouseEntry");
+        private static bool _warehouseLabelWarned;
+
+        /// <summary>Is this entry one of an owner's shared buildings? (Also the stand-down MPPatches' warehouse-list
+        /// veto consults, so "listed" and "not vetoed" can never disagree.)</summary>
+        internal static bool IsSharedWarehouseEntry(BuildingRegistration reg)
+        {
+            try { return reg != null && SharedShopSchedule.IsSharedShop(reg, AddrOf(reg)); } catch { return false; }
+        }
+
+        [HarmonyPatch(typeof(WarehouseList), "Load")]
+        public static class Patch_WarehouseList_Load_IncludeShared
+        {
+            static void Prefix(out List<BuildingRegistration> __state) { __state = RaiseSharedWarehouses(); }
+            static void Finalizer(List<BuildingRegistration> __state)
+            {
+                if (__state == null) return;
+                foreach (var r in __state) LowerTenancy(r, raised: true);
+            }
+        }
+
+        private static List<BuildingRegistration> RaiseSharedWarehouses()
+        {
+            var raised = new List<BuildingRegistration>();
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsClientInWorld) return raised;
+                if (GrantSync.SharedManageCount == 0) return raised;
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return raised;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    string addr = AddrOf(reg);
+                    if (!SharedShopSchedule.IsSharedShop(reg, addr)) continue;
+                    bool warehouseBuilding = false;
+                    try { warehouseBuilding = reg.GetBuildingType() == "ba:buildingtype_warehouse"; } catch { }
+                    if (!warehouseBuilding) continue;
+                    if (RaiseTenancy(reg, addr)) raised.Add(reg);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} warehouse list: {ex.Message}"); }
+            return raised;
+        }
+
+        /// <summary>Colour the entry the game has just appended with its OWNER'S PLAYER COLOUR (the teal below is
+        /// only the fallback for an owner this machine cannot name). These are plain instantiated rows, not recycled
+        /// table cells, so the colour is written directly and needs no restore path.</summary>
+        [HarmonyPatch(typeof(WarehouseList), "SetUpEntry")]
+        public static class Patch_WarehouseList_SetUpEntry_Tint
+        {
+            static void Postfix(WarehouseList __instance, Entities.Warehouse warehouse)
+            {
+                try
+                {
+                    // M3(d) 2026-09-12: a PARTNER's warehouse under a merger is not IsSharedWarehouseEntry (the
+                    // flip makes IsSharedShop false) and its rival id is blanked by the flip, so the row was listed
+                    // but left uncoloured. The flip table answers for it; the owner comes from the flip-proof source.
+                    if (__instance == null) return;
+                    string whAddr = ""; try { whAddr = AddrOf(warehouse); } catch { }
+                    bool whFlipped = whAddr.Length > 0 && MergerFlip.IsFlipped(whAddr);
+                    if (!whFlipped && !IsSharedWarehouseEntry(warehouse)) return;
+                    var template = _fWarehouseEntry?.GetValue(__instance) as Transform;
+                    var parent = template != null ? template.parent : null;
+                    if (parent == null || parent.childCount == 0) return;
+                    // Object.Instantiate(template, template.parent) appends: the row just built is the last sibling.
+                    var row = parent.GetChild(parent.childCount - 1);
+                    // 2026-09-05 colours: the same stamp IsSharedShop reads to decide this row is someone else's
+                    // (reg.businessOwnerRivalId != MPConfig.PlayerId) names whose colour it gets.
+                    string whOwner = ""; try { whOwner = warehouse?.businessOwnerRivalId?.ToString() ?? ""; } catch { }
+                    if (whOwner.Length == 0 && whAddr.Length > 0) whOwner = PlayerColours.FlipProofOwner(whAddr);   // M3(d): the flip blanked the stamp
+                    Color whTint = PlayerColours.TryColourFor(whOwner, out var wc) ? (Color)wc : Tint;
+                    int tinted = 0;
+                    foreach (var t in row.GetComponentsInChildren<TMPro.TMP_Text>(true))
+                        if (t != null && t.transform.name == "WarehouseName") { t.color = whTint; tinted++; }
+                    if (tinted == 0 && !_warehouseLabelWarned)
+                    {
+                        _warehouseLabelWarned = true;
+                        Plugin.Logger.LogWarning($"{Tag} could not find the name label on a shared warehouse row — it is listed, but not coloured.");
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} warehouse tint: {ex.Message}"); }
+            }
+        }
+
+        private static Color? _defaultTypeLabelColor;
+
+        /// <summary>Page (after RefreshData): colour the business-type label of a shared shop; grey "open in EconoView"
+        /// on any other player's shop (EconoView hides those businesses). Restored on every own-shop page.</summary>
+        private static void ApplyPageTintAndGuards(BizManBusiness page)
+        {
+            if (page == null) return;
+            var reg = page.buildingRegistration;
+            string addr = AddrOf(reg);
+            bool other  = IsOtherPlayersShop(reg, addr);
+            // M3(e) 2026-09-12: IsOtherPlayersShop is FALSE on a merger-flipped shop by design (:61), so a partner's
+            // business page kept the default type-label colour. A flipped key IS a partner's building; its owner
+            // comes from the flip-proof source, because the flip blanks businessOwnerRivalId.
+            bool flipped = !string.IsNullOrEmpty(addr) && MergerFlip.IsFlipped(addr);
+            bool shared = (other && SharedShopSchedule.IsSharedShop(reg, addr)) || flipped;
+            // businessTypeLabel is a TextLocalizationComponent (Localizor, un-referenced) — reflection, as HousingMapCues.
+            if (HousingMapCues.GetMember(_fTypeLabel?.GetValue(page), "TextContainer") is TMPro.TMP_Text labelText)
+            {
+                _defaultTypeLabelColor ??= labelText.color;
+                Color? paint = null;
+                if (flipped && PlayerColours.TryColourForOwnerOf(addr, out var fc)) paint = (Color)fc;   // M3(e): flip-proof owner
+                // HO-1c L4.4: an owner this machine cannot name falls back to the label's OWN colour (paint stays
+                // null), never to the generic teal - a wrong colour reads as somebody else's shop.
+                else if (shared && PlayerColours.TryColourFor(reg?.businessOwnerRivalId?.ToString() ?? "", out var pc)) paint = (Color)pc;   // 2026-09-05 colours
+                labelText.color = paint ?? _defaultTypeLabelColor.Value;
+            }
+            SetButtonsCalling(page.transform, "OpenInEconoView", interactable: !other);
+        }
+
+        private static readonly HashSet<string> _noButtonLogged = new();
+
+        /// <summary>Find every Button under <paramref name="root"/> whose click is wired (in the prefab) to a method of
+        /// that name, and set its interactable state. Greyed = Unity's disabled tint; the control stays visible.
+        /// The wiring is a prefab fact the decompile cannot show — so when GREYING finds nothing, say so once: the
+        /// hard Prefix guards still hold, but a control would be live-looking, which ruling 14 forbids.</summary>
+        /// <summary>Same, for the other shared-shop surfaces (7d greys Shutdown with it).</summary>
+        internal static int SetButtonsCallingPublic(Transform root, string methodName, bool interactable)
+            => SetButtonsCalling(root, methodName, interactable);
+
+        private static int SetButtonsCalling(Transform root, string methodName, bool interactable)
+        {
+            int matched = 0;
+            if (root == null) return 0;
+            foreach (var b in root.GetComponentsInChildren<Button>(true))
+            {
+                try
+                {
+                    int n = b.onClick.GetPersistentEventCount();
+                    for (int i = 0; i < n; i++)
+                        if (b.onClick.GetPersistentMethodName(i) == methodName) { b.interactable = interactable; matched++; break; }
+                }
+                catch { }
+            }
+            if (matched == 0 && !interactable && _noButtonLogged.Add(methodName))
+                Plugin.Logger.LogWarning($"{Tag} could not find a button wired to '{methodName}' under '{root.name}' — it cannot be greyed (the action itself is still blocked by its guard). The prefab wires it differently; needs a look.");
+            return matched;
+        }
+
+        private static readonly HashSet<string> _blockLogged = new();
+        private static bool BlockOnOtherPlayersShop(BizManBusiness page, string what)
+        {
+            var reg = page?.buildingRegistration;
+            string addr = AddrOf(reg);
+            if (!IsOtherPlayersShop(reg, addr)) return false;
+            if (_blockLogged.Add(what + "|" + addr))
+                Plugin.Logger.LogInfo($"{Tag} '{what}' on another player's shop '{addr}' — not allowed (reserved), ignored.");
+            return true;
+        }
+
+        // ── Presentation tab guards ───────────────────────────────────────────
+
+        private static readonly System.Reflection.FieldInfo _fPresBiz = AccessTools.Field(typeof(BizManPresentation), "bizManBusiness");
+
+        /// <summary>Another player's shop: the contract-termination and buy-building buttons are greyed (closing shops and
+        /// deeds are reserved — ruling 4 / §4.1 row 15) and the rival "show employees" button (the poaching panel) is
+        /// hidden. Own shops: restored.</summary>
+        [HarmonyPatch(typeof(BizManPresentation), "OnEnable")]
+        public static class Patch_BizManPresentation_OnEnable_Guards
+        {
+            // Raised tenancy for the native view choice: a shared shop shows the "I run this" layout (no takeover /
+            // rent panels), not the AI-owned takeover view it would get with the flag down. Lowered in the finalizer.
+            static void Prefix(BizManPresentation __instance, out bool __state)
+            {
+                __state = false;
+                try
+                {
+                    var page = _fPresBiz?.GetValue(__instance) as BizManBusiness;
+                    __state = RaiseTenancy(page?.buildingRegistration, AddrOf(page?.buildingRegistration));
+                }
+                catch { }
+            }
+            static void Finalizer(BizManPresentation __instance, bool __state)
+            {
+                try { LowerTenancy((_fPresBiz?.GetValue(__instance) as BizManBusiness)?.buildingRegistration, __state); } catch { }
+            }
+            static void Postfix(BizManPresentation __instance)
+            {
+                try
+                {
+                    var page = _fPresBiz?.GetValue(__instance) as BizManBusiness;
+                    var reg = page?.buildingRegistration;
+                    bool other = IsOtherPlayersShop(reg, AddrOf(reg));
+                    // D30 / r3 K1 - ONE writer for the terminate button state. A merger-flipped address is
+                    // never `other` (see IsOtherPlayersShop), so for it the verdict is the ROUTABILITY one:
+                    // the same predicate the route itself reads, re-evaluated on every page populate, so a
+                    // runner coming back re-enables the button. BOTH states are written every time - the
+                    // BizMan page is one shared prefab instance serving every building. Inert without a
+                    // merger: with FlippedCount == 0 the shared-shop verdict stands untouched.
+                    bool termOk = !other;
+                    if (!other && reg != null && MergerFlip.FlippedCount > 0)
+                    {
+                        string fkey = AddrOf(reg);
+                        if (MergerFlip.IsFlipped(fkey))
+                        {
+                            // H-STANDINLEASE-1: an OFFLINE owner's lease is ended by nobody - greyed for the stand-in
+                            // and for a routing member alike (the confirm behind it is refused and logged).
+                            bool absent = false; try { absent = LeaseEndWatch.OwnerAbsent(fkey, out _); } catch { }
+                            termOk = !absent && MergerSync.IAmMember && SharedShopWorkTabs.RunnerReachable(fkey);
+                        }
+                    }
+                    SetButtonsCalling(__instance.transform, "TerminateContract", interactable: termOk);
+                    SetButtonsCalling(__instance.transform, "SendBuyBuildingOffer", interactable: !other);
+                    if (other && __instance.showEmployeesButton != null) __instance.showEmployeesButton.SetActive(false);
+                    if (other && !SharedShopSchedule.IsSharedShop(reg, AddrOf(reg))) ShopValuation.Request(AddrOf(reg));   // H-BIZ-1 (review #5): a SHARED shop shows the "mine" view (tenancy raised for OnEnable) — nothing to fill
+                    // (the buy-offer box is re-shown by the "make an offer" button later; its Send button is greyed
+                    //  even while inactive — GetComponentsInChildren(true) — and the method is hard-blocked below)
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} presentation guards: {ex.Message}"); }
+            }
+        }
+
+        /// <summary>HARD STOP behind the greyed button: terminating the contract runs entirely on the local replica —
+        /// it would credit the CLICKER with the owner's inventory value and deposit and blank the shop locally.
+        /// Closing shops is reserved (ruling 4); on another player's shop the confirm does nothing.</summary>
+        [HarmonyPatch(typeof(BizManPresentation), "OnTerminateContractConfirm")]
+        public static class Patch_BizManPresentation_TerminateConfirm_Block
+        {
+            static bool Prefix(BizManPresentation __instance)
+            {
+                try { return !BlockOnOtherPlayersShop(_fPresBiz?.GetValue(__instance) as BizManBusiness, "terminate contract"); }
+                catch { return true; }
+            }
+        }
+
+        /// <summary>HARD STOP behind the greyed button: a buy-building offer on another player's shop (deed — reserved).</summary>
+        [HarmonyPatch(typeof(BizManPresentation), nameof(BizManPresentation.SendBuyBuildingOffer))]
+        public static class Patch_BizManPresentation_BuyOffer_Block
+        {
+            static bool Prefix(BizManPresentation __instance)
+            {
+                try { return !BlockOnOtherPlayersShop(_fPresBiz?.GetValue(__instance) as BizManBusiness, "buy-building offer"); }
+                catch { return true; }
+            }
+        }
+
+        // ── Schedule tab guards (shared shops only — other players' shops never show the tab) ──
+
+        private static bool ScheduleIsOnSharedShop()
+        {
+            try
+            {
+                var reg = ScheduleHelper.Business != null ? ScheduleHelper.Business.buildingRegistration : null;
+                return SharedShopSchedule.IsSharedShop(reg, AddrOf(reg));
+            }
+            catch { return false; }
+        }
+
+        private static readonly System.Reflection.FieldInfo _fLicToggle    = AccessTools.Field(typeof(ScheduleCellView), "toggle");
+        private static readonly System.Reflection.FieldInfo _fRenameInput  = AccessTools.Field(typeof(ScheduleCellView), "workstationNameInputField");
+
+        /// <summary>Pasting a day (and paste-to-all) also copies the cinema licensing-fee switches into the LOCAL
+        /// save's list keyed by the owner's address — a silent local write nothing routes. On a shared shop the
+        /// paste carries hours and shifts only (the licensing toggle itself is greyed below).</summary>
+        [HarmonyPatch(typeof(ScheduleDayButton), "CopyDisabledLicensingFeesBetweenDays")]
+        public static class Patch_ScheduleDayButton_CopyLicensing_Block
+        {
+            static bool Prefix() { try { return !ScheduleIsOnSharedShop(); } catch { return true; } }
+        }
+        [HarmonyPatch(typeof(ScheduleDayButton), "ClearDisabledLicensingFeesOfDay")]
+        public static class Patch_ScheduleDayButton_ClearLicensing_Block
+        {
+            static bool Prefix() { try { return !ScheduleIsOnSharedShop(); } catch { return true; } }
+        }
+
+        // Auto-fill (week + per-day) is LIVE on a shared shop since slice 3: the auto-fill guard in MPPatches exempts
+        // the owner's copied staff for the owner's shop (SharedShopStaff.AllowedInAutoFill), the fill writes the local
+        // replica, and the slice-1 scan routes the changed days to the owner once the fill has finished.
+
+        /// <summary>Per workstation row: the cinema licensing-fee toggle (spends the owner's money — reserved) and the
+        /// workstation-rename field (ruling 14 e: later — the name is not synced, so a local rename would silently stick
+        /// only here) are greyed on a shared shop. On own shops the game's own readOnly rule is left as it set it.</summary>
+        [HarmonyPatch(typeof(ScheduleCellView), "SetWorkstationData")]
+        public static class Patch_ScheduleCellView_SetWorkstationData_Guards
+        {
+            static void Postfix(ScheduleCellView __instance)
+            {
+                try
+                {
+                    bool shared = ScheduleIsOnSharedShop();
+                    if (_fLicToggle?.GetValue(__instance) is Toggle t) t.interactable = !shared;
+                    if (_fRenameInput?.GetValue(__instance) is TMPro.TMP_InputField f)
+                    {
+                        f.interactable = !shared;
+                        if (shared) f.readOnly = true;   // the game set readOnly for its own reason just before; only ADD the restriction
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} workstation row guard: {ex.Message}"); }
+            }
+        }
+
+        /// <summary>M3(g)/(h) 2026-09-12: the schedule page's EMPLOYEE rows — the list a shop's staff tab shows —
+        /// carry a partner's colour (ScheduleEmployeeCellView.SetData -> SetBasicInfo, decompile
+        /// UI.Smartphone.Apps.BizMan.Schedule/ScheduleEmployeeCellView.cs:79 and :116-118). A rich-text tag, not a
+        /// component colour: this is a BaTableCellView, so the table repaints its child labels on every (re)bind
+        /// (the MyEmployees probe, SharedShopStaff.cs:726-733), and SetBasicInfo rewrites the text from the model
+        /// each pass — tags never stack and own rows need no restore.</summary>
+        /// <summary>HO-1c L4.1 (manager ruling 2026-09-12): IsFromRoutedOwner is a direct grant OR a co-member, so
+        /// a permission helper's copied staff are painted here too - which is what the MyEmployees row list has done
+        /// per owner since 2026-09-05; this surface now matches it.  Colour only.</summary>
+        [HarmonyPatch(typeof(ScheduleEmployeeCellView), nameof(ScheduleEmployeeCellView.SetData))]
+        public static class Patch_ScheduleEmployeeCellView_SetData_Tint
+        {
+            static void Postfix(ScheduleEmployeeCellView __instance, ScheduleEmployeeModel data)
+            {
+                try
+                {
+                    if (__instance == null || data == null || __instance.employeeNameLabel == null) return;
+                    string sid = data.employeeId ?? "";
+                    if (!SharedShopStaff.IsFromRoutedOwner(sid)) return;
+                    __instance.employeeNameLabel.text = PlayerColours.TagOpen(MPRegisterSync.OwnerOfInjected(sid)) + __instance.employeeNameLabel.text + "</color>";
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"{Tag} schedule employee row tint: {ex.Message}"); }
+            }
+        }
+    }
+}

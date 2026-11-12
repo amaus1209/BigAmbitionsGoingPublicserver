@@ -1,0 +1,49 @@
+[h1]Going Online – become a cable network operator[/h1]
+Found your own internet and cable TV provider: buy bandwidth, connect the city's buildings and sell internet, television and phone lines – the bigger a building, the more customers it holds. Modelled on real cable networks: headend, fiber nodes, amplifiers, house transfer point, modem.
+
+[h2]Please note[/h2]
+[list]
+[*][b]A new mod, still being tested[/b] – please report bugs and wishes in the comments, with your Player.log if you can.
+[*][b]Saves:[/b] your provider lives in your save. Without the mod it simply stays there.
+[*][b]Multiplayer:[/b] [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182]Going Public Server[/url] has Going Online built in (module 8), and the server's ranking shows the players' cable providers. When Going Public Server is active, this mod steps aside.
+[/list]
+
+[h2]How to start[/h2]
+First the office, then the customer center: rent an [b]office[/b] and found the [b]"Cable provider"[/b] there in [b]BizMan[/b] (course "Office Businesses") - it becomes your headend. Then rent a [b]shop[/b] in the same neighbourhood and found a [b]"Cable customer center"[/b] there. Only when both stand do people sign. The [b]Going Online[/b] app (phone or [b]Shift+F12[/b]) guides you through the first steps. To start you need 25,000 $ for the CMTS; you can lease a van.
+
+[h2]What's in it[/h2]
+[list]
+[*][b]Connect buildings[/b]: a building's size decides its households and businesses. The incumbent has all customers at first; how many switch to you depends on price, evening speed, faults and your reputation.
+[*][b]Competition: Skyline Cable[/b]: the city's old cable company fights back where you take its customers. It cuts prices, wins customers back with switching bonuses, upgrades its network, signs exclusive contracts for buildings and bids in every tender. When its network fails, many switch to you. How hard it fights follows the game's rivals setting.
+[*][b]New in 0.8 - offices, hubs, customer centers[/b]: every neighbourhood needs an office and a customer center. An office in another neighbourhood becomes a hub with its own CMTS once its feeder fiber is built; a ring survives the digger. In the customer center people come in, look at the device table, wait on the chairs in front of the promo TV with your spot and go to the customer desk. One person serves 400 (technicians), 800 (switching staff) or 500 (customer service) connections, a network master leads up to 10 people.
+[*][b]Fiber nodes per neighbourhood[/b]: all connections on a node share its capacity, the evening is the peak. Every CMTS has 8 ports. Nodes can be removed again too.
+[*][b]Technology in stages[/b]: start with DOCSIS 3.0 (tariffs up to 500 Mbit/s). DOCSIS 3.1 comes at 300 connections (up to 1000 Mbit/s, faster only with a 3.1 modem). Fiber to the home with XGS-PON comes at 1500 connections. Then high split for more upload (house amplifiers swapped), fiber deep with small nodes without amplifiers, and remote PHY on a vCMTS server.
+[*][b]Buy bandwidth[/b]: IP transit in steps from 100 Mbit/s to 100 Gbit/s, cheaper per Mbit/s the more you buy, billed like the 95th percentile. Peering ports at an internet exchange take part of the traffic.
+[*][b]Tariffs[/b]: name, speed, TV (cable or IPTV), phone, price per day and minimum term, with the market price next to it.
+[*][b]Phone[/b]: with the voice platform every internet tariff can come with a phone line. You buy numbers in blocks of 1,000, and many new customers bring their number along (porting, two days).
+[*][b]IPTV[/b]: about 120 channels and replay over the internet line, with no cable channels used, and a set-top box. It adds load on the nodes at TV time.
+[*][b]Devices[/b]: buy cable modems, ONTs and set-top boxes wholesale. Customers rent, buy or bring their own (router freedom).
+[*][b]TV by satellite[/b]: every satellite device puts one transponder on the cable. Every channel takes room the internet then lacks.
+[*][b]Pay-TV as a reseller[/b]: wholesale contracts with a price per subscriber and a minimum per day. You set the retail price. It needs a CA system and smartcards.
+[*][b]Faults like in a real network[/b]: return-path interference, amplifier failures, water in the house connection, power cuts at nodes, fiber cut by a digger, broken modems and Wi-Fi trouble. Batteries, a UPS and a generator bridge power cuts in a neighbourhood. Network monitoring in the control room finds faults before anyone calls. After two days without a fix, compensation is due (German § 58 TKG).
+[*][b]Staff in six roles[/b]: technicians, switching staff, network masters, field sales, customer service and technical support, each with skill, wage and shift. You can also drive there yourself and repair it.
+[*][b]Vehicles and workplaces[/b]: park vehicles at your offices. The jobs come with the workplaces; customer service works in the customer center. The monitors show the app, as if your staff were clicking through it.
+[*][b]New in 0.8.1 – in BizMan[/b]: the cable provider is in BizMan's list (connections, satisfaction) with the tabs Deliveries, Fleet and Inventory. Wholesalers bring the devices by delivery contract, and the furniture store delivers to your office by phone.
+[*][b]Own models[/b]: all devices have their own 3D models with blinking LEDs, without brands. The service van is a real vehicle: sold by the dealers, yours to drive, with the livery from the tab "Service van" and number plates "GO1-name" ...; leased vans drive through the city.
+[*][b]New in 0.8.3[/b]: events with a decision (storm, big match, excavator, press, test win, fibre subsidy), street cabinets with your logo and road works in the city, seen by everybody, lines between players (Going Public Server) and templates for more building sizes.
+[*][b]Deals[/b]: a streaming cache saves bandwidth, a provider without a network rents lines from you, firms book tariffs with an 8-hour repair time, and large residential buildings sign bulk TV contracts.
+[*][b]Orders like in real life[/b]: the order, porting, switching on in the building, then self-installation or an appointment. Customers who cancel keep the signal until the line is switched off.
+[*][b]Permission contracts[/b]: every building has a contract with its owner for two game years. Renew it in time, or there is a tender, and with a poor reputation another provider takes the building and its customers. Field sales help with that and win new customers at the door.
+[*][b]Customer satisfaction[/b]: five parts show what is wrong: network, faults, appointments, calls and orders. Missing staff shows there first. Contractors and overtime help through bottlenecks.
+[*][b]Start small, grow big[/b]: at first you lend a hand yourself. With more customers you get a volume discount.
+[*][b]Age and maintenance[/b]: new connections need hardly any maintenance, old ones more, and they fail more often - refurbish them or move them to fiber. Repairs on old coax are cheap, a fiber cut is expensive.
+[*][b]Moves, charges, complaints[/b]: a move fee, a fault service charge when the fault is the customer's, complaints about unfriendly technicians - a training helps.
+[*][b]Finance[/b]: the bill runs at midnight, and every item is also in the game's finance app.
+[*][b]Settings[/b] under Options → Mods: how often faults come, how fast the customers grow, when DOCSIS 3.1 and fiber unlock.
+[/list]
+
+[h2]Languages[/h2]
+German and English. The other languages show English.
+
+[h2]Thanks[/h2]
+Developed by amaus1209 together with Claude Code (Anthropic). The numbers come from research on real cable networks: DOCSIS, XGS-PON, IP transit, German telecoms law, router rentals and Pay-TV contracts. Big Ambitions belongs to Hovgaard Games.

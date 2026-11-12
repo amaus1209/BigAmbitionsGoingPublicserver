@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using Buildings;
+using Entities;
+using Helpers;
+using UnityEngine;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Live retail-price sync — the economy-coupling feature (2026-06-10).
+    ///
+    /// The game's price competition is per-neighbourhood (CompetitionHelper)
+    /// and runs LOCALLY on every machine over its local registration table.
+    /// Business existence/type already syncs, so competitor COUNTS are right
+    /// everywhere — but other players' retail PRICES only used to arrive on
+    /// interior entry, so the regional price picture drifted between machines.
+    ///
+    /// Each machine scans the businesses IT runs (RentedByPlayer on the local
+    /// save) every few seconds and broadcasts any registration whose price
+    /// list changed (hash-gated).  Receivers write the list into their local
+    /// copy of that registration — both sims then run the same deterministic
+    /// competition math over the same inputs.
+    /// </summary>
+    public static class MPPriceSync
+    {
+        /// <summary>Re-enabled 2026-06-10: the taxi-crash experiment ACQUITTED
+        /// price sync (the killer was a leftover SetHighlight diagnostic
+        /// detour).</summary>
+        public static bool Enabled = true;
+
+        private const float ScanSeconds = 5f;
+        private const float ReassertSeconds = 30f;   // re-send an UNCHANGED price list at least this often → a dropped update (e.g. the just-rented window) self-heals on the next pass
+
+        private static readonly Dictionary<string, int> _lastHash = new();
+        private static readonly Dictionary<string, float> _lastSentAt = new();   // addr → last send time (changed or heartbeat); drives the re-assert
+        // Addresses whose prices arrived from another player — never rebroadcast
+        // those as our own (guards against ownership-flag ambiguity on synced
+        // foreign businesses).
+        private static readonly HashSet<string> _foreignAddrs = new();
+        private static float _nextScanAt;
+        // Host-only cache (Class 4 join replay): the latest price payload per player-shop addr — replayed to a
+        // connecting peer so a hot-joiner gets ALL current player-shop prices, not just AI ones. Concurrent: the
+        // host records from BOTH the network-thread relay and the main-thread Tick. Keyed by addr (bounded).
+        private static readonly ConcurrentDictionary<string, RetailPricesPayload> _hostCache = new();
+        internal static void HostRecord(RetailPricesPayload? p)
+        { if (p != null && !string.IsNullOrEmpty(p.AddressKey)) _hostCache[p.AddressKey] = p; }
+        internal static ICollection<RetailPricesPayload> HostCachedPayloads => _hostCache.Values;
+
+        public static void Reset()
+        {
+            _lastHash.Clear();
+            _lastSentAt.Clear();
+            _foreignAddrs.Clear();
+            _hostCache.Clear();
+            _nextScanAt = 0f;
+        }
+
+        /// <summary>Publish this shop's prices on the next scan (the owner, right after applying a routed edit) —
+        /// the hash gate would otherwise wait out the re-assert interval before anyone saw the new number.</summary>
+        internal static void PublishNow(string addressKey)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey)) return;
+                _lastHash.Remove(addressKey);
+                _nextScanAt = 0f;
+            }
+            catch { }
+        }
+
+        /// <summary>Main thread, while MP active + in game: broadcast changed
+        /// price lists of locally-run businesses.</summary>
+        public static void Tick()
+        {
+            if (!Enabled) return;
+            if (Time.unscaledTime < _nextScanAt) return;
+            _nextScanAt = Time.unscaledTime + ScanSeconds;
+            try
+            {
+                var gi = SaveGameManager.Current;
+                if (gi == null) return;
+                foreach (var reg in gi.BuildingRegistrations)
+                {
+                    if (reg == null) continue;
+                    bool mine;
+                    try { mine = MergerFlip.TrulyMine(reg); } catch { continue; }   // flip = presentation; never publish partner prices
+                    if (!mine) continue;
+
+                    var prices = reg.retailPrices;
+                    if (prices == null || prices.Count == 0) continue;
+                    string addr = GameStateReader.AddressKey(reg);
+                    if (string.IsNullOrEmpty(addr) || _foreignAddrs.Contains(addr)) continue;
+
+                    int h = 17;
+                    unchecked
+                    {
+                        for (int i = 0; i < prices.Count; i++)
+                        {
+                            var rp = prices[i];
+                            if (rp == null) continue;
+                            h = h * 31 + (rp.itemName?.GetHashCode() ?? 0);
+                            h = h * 31 + rp.price.GetHashCode();
+                        }
+                    }
+                    bool changed = !(_lastHash.TryGetValue(addr, out var prev) && prev == h);
+                    bool reassertDue = !_lastSentAt.TryGetValue(addr, out var sentAt) || (Time.unscaledTime - sentAt) >= ReassertSeconds;
+                    if (!changed && !reassertDue) continue;   // unchanged AND sent recently → skip; otherwise (re)send so a dropped update self-heals
+                    _lastHash[addr] = h;
+                    _lastSentAt[addr] = Time.unscaledTime;
+
+                    var p = new RetailPricesPayload { AddressKey = addr, OwnerId = MPConfig.PlayerId };
+                    for (int i = 0; i < prices.Count; i++)
+                    {
+                        var rp = prices[i];
+                        if (rp == null) continue;
+                        p.Prices.Add(new RetailPriceInfo { ItemName = rp.itemName ?? "", Price = rp.price });
+                    }
+
+                    if (MPServer.IsRunning)        MPServer.BroadcastRetailPrices(p);
+                    else if (MPClient.IsConnected) MPClient.SendRetailPrices(p);
+                    if (changed) Plugin.Logger.LogInfo($"[PriceSync] sent {p.Prices.Count} price(s) for '{addr}'.");   // quiet on heartbeat re-asserts
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[PriceSync] Tick: {ex.Message}"); }
+        }
+
+        /// <summary>Write a received price list into the local registration copy.
+        /// MAIN THREAD ONLY (touches IL2CPP game state).</summary>
+        public static void Apply(RetailPricesPayload? p)
+        {
+            try
+            {
+                if (!Enabled) return;
+                if (p == null || string.IsNullOrEmpty(p.AddressKey)) return;
+                if (p.OwnerId == MPConfig.PlayerId) return;   // own relay echo
+                _foreignAddrs.Add(p.AddressKey);
+
+                var reg = GameStatePatcher.FindRegistration(p.AddressKey);
+                if (reg == null || reg.retailPrices == null) return;   // building unknown here (yet)
+                // Sweep item 10 (2026-08-18): the sender's ~30s re-assert heartbeat is deliberate
+                // dropped-update insurance — but this receiver rewrote the table and logged a line
+                // for every IDENTICAL heartbeat (12,021 field lines/8 bundles buried the evidence
+                // reports exist to carry).  Live compare: apply + log only when the LOCAL table
+                // actually differs from the payload — the heartbeat still heals genuine drift.
+                bool same = reg.retailPrices.Count == p.Prices.Count;
+                if (same)
+                    for (int i = 0; i < p.Prices.Count; i++)
+                    {
+                        var rp = p.Prices[i]; var lp = reg.retailPrices[i];
+                        if (lp == null || lp.itemName != rp.ItemName || lp.price != rp.Price) { same = false; break; }
+                    }
+                if (same) return;
+                // Shared-shop slice 4: an item this machine has just re-priced (routed, not yet confirmed) keeps its
+                // local value — otherwise the owner's re-assert pulls the number back under the helper's cursor. Per
+                // ITEM, so everything else in the same message still applies. The hold is keyed by ADDRESS + item and
+                // asks no question about WHY the shop is routed, so merger phase 2's flipped partner shops are covered
+                // by the same rule with no change here (2026-09-11).
+                var localHeld = new Dictionary<string, float>();
+                var incoming = new Dictionary<string, float>();
+                foreach (var rp in p.Prices) if (rp?.ItemName != null) incoming[rp.ItemName] = rp.Price;
+                foreach (var lp in reg.retailPrices)
+                    if (lp?.itemName != null
+                        && SharedShopPrices.HoldsItem(p.AddressKey, lp.itemName, incoming.TryGetValue(lp.itemName, out var inc) ? inc : float.NaN))
+                        localHeld[lp.itemName] = lp.price;
+                reg.retailPrices.Clear();
+                foreach (var rp in p.Prices)
+                    reg.retailPrices.Add(new RetailPrice { itemName = rp.ItemName, price = localHeld.TryGetValue(rp.ItemName, out var keep) ? keep : rp.Price });
+                if (localHeld.Count > 0) Plugin.Logger.LogInfo($"[PriceSync] '{p.AddressKey}': kept {localHeld.Count} price(s) being edited here.");
+                Plugin.Logger.LogInfo($"[PriceSync] applied {p.Prices.Count} price(s) for '{p.AddressKey}' (from {p.OwnerId}).");
+
+                // PRICE-PER-UNIT-DIVERGE-1 (owner decision 53): the shelves are no longer re-stamped with the new table
+                // prices - a stack's price is its purchase cost on every machine; what a visitor carries and pays reads the
+                // store table at the take (Patch_ShowcaseGrab_RetailPrice, PlayerItemPurchaser) and the charge.
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[PriceSync] Apply: {ex.Message}"); }
+        }
+    }
+}

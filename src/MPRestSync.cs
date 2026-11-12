@@ -1,0 +1,1889 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>
+    /// Consensus time-skip v3 ("our wiring", user-designed 2026-06-10).
+    ///
+    /// PRINCIPLE: the game's skip engine (TimeMachine) NEVER stays alive in
+    /// MP.  Sitting just sits — pure native behavior, normal time.  Waiting
+    /// is OUR system: while seated, a small "Wait until…" button (MPCanvasUI)
+    /// raises a vote with an absolute goal (minimum 1 hour ahead).  When ALL
+    /// players have an active vote the HOST races the authoritative clock to
+    /// the EARLIEST goal; standing up or cancelling drops your vote and stops
+    /// the skip.  No native overlay, no pause, no hidden mechanics.
+    ///
+    /// The native skip button is neutralized, not fought: if pressed, the
+    /// engine starts and is immediately shut down through ITS OWN off switch
+    /// (complete, self-consistent teardown) and a notice points to our button.
+    /// A watchdog clears any leftover time-freeze every second — a hard-lock
+    /// is structurally impossible.
+    /// </summary>
+    public static class MPRestSync
+    {
+        /// <summary>Game-minutes of simulation per REAL second while a consensus skip runs - the SINGLE
+        /// source of truth for the rate. Read by the skip executor on host and clients (TickSkipFrame) and
+        /// by the client's BEHIND catch-up (TimeSync.TickClockCorrection). A field, not a const, so the DEV
+        /// lever `skiprate` can change it at runtime and one rig run can compare rates without a rebuild -
+        /// verified safe: nothing needs it at compile time (no attribute argument, no default parameter, no
+        /// case label; the only two reads are the two tick sites above). 50 since 2026-09-20 (user ruling,
+        /// was 25): the ~70 ms of economy per simulated hour is unchanged, twice as much of it per second.</summary>
+        public static float SkipMinutesPerRealSecond = 50f;
+
+        // ── D-SKIPPACE-1 (user-approved 2026-09-21): the shop's VISUAL pace during a skip ──
+        /// <summary>THE ONE NUMBER the user asked to be easy to change: the most a skipping shop's
+        /// bodies may be sped up. 1000 (user ruling 2026-09-21: "if we do 50x then let's see 50x, I'll
+        /// judge if it looks wrong" - so the shipped pace is the REAL skip multiple, un-capped in
+        /// practice, and this number is only the safety rail a dev can lower). Only two writers: this
+        /// initialiser and the `skippace` DEV lever. Setting it to 1 turns the feature off here.</summary>
+        public static float MaxSkipVisualPace = 1000f;
+
+        // ── BATCH-26 FOLD 3 (A): the LIVE skip-shop mode is GONE (user decision 2026-09-21, after the
+        // three-way gym comparison: per scheduled shopper, normal 0.52 orders / $12.3, LIVE 50x
+        // 0.25 / $5.8, PAPER 50x 0.65 / $16.1). The PAPER simulator - vanilla's own fast-forward
+        // method - is the accountant during a skip, and the sped-up floor is decoration. There is no
+        // mode switch left: SkipShopMode / SkipShopLiveNow and the `skipshop` lever are deleted.
+
+        private static int   _paceFrame  = -1;
+        private static float _paceCached = 1f;
+
+        /// <summary>How much faster the SHOP looks while a consensus skip runs: the skip's clock rate
+        /// divided by the NORMAL clock rate (GameManager.MinutesMultiplier - the same helper the
+        /// round-60b arrival throttle uses, never a second copy of it), clamped to [1, MaxSkipVisualPace].
+        /// 1 whenever no skip is running, so every reader is free outside a skip. Memoised per frame so
+        /// that per-frame READERS (the puppet chase clamp) cost one int compare, not a reflection call.</summary>
+        public static float SkipPace
+        {
+            get
+            {
+                if (!SkipActive) return 1f;
+                int f = Time.frameCount;
+                if (f == _paceFrame) return _paceCached;
+                _paceFrame = f;
+                float norm = 1f;
+                try { norm = MPPatches.Patch_IndoorSpawner_SkipVisualPace.NormalMinutesPerRealSecond(); } catch { }
+                if (norm < 0.05f) norm = 1f;
+                _paceCached = Mathf.Clamp(SkipMinutesPerRealSecond / norm, 1f, Mathf.Max(1f, MaxSkipVisualPace));
+                return _paceCached;
+            }
+        }
+
+        /// <summary>True only while THIS player's own body should be sped up: a skip is running and the
+        /// player is actually working a station. Read LIVE from the game's own activity state, never
+        /// latched - the moment the player stops working, the body is normal again.</summary>
+        public static bool LocalBodyPaced
+        {
+            get
+            {
+                try { return SkipActive && CurrentActivityName() == "Work" && AvatarInActivity(); }
+                catch { return false; }
+            }
+        }
+        // Defensive ceiling on game-minutes simulated in a SINGLE frame during a skip: a frame-time spike
+        // (alt-tab, stall) must not dump many hours of economy into one frame (~70ms/simulated-hour). This is
+        // a per-FRAME absolute and is deliberately NOT derived from the rate. At 50 min/s a 60 fps frame
+        // advances ~0.8 min, so it still only caps a recovery frame after a spike - one longer than ~1.2 s
+        // (it was ~2.4 s at 25 min/s).
+        public const float MaxSkipMinutesPerFrame = 60f;
+
+        // ── Local state ───────────────────────────────────────────────────────
+        public static bool   Seated       { get; private set; }
+
+        /// <summary>What the DOCK should follow: after StandUp, the same
+        /// activity instance is suppressed — a half-cancelled approach (click
+        /// bench, walk away) left Seated wedged true and the dock stuck open
+        /// with no X (user, 2026-06-11).  A NEW activity un-suppresses.</summary>
+        public static bool SeatedForUi => Seated && !ReferenceEquals(_curActRef, _suppressedActRef);
+        private static object? _suppressedActRef;
+        private static object? _curActRef;
+        private static bool _buttonsReadStackLogged;   // round-266: inner-exception stack printed once per activity
+        private static readonly Dictionary<NavigationBlocker, int> _stuckObs = new();   // round-90b: consecutive held-while-owner-closed observations
+
+        /// <summary>Round-90b: is this blocker's OWNING surface actually active right now?
+        /// true = open (legitimate hold), false = CLOSED (impossible in normal play — stuck),
+        /// null = no owner mapping (sequences, dialogs — the plain persistence warn covers them).
+        /// Singleton statics only — no scene scans, O(1) reads.</summary>
+        private static bool? BlockerOwnerOpen(NavigationBlocker key)
+        {
+            try
+            {
+                switch (key)
+                {
+                    case NavigationBlocker.Map:                return CityMap.IsOpen;
+                    // 'Vehicle' has TWO legitimate holders (user catch 2026-08-17): the native
+                    // driver flow (GetCurrentVehicle-based) AND our passenger ride, which sets
+                    // this key MANUALLY (PassengerRide.SetVehicleNavBlocker) while the native
+                    // check reads false — a rider is NOT natively "in" the car. Without the
+                    // second term every normal passenger ride reads as stuck.
+                    case NavigationBlocker.Vehicle:            return Helpers.VehicleHelper.IsInsideMotorVehicle() || PassengerRide.IsSeated;
+                    case NavigationBlocker.PurchaseUI:         return UI.Purchase.PurchaseUI.IsPanelOpen;
+                    case NavigationBlocker.InteriorDesignerUI: return UI.InteriorDesigner.InteriorDesignerUI.IsOpen;
+                    case NavigationBlocker.PurchaseVehicleUI:  return UI.PurchaseVehicle.PurchaseVehicleUI.IsPanelOpen;
+                    // Round-279: this oracle CANNOT go stale — IsInPlacementMode is
+                    // CurrentPlaceableItemBeingPlaced != null, the same object lifetime
+                    // that gates the blocker's set.
+                    case NavigationBlocker.PlacementMode:      return BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode;
+                    default: return null;
+                }
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Round-279 (fix C): the blocker state sampled the instant the report popup
+        /// opens — BEFORE the popup's own input-block sets NavigationBlocker.HelpSystem.  The
+        /// old live sample was self-poisoned: every manual report showed HelpSystem because
+        /// the report tool itself had just set it, and the wedge-time state was unknowable.
+        /// Set by MPCanvasUI.OpenManualBugReport; cleared when the popup closes.</summary>
+        internal static string? PreReportNavBlockers;
+
+        /// <summary>Round-90b: the navigation-blocker state at THIS moment, for report.md — a
+        /// player filing "I'm stuck" with a key marked "owner CLOSED — STUCK" is the smoking
+        /// gun the round-90 class has been missing. MAIN THREAD (report creation is).</summary>
+        internal static string DescribeNavBlockersForReport()
+        {
+            try
+            {
+                var pc = InstanceBehavior<GameManager>.Instance?.playerController;
+                if (pc == null) return "(no player)";
+                _navBlockerSetField ??= HarmonyLib.AccessTools.Field(typeof(PlayerController), "_activeNavigationBlockers");
+                if (_navBlockerSetField?.GetValue(pc) is not System.Collections.IEnumerable held) return "(unreadable)";
+                var parts = new List<string>();
+                foreach (var b in held)
+                {
+                    if (b is not NavigationBlocker key) continue;
+                    bool? open = BlockerOwnerOpen(key);
+                    parts.Add(open == null ? key.ToString()
+                            : open == true ? $"{key}(owner open)"
+                            : $"{key}(owner CLOSED — STUCK)");
+                }
+                return parts.Count == 0 ? "none" : string.Join(", ", parts);
+            }
+            catch (Exception ex) { return $"(error: {ex.Message})"; }
+        }
+
+        /// <summary>Round-279 (fix D): 3-frame origin tag for the PlacementMode set/unset
+        /// logs below — Harmony wrapper frames (DMD…) filtered out.</summary>
+        private static string BlockerOrigin()
+        {
+            try
+            {
+                var st = new System.Diagnostics.StackTrace(2, false);
+                var parts = new List<string>();
+                for (int i = 0; i < st.FrameCount && parts.Count < 3; i++)
+                {
+                    var m = st.GetFrame(i)?.GetMethod();
+                    if (m == null) continue;
+                    string n = $"{m.DeclaringType?.Name}.{m.Name}";
+                    if (n.Contains("DMD") || n.Contains("NavBlocker") || n.Contains("BlockerOrigin")) continue;
+                    parts.Add(n);
+                }
+                return parts.Count == 0 ? "(unknown)" : string.Join(" ← ", parts);
+            }
+            catch { return "(unknown)"; }
+        }
+
+        // Round-279 (fix D): every PlacementMode set/unset names its origin — this alone
+        // settles whether a future strand came from round-37i/279, the placement finalizer,
+        // a dead cancel-coroutine, or a native path.  Placement start/end are rare events,
+        // so the stack capture is negligible.  5-point checklist 2026-08-19: (1) no other
+        // patch class targets these methods (grep); (2) our own Unset callers (heals,
+        // HousingPatches finalizer, VehicleManager) logging through this is intended;
+        // (3) loader annotation checked on next load; (4) MP-gated below; (5) the game
+        // call is never absorbed — only our own log line is guarded.
+        [HarmonyLib.HarmonyPatch(typeof(PlayerController), "SetNavigationBlocker")]
+        public static class Patch_NavBlockerSet_PlacementOrigin
+        {
+            static void Postfix(NavigationBlocker navigationBlocker)
+            {
+                if (navigationBlocker != NavigationBlocker.PlacementMode) return;
+                if (!MPServer.IsRunning && !MPClient.InMpGame) return;
+                try { Plugin.Logger.LogInfo($"[Rest] PlacementMode blocker SET — origin: {BlockerOrigin()}"); } catch { }
+            }
+        }
+
+        [HarmonyLib.HarmonyPatch(typeof(PlayerController), "UnsetNavigationBlocker")]
+        public static class Patch_NavBlockerUnset_PlacementOrigin
+        {
+            static void Postfix(NavigationBlocker navigationBlocker)
+            {
+                if (navigationBlocker != NavigationBlocker.PlacementMode) return;
+                if (!MPServer.IsRunning && !MPClient.InMpGame) return;
+                try { Plugin.Logger.LogInfo($"[Rest] PlacementMode blocker UNSET — origin: {BlockerOrigin()}"); } catch { }
+            }
+        }
+
+        /// <summary>True once the avatar has physically ARRIVED in the activity (sitting / performing) —
+        /// NOT while still choosing or walking over (MovingTowardsActivity).  This DELAYS the dock until
+        /// the player is seated; it gates NOTHING else (the activity, the auto-start, and the vanilla-panel
+        /// suppression all run regardless), and it can't gate the dock OUT — it reads the game's own LIVE
+        /// state (HasNavigationDisabled && not moving-towards), so once seated it reliably shows.</summary>
+        public static bool AvatarInActivity()
+        {
+            var g = ReadAvatarGate();
+            return g.uiFound && g.navDisabled && !g.moving;
+        }
+
+        // RESTDOCK-LOG (bundle 20260903-180322, F-2026-09-05-U): the two game flags behind AvatarInActivity, read ONCE
+        // here for both the gate and the dock's show/hide log line. uiFound=false → the activity UI object is missing
+        // (the gate then reads false, as before).
+        private static (bool uiFound, bool navDisabled, bool moving) ReadAvatarGate()
+        {
+            try
+            {
+                var (ui, uiType) = GetActivityUiCached();
+                if (ui == null || uiType == null) return (false, false, false);
+                bool navDisabled = (bool)(uiType.GetMethod("HasNavigationDisabled",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.Invoke(null, null) ?? false);
+                bool moving = (bool)(uiType.GetProperty("IsMovingTowardsActivity",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetValue(null) ?? false);
+                return (true, navDisabled, moving);
+            }
+            catch { return (false, false, false); }
+        }
+
+        /// <summary>One-line description of everything that gates the seated dock — for the dock's show/hide log line.</summary>
+        public static string DescribeDockGate()
+        {
+            var g = ReadAvatarGate();
+            return $"seated={Seated} seatedForUi={SeatedForUi} loitering={Loitering} uiFound={g.uiFound} navDisabled={g.navDisabled} movingTowards={g.moving} state={ActivityState} activity='{ActivityName}'";
+        }
+
+        public static string ActivityName { get; private set; } = "";
+        public static int    ActivityState { get; private set; } = -1;   // PlayerActivityState; -1 = none
+        private static bool   _localVoteActive;
+        private static double _localGoal;
+        private static float  _nextPollAt;
+
+        public static bool LocalVoteActive => _localVoteActive;
+
+        // ── Loitering (user feature 2026-08-26): a skip vote WITHOUT a seat ──────
+        // The bottom-left HUD button (MPCanvasUI) toggles this; the dock opens in
+        // "Loitering" mode and SetSkipRequest accepts the vote standing up. Votes are
+        // unchanged on the wire — the host never validated seatedness; the Activity
+        // field carries the display string "loitering". Sitting down CONVERTS the
+        // session to the seated contract (flag clears, the vote carries — user ruling
+        // #2); WASD never cancels a loiterer (they are allowed to walk — ruling #1).
+        public static bool Loitering { get; private set; }
+
+        public static void SetLoitering(bool on)
+        {
+            if (on == Loitering) return;
+            Loitering = on;
+            Plugin.Logger.LogInfo($"[Rest] loitering {(on ? "ON" : "OFF")}.");
+            if (!on && _localVoteActive && !Seated) SetSkipRequest(false);        // the loiter vote dies with its session
+            else if (on && _localVoteActive) SendVote(true, _localGoal, "loitering");   // review MINOR-8: a vote carried INTO loitering re-labels for everyone
+        }
+        public static double LocalGoal     => _localGoal;
+
+        /// <summary>The live activity object (null when not seated) — lets
+        /// MPRegisterSync read WorkActivity._employeeStationController, the
+        /// EXACT station being worked (replaces the nearest-register-in-5m
+        /// guess; decompile sweep 2026-06-12).</summary>
+        public static object? CurrentActivityObject => _curAct;
+
+        // ── Dock data: passthrough of the activity's own buttons ─────────────
+        public sealed class DockButton
+        {
+            public string  Label = "";
+            public object? OnClick;
+        }
+        public static readonly List<DockButton> DockButtons = new();
+        /// <summary>Index of the Stop/Cancel button in DockButtons (-1 = none) —
+        /// rendered as the dock's header X.</summary>
+        public static int CancelButtonIndex { get; private set; } = -1;
+        private static object? _lastAutoStartedActRef;   // activity instance we last auto-pressed Start on — fire once per instance, no time gate
+
+        // ── Shared state (host-broadcast; banner + detector stand-down) ──────
+        public static readonly List<RestVoteEntry> Votes = new();
+        public static int  RequiredVotes;
+        public static volatile bool SkipActive;
+
+        // ── Skip stopwatch (batch-21 measurement; written on the SkipActive edge in TickSkipFrame) ──
+        /// <summary>Real seconds the LAST completed skip on this machine took, and the one before it
+        /// (so one rig step can compare two legs). -1 until a skip has finished this session.</summary>
+        public static float  LastSkipRealSeconds  = -1f;
+        public static float  PrevSkipRealSeconds  = -1f;
+        /// <summary>Game-minutes at the start/end of that skip, and the goal it was racing to. The END
+        /// value is FROZEN once the skip stops, which is what lets a rig compare two machines' clocks
+        /// exactly - a live clock moves between two rig commands, this one does not.</summary>
+        public static double LastSkipStartMinutes = -1d;
+        public static double LastSkipEndMinutes   = -1d;
+        public static double LastSkipGoalMinutes  = -1d;
+        /// <summary>The goal of the skip running right now (0 = none) - clients get it from ApplyState.</summary>
+        public static double SkipGoalMinutes => _skipGoalMinutes;
+        /// <summary>Real seconds the CURRENT skip has been running (-1 when none).</summary>
+        public static float  SkipElapsedRealSeconds
+            => (SkipActive && _skipStartedReal > 0f) ? Time.unscaledTime - _skipStartedReal : -1f;
+        private static bool   _skipWasActive;
+        private static float  _skipStartedReal;
+        private static double _skipStartedMin;
+
+        // ── Host-only ─────────────────────────────────────────────────────────
+        private static readonly Dictionary<string, RestVoteEntry> _hostVotes = new();
+        private static double _skipGoalMinutes;
+
+        public static void Reset()
+        {
+            Seated = false; ActivityName = ""; ActivityState = -1;
+            Loitering = false;
+            _skipWasActive = false; _skipStartedReal = 0f;   // the stopwatch's edge state must not survive a session boundary
+            DockButtons.Clear();
+            _localVoteActive = false; _localGoal = 0;
+            _machine = null;
+            Votes.Clear(); RequiredVotes = 0; SkipActive = false;
+            _hostVotes.Clear(); _skipGoalMinutes = 0;
+            TimeSync.AheadHeld = false;   // drop any stale ahead-hold so it can't freeze the clock
+            try { MPPatches.Patch_IndoorSpawner_SkipVisualPace.ClearDenialStamp(); } catch { }   // H-SKIPTAIL-1: the skip-pacing denial stamp is skip state too
+            try { SkipPaceBodies.RestoreAll(); } catch { }   // D-SKIPPACE-1: no body may carry a scaled speed across a session boundary
+            try { SkipHandback.Reset(); } catch { }         // H-SKIPWALKIN-1: the set-aside registry is skip state too
+        }
+
+        /// <summary>On RECONNECT, clear ONLY the consensus/skip state — the host's vote tally and any
+        /// in-flight skip are gone on its side, so a stale SkipActive or leftover vote rows would wedge the
+        /// dock or keep the world-clock detector standing down. LOCAL seating (Seated / ActivityName / the
+        /// live activity refs / DockButtons) is PRESERVED — the player is still in their activity after
+        /// rejoining. Harmless on the initial connect (state already empty).</summary>
+        public static void ClearVotesOnReconnect()
+        {
+            _localVoteActive = false; _localGoal = 0;
+            Votes.Clear(); RequiredVotes = 0; SkipActive = false;
+            _hostVotes.Clear(); _skipGoalMinutes = 0;
+            TimeSync.AheadHeld = false;   // drop any stale ahead-hold so it can't freeze the clock post-reconnect
+        }
+
+        // ── Taxi v2: INSTANT ARRIVAL (user-chosen, 2026-06-10) ───────────────
+        // The ride's completion handler (TaxiSystem.OnTimeMachineEnded) is what
+        // teleports the player — so: machine starts, we hide its misleading
+        // overlay (frozen clock, "Day 123") and stop it through its own off
+        // switch a beat later.  Ride completes instantly, clock never moves.
+        private static float _taxiPendingUntil;
+        private static float _taxiStopAt;
+
+        public static bool TaxiRidePending => Time.unscaledTime < _taxiPendingUntil;
+
+        public static void OnTaxiRideStarting()
+        {
+            _taxiPendingUntil = Time.unscaledTime + 8f;
+            Plugin.Logger.LogInfo("[Taxi] ride starting — instant-arrival mode armed.");
+        }
+
+        public static void OnTaxiMachineStarted()
+        {
+            SetMachineCanvasVisible(false);            // no frozen-clock overlay
+            _taxiStopAt = Time.unscaledTime + 0.3f;    // let the caller settle first
+            Plugin.Logger.LogInfo("[Taxi] ride machine started — stopping for instant arrival.");
+        }
+
+        // ── Native skip engine → clean neutralization (MPPatches Postfix) ─────
+        public static void OnNativeSkipButtonPressed()
+        {
+            StopLocalMachine();   // the game's own complete teardown
+            Plugin.Logger.LogInfo("[Rest] native skip engine start neutralized (stopped through its own off switch).");
+        }
+
+        // ── Our wait API (called by the MPCanvasUI wait button/panel) ─────────
+        public static double NowMinutes()
+        {
+            var (d, h) = GameStateReader.GetGameTime();
+            return d * 1440.0 + h * 60.0;
+        }
+
+        /// <summary>Earliest other player's goal, for the "Match" button.  0 = none.</summary>
+        public static double OtherVoteGoal(out string who)
+        {
+            who = "";
+            double best = 0;
+            foreach (var v in Votes)
+            {
+                if (v.PlayerId == MPConfig.PlayerId) continue;
+                if (best == 0 || v.GoalMinutes < best) { best = v.GoalMinutes; who = v.PlayerId; }
+            }
+            return best;
+        }
+
+        /// <summary>Toggle/update the skip request.  goalMinutes is absolute
+        /// (total game-minutes); clamped to a few minutes ahead — no other
+        /// minimum (user removed the 1h floor).</summary>
+        public static void SetSkipRequest(bool on, double goalMinutes = 0)
+        {
+            if (!on)
+            {
+                if (!_localVoteActive) return;
+                _localVoteActive = false;
+                SendVote(false, 0, "");
+                Plugin.Logger.LogInfo("[Rest] skip request OFF.");
+                return;
+            }
+            if (!Seated && !Loitering)
+            {
+                // Never swallow a player's commit silently (Goonie report, 2026-07-09): a click landing
+                // in a seated-flag flicker was indistinguishable from "never clicked" in the logs.
+                Plugin.Logger.LogInfo("[Rest] skip request IGNORED — not seated (and not loitering) at click time.");
+                return;
+            }
+            double now = NowMinutes();
+            if (goalMinutes < now + 5) goalMinutes = now + 5;
+            goalMinutes = Math.Ceiling(goalMinutes / 5.0) * 5.0;
+            _localGoal = goalMinutes;
+            _localVoteActive = true;
+            if (Seated) EnsureActivityCovers(goalMinutes);   // game must not auto-stand us mid-vote (a work shift excepted: H-SHIFTEND-1); a loiterer has no activity to extend
+            string act = Seated ? ActivityName : "loitering";
+            SendVote(true, goalMinutes, act);
+            Plugin.Logger.LogInfo($"[Rest] skip request ON: until {Fmt(goalMinutes)} ({act}).");
+        }
+
+
+        /// <summary>Guaranteed stand-up: the activity's own Stop/Cancel button
+        /// when present, else the activity's Finish() directly (concrete cast).
+        /// The exit must never depend on a button existing.</summary>
+        private static float _suppressAutoStartUntil;
+        private static float _navHealNext;
+        private static float _notSeatedSince;
+        private static System.Reflection.FieldInfo? _navBlockerSetField;
+        private static System.Reflection.FieldInfo? _navAgentField;
+        private static System.Reflection.FieldInfo? _sittingOnField;
+        private static System.Reflection.FieldInfo? _charRbField;   // round-195: kinematic-wedge check
+        private static float _cartBadSince = -1f;   // round-83 tripwire: when cart-mode machinery went bad
+        private static float _cartWarnNext;         // round-83 tripwire: re-warn throttle
+        private static readonly Dictionary<NavigationBlocker, float> _foreignHeldSince = new();   // round-90 foreign-blocker watch
+        private static float _foreignWarnNext;
+        private static float _voteWaitLogNext;   // round-277: skip-vote limbo heartbeat throttle
+
+        /// <summary>The nine ACTIVITY-class navigation blockers — the IPlayerActivity states whose
+        /// UI our dock replaces (and whose lifecycle we therefore own in MP). The nav-heal watchdog
+        /// may release ONLY these; every other NavigationBlocker key belongs to a different system
+        /// (menus, vehicles, placement, scripted sequences) with its own lifecycle.</summary>
+        private static readonly NavigationBlocker[] ActivityBlockers =
+        {
+            NavigationBlocker.RestActivity,   NavigationBlocker.SleepActivity,
+            NavigationBlocker.WorkActivity,   NavigationBlocker.WorkoutActivity,
+            NavigationBlocker.HygieneActivity, NavigationBlocker.EntertainActivity,
+            NavigationBlocker.StudyActivity,  NavigationBlocker.SwimmingActivity,
+            NavigationBlocker.PaidActivity,
+        };
+
+        // ── BOAT-SELL-DOCK (user-approved 2026-09-05) ─────────────────────────────────────────────────────────
+        // The game's SellBoat button (SleepActivity.GetButtons, NotStarted state) lives in the native activity panel the mod hides
+        // in MP, so an owner could never sell a boat in a session. The dock carries it: visible only while the current activity is
+        // a SleepActivity whose entity is a BoatController the game marks IsPlayerOwned (this machine's own save — boats are never
+        // replicated, user decision 2026-09-05). BoatController.Sell() is the game's own: its confirmation dialog, then
+        // PlayerActivityUI.CancelActivity — which calls GetCurrentActivity.Finish() (the full teardown, PlayerActivityUI.cs:462-471),
+        // so it is safe against the started activity the mod's auto-start produces — then ownership + money on this machine only.
+        private static readonly System.Reflection.FieldInfo? _fSleepEntity =
+            HarmonyLib.AccessTools.Field(typeof(PlayerActivity.SleepActivity), "_entityController");
+        private static Boats.BoatController? CurrentOwnBoat()
+        {
+            try
+            {
+                if (_curAct is not PlayerActivity.SleepActivity sleep || _fSleepEntity == null) return null;
+                var boat = _fSleepEntity.GetValue(sleep) as Boats.BoatController;
+                return boat != null && boat.IsPlayerOwned ? boat : null;
+            }
+            catch { return null; }
+        }
+        public static bool SeatedOnOwnBoat() => Seated && CurrentOwnBoat() != null;
+
+        // ── POWERNAP (user-approved 2026-09-05) ────────────────────────
+        // The nap button is BED-ONLY (not car, not boat): SleepActivity carries a private _sleepEnvironment
+        // (SleepActivity.cs:16) whose SleepEnvironmentType (SleepEnvironment.cs:12) is Bed/Car/Boat
+        // (SleepEnvironmentType.cs:5-7). Read live each tick; anything unexpected → false (fail-safe).
+        private static readonly System.Reflection.FieldInfo? _fSleepEnv =
+            HarmonyLib.AccessTools.Field(typeof(PlayerActivity.SleepActivity), "_sleepEnvironment");
+        internal static bool SeatedInBed()
+        {
+            try
+            {
+                if (!Seated) return false;
+                if (_curAct is not PlayerActivity.SleepActivity sleep || _fSleepEnv == null) return false;
+                var env = _fSleepEnv.GetValue(sleep) as PlayerActivity.SleepEnvironment;
+                return env != null && env.SleepEnvironmentType == PlayerActivity.SleepEnvironmentType.Bed;
+            }
+            catch { return false; }
+        }
+        public static void SellCurrentBoat()
+        {
+            try
+            {
+                var boat = CurrentOwnBoat();
+                if (boat == null) { Plugin.Logger.LogInfo("[Rest] sell boat: no owned boat under the current activity — ignored."); return; }
+                boat.Sell();
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Rest] sell boat: {ex.Message}"); }
+        }
+
+        public static void StandUp()
+        {
+            try
+            {
+                // Standing must STAY stood: without this cooldown the auto-sit
+                // re-engaged the lingering activity ~1.5s after every cancel
+                // (visible stand, then silently busy again = movement lock).
+                _suppressAutoStartUntil = Time.unscaledTime + 4f;
+                // The dock must not re-show for THIS activity instance even if
+                // the game keeps it half-alive (walk-away wedge).
+                _suppressedActRef = _curActRef;
+
+                // Decide from the activity's LIVE state, never the poll snapshot:
+                // DockButtons/CancelButtonIndex can be up to 0.5s stale, and auto-start
+                // + already-standing-at-the-station advances NotStarted→Started within
+                // milliseconds. The Cancel button (CancelResting/CancelWorking) is
+                // STATE-ONLY — clicked against an advanced activity it skips the whole
+                // physical teardown (employee brain left on the player character,
+                // station occupied, blocker armed: round-195, field 20260730-194909
+                // 'stuck in cashier', 64s+ frozen). Only a still-NotStarted activity
+                // may use Cancel; anything further along gets the game's own full
+                // teardown, Finish() (identical to the Stop button).
+                var act = _curAct;
+                int liveState = -1;
+                try
+                {
+                    if (act != null)
+                    {
+                        var sm = act.GetType().GetMethod("GetState");
+                        if (sm != null) liveState = Convert.ToInt32(sm.Invoke(act, null));
+                    }
+                }
+                catch { }
+
+                // Round-234 (field 20260802-221740 'stuck in my bed', revised design): the native
+                // Cancel button is a STATE-FLIP with zero cleanup (no blocker unset, no
+                // ResetNavigation, no seat release) — safe ONLY on an activity whose Start was
+                // never pressed. The reflected state read alone chose Cancel against a
+                // starting activity in the field (branch unexplained — hence the log line
+                // below), so the routing no longer trusts it alone: auto-start stamps the
+                // instance it started (_lastAutoStartedActRef), and that LOCAL fact vetoes
+                // Cancel outright. Finish() is the game's own Stop — correct teardown from
+                // every post-press state, including MovingTowards (ResetNavigation stops the
+                // walk). Zero delay on every path; the round-73 nav heal stays as backstop.
+                bool startPressed = _curActRef != null && ReferenceEquals(_curActRef, _lastAutoStartedActRef);
+                string branch;
+                // H-WORKPANEL-1 (user-approved 2026-09-27): a WorkActivity still NotStarted whose buttons cannot be read
+                // (outside a building its GetButtons throws at WorkActivity.cs:454, so CancelButtonIndex is -1) is closed
+                // by the Cancel button's own handler, WorkActivity.CancelWorking (:224-229) - never Finish(), which throws
+                // there before its own CancelWorking call. A readable Cancel button keeps the native-cancel branch below.
+                bool workRegMissing = act is global::PlayerActivity.WorkActivity && BuildingRegistrationMissing();
+                if (!startPressed && act is global::PlayerActivity.WorkActivity && liveState == (int)PlayerActivityState.NotStarted
+                    && (CancelButtonIndex < 0 || workRegMissing)
+                    && CloseNotStartedWork(act, workRegMissing ? "moved - stand-up outside the building" : "moved - stand-up with no readable Cancel button"))
+                {
+                    branch = "work panel closed (never started; WorkActivity.CancelWorking)";
+                }
+                else if (!startPressed && liveState == (int)PlayerActivityState.NotStarted && CancelButtonIndex >= 0)
+                {
+                    branch = "native-cancel (never started)";
+                    InvokeDockButton(CancelButtonIndex);
+                }
+                else if (act != null)
+                {
+                    branch = "Finish";
+                    // Mono: the object IS its concrete type — call Finish directly.
+                    act.GetType().GetMethod("Finish")?.Invoke(act, null);
+                }
+                else if (CancelButtonIndex >= 0)
+                {
+                    branch = "legacy cached-cancel (no activity readable)";
+                    InvokeDockButton(CancelButtonIndex);
+                }
+                else branch = "no lever (heal backstops)";
+                Plugin.Logger.LogInfo($"[Rest] StandUp: liveState={liveState} startPressed={startPressed} → {branch}.");
+                _lastStandUpAt = Time.unscaledTime; _lastStandUpBranch = branch;   // part 2b: names a mod stand-up at the vote-OFF line
+
+                // NO force-clearing of the UI's activity slot here: the movement
+                // lock it tried to fix was actually the input-suppression latch
+                // (fixed at the source), and nulling the slot out-of-band skips
+                // the game's natural teardown — which is what frees the SEAT
+                // (bench became unusable after standing, 2026-06-10).  Let the
+                // UI's own Update see the finished state and tear down properly.
+                _curAct = null;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Rest] StandUp: {ex.Message}"); }
+        }
+
+        public static void InvokeDockButton(int index)
+        {
+            try
+            {
+                if (index < 0 || index >= DockButtons.Count) return;
+                var oc = DockButtons[index].OnClick;
+                if (oc == null) return;
+                oc.GetType().GetMethod("Invoke", Type.EmptyTypes)?.Invoke(oc, null);
+                Plugin.Logger.LogInfo($"[Rest] dock button '{DockButtons[index].Label}' invoked.");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Rest] InvokeDockButton: {ex.Message}"); }
+        }
+
+        /// <summary>The current activity's remaining minutes (0 if unknown).
+        /// Uses the activity cached by the last seated-poll (no scene walks).</summary>
+        public static int RemainingActivityMinutes()
+        {
+            return TryRemainingActivityMinutes(out int rem) ? rem : 0;
+        }
+
+        /// <summary>Review MINOR-4 (2026-09-01): false = the game could not answer (on the 1.0 update
+        /// Sleep/Work/Study read `_finishTime` with no null check until Start, so the call THROWS while the
+        /// activity is NotStarted). Callers that extend durations must treat false as UNKNOWN, never as 0 —
+        /// "0 remaining" made EnsureActivityCovers add the whole need to the minutes int every tick.</summary>
+        public static bool TryRemainingActivityMinutes(out int rem)
+        {
+            rem = 0;
+            try
+            {
+                var act = _curAct;
+                if (act == null) return true;
+                var m = act.GetType().GetMethod("GetRemainingMinutesForTimeMachine");
+                if (m == null) return true;
+                rem = Math.Max(0, Convert.ToInt32(m.Invoke(act, null)));
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Make sure the activity itself lasts at least until the goal,
+        /// so the game can't auto-stand the player mid-vote or mid-skip.
+        /// WRITES THE ACTIVITY'S OWN DURATION FIELD (the *_minutesTo*** int) —
+        /// the slider API (ChangeSliderValue) silently no-ops with the native
+        /// panel hidden, which is why players kept auto-standing and skips
+        /// self-cancelled the moment they started.
+        /// H-SHIFTEND-1 (2026-09-26): a WorkActivity is EXEMPT — neither its minutes field nor its _finishTime is
+        /// touched; the game ends the shift itself at the shift end, like single-player.</summary>
+        public static void EnsureActivityCovers(double goalMinutes)
+        {
+            try
+            {
+                var act = _curAct;
+                if (act == null) return;
+                // Review MINOR-4 (2026-09-01): nothing to extend before the activity has started — its
+                // duration is re-derived at Start, and on the 1.0 update the remaining-minutes read throws
+                // there (see TryRemainingActivityMinutes). The seated tick re-runs this every 0.5 s, so the
+                // extension lands on the first tick after Start.
+                // Review #4 (2026-09-02): read the LIVE state — the cached ActivityState is up to 0.5 s old, which
+                // during an active skip is up to ~12 game-minutes, enough for a short sleep to expire unextended.
+                try
+                {
+                    var sm = act.GetType().GetMethod("GetState");
+                    if (sm != null && Convert.ToInt32(sm.Invoke(act, null)) == (int)PlayerActivityState.NotStarted) return;
+                }
+                catch { if (ActivityState == (int)PlayerActivityState.NotStarted) return; }
+                // H-SHIFTEND-1 (2026-09-26, user-approved): a WORK shift is left to the game. WorkActivity.Perform
+                // (WorkActivity.cs:133-147 on the 0923 decompile) ends the shift only when its _finishTime is past;
+                // SetTimeToWork (:231-247) sets that to the opening slot's end (owner) / the job shift's end (hired).
+                // Topping it up (minutes field + PushFinishTime) meant a shift in MP never ended by itself: an owner
+                // stayed on the register after closing, a hired job's Finish (:164-183) paid every extra hour. So
+                // neither field is touched for a WorkActivity; every other activity keeps the top-up below. During a
+                // skip that crosses the shift end, the game's Finish stands the player up and the existing
+                // '[Rest] vote OFF (stood up)' path drops his vote.
+                if (act is global::PlayerActivity.WorkActivity)
+                {
+                    try
+                    {
+                        if (!ReferenceEquals(_workExemptLoggedAct, act))
+                        {
+                            _workExemptLoggedAct = act;
+                            string end = "?";
+                            try
+                            {
+                                _workFinishField ??= HarmonyLib.AccessTools.Field(typeof(global::PlayerActivity.WorkActivity), "_finishTime");
+                                if (_workFinishField?.GetValue(act) is BigAmbitions.DayNightCycle.Timestamp ts)
+                                {
+                                    double fm = ts.GetTotalMinutes();
+                                    double r = fm - Math.Floor(fm / 1440.0) * 1440.0;
+                                    int hh = (int)(r / 60.0), mm = (int)(r - hh * 60.0);
+                                    end = $"{hh:D2}:{mm:D2}";
+                                }
+                            }
+                            catch { end = "?"; }
+                            Plugin.Logger.LogInfo($"[Rest] work activity - finish left to the game (shift end {end})");
+                        }
+                    }
+                    catch { }
+                    return;
+                }
+                double need = goalMinutes - NowMinutes();
+                if (!TryRemainingActivityMinutes(out int rem))
+                {
+                    _remUnknown++;
+                    if (_remUnknown <= 5 || _remUnknown % 100 == 0)
+                        Plugin.Logger.LogInfo($"[Rest] remaining-minutes read failed for {act.GetType().Name} (state {ActivityState}) — extension skipped this tick (#{_remUnknown}); UNKNOWN is not zero.");
+                    return;
+                }
+                if (need <= rem + 1) return;
+
+                // Mono: GetType() already yields the concrete activity class
+                // (the IL2CPP interface-wrapper downcast is gone).
+                object target = act;
+                var t = act.GetType();
+
+                if (!_durProps.TryGetValue(t, out var member))
+                {
+                    member = null;
+                    const System.Reflection.BindingFlags bf =
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+                    foreach (var p in t.GetProperties(bf))
+                        if (p.PropertyType == typeof(int) && p.CanRead && p.CanWrite
+                            && p.Name.IndexOf("minutesTo", StringComparison.OrdinalIgnoreCase) >= 0)
+                        { member = p; break; }
+                    // EA 0.11 (Mono): the durations are private int FIELDS
+                    // (_minutesToRest/_minutesToWork/_minutesToSleep) — the
+                    // property-only scan logged "NOT FOUND" and silently
+                    // no-opped, so the native duration expired the moment the
+                    // skip raced the clock: auto-stand → vote drop → skip
+                    // cancelled (the recurring bench bug, user 2026-06-12).
+                    if (member == null)
+                        foreach (var f in t.GetFields(bf))
+                            if (f.FieldType == typeof(int)
+                                && f.Name.IndexOf("minutesTo", StringComparison.OrdinalIgnoreCase) >= 0)
+                            { member = f; break; }
+                    _durProps[t] = member;
+                    Plugin.Logger.LogInfo($"[Rest] duration field for {t.Name}: {(member != null ? member.Name : "NOT FOUND")}");
+                }
+                if (member != null)
+                {
+                    int total = Convert.ToInt32(MPReflect.Get(member, target) ?? 0);
+                    int delta = (int)Math.Ceiling(need - rem);
+                    MPReflect.Set(member, target, total + delta);
+                }
+                PushFinishTime(target, t, goalMinutes);   // 1.0 update: the clock-based finish must move too
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Rest] EnsureActivityCovers: {ex.Message}"); }
+        }
+        private static readonly Dictionary<Type, System.Reflection.MemberInfo?> _durProps = new();
+        private static int _remUnknown;   // review MINOR-4: counted, rate-limited
+        private static object? _workExemptLoggedAct;                          // H-SHIFTEND-1: log once per sit
+        private static System.Reflection.FieldInfo? _workFinishField;         // H-SHIFTEND-1: shift end, log only
+
+        // 1.0 update 2026-09-01 (field 20260901-192731, user-approved): Rest/Sleep/Work/Study now ALSO finish
+        // when a private `Timestamp _finishTime`, captured at start, falls into the past — Perform() checks
+        // IsInThePast() on every game-minute change (PlayerActivityUI.OnActivityRunning :316-326, Perform at :323; Rest :208,
+        // Sleep :133, Work :129, Study :163 on the update decompile). Extending the minutes int above no longer
+        // covers a skip: our fast clock ran past the ORIGINAL finish time, the game stood the player up, the
+        // vote dropped, the skip stopped, the bench re-offered, the player re-sat — every ~3 s on both machines.
+        // So the finish time is pushed to the goal as well. Field NOT FOUND (pre-update shape) → the minutes
+        // path alone governs, exactly as before. A null value is the game's own "no clock finish" (Rest while
+        // watching a show) and is left alone. Timestamp.GetTotalMinutes = (Day*24+Hour)*60+Minute — the same
+        // basis as NowMinutes()/goalMinutes, and the (float totalMinutes) constructor splits it back.
+        // H-SHIFTEND-1 (2026-09-26): WorkActivity no longer reaches here — EnsureActivityCovers returns before the
+        // push for it, so the game's own shift end stands (Rest/Sleep/Study keep the push).
+        private static readonly Dictionary<Type, System.Reflection.FieldInfo?> _finishFields = new();
+        private static object? _lastFinishPushedAct;
+        private static void PushFinishTime(object act, Type t, double goalMinutes)
+        {
+            try
+            {
+                if (!_finishFields.TryGetValue(t, out var f))
+                {
+                    f = HarmonyLib.AccessTools.Field(t, "_finishTime");
+                    _finishFields[t] = f;
+                    // Review MINOR-1: seven activity types (Hygiene/Entertain/Workout/Swimming/Golf/Tennis/Paid) never
+                    // had this field on ANY build — "not found" is the normal shape there, not a version signal.
+                    Plugin.Logger.LogInfo($"[Rest] finish-time field for {t.Name}: {(f != null ? f.Name : "none (no clock finish on this type — the minutes field governs)")}");
+                }
+                if (f == null) return;
+                object? raw = f.GetValue(act);
+                if (raw == null) return;                                   // no clock finish right now (Rest watching a show)
+                if (raw is not BigAmbitions.DayNightCycle.Timestamp cur)
+                {
+                    // Review MINOR-3: a wrong type must not look like "nothing to do" — that silence would bring
+                    // the 3-second stand-up loop back with a log that says the fix is armed.
+                    if (_finishTypeWarned.Add(t))
+                        Plugin.Logger.LogWarning($"[Rest] {t.Name}._finishTime is a {raw.GetType().Name}, not a Timestamp — clock-finish push stands down for this type (stand-ups during a skip would return).");
+                    return;
+                }
+                if (cur.GetTotalMinutes() >= goalMinutes) return;          // already covers the goal
+                f.SetValue(act, new BigAmbitions.DayNightCycle.Timestamp((float)goalMinutes));
+                if (!ReferenceEquals(_lastFinishPushedAct, act))
+                {
+                    _lastFinishPushedAct = act;                            // first push per sit only
+                    Plugin.Logger.LogInfo($"[Rest] {t.Name} finish time pushed to {Fmt(goalMinutes)} (1.0-update clock-based finish).");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Review MINOR-2: this runs from the 0.5 s seated tick — a persistent failure must not flood the log.
+                _pushFailures++;
+                if (_pushFailures <= 5 || _pushFailures % 100 == 0)
+                    Plugin.Logger.LogWarning($"[Rest] PushFinishTime (#{_pushFailures}): {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+        private static readonly HashSet<Type> _finishTypeWarned = new();   // review MINOR-3: once per type
+        private static int _pushFailures;                                   // review MINOR-2: counted, rate-limited
+
+        /// <summary>All session player names (for the who-voted checklist).</summary>
+        public static IReadOnlyList<string> AllPlayers()
+            => MPServer.IsRunning ? HostVoters()
+             : _stateVoters.Count > 0 ? _stateVoters
+             : MPClient.IsConnected ? MPClient.LobbyPlayers : new List<string>();
+
+        /// <summary>DEDICATED-NPC-1: who has to agree to a skip - every session player, except a dedicated server's own
+        /// character (nobody plays it; it only holds the host's seat in the world). HOST side.</summary>
+        public static List<string> HostVoters()
+        {
+            var all = new List<string>(MPServer.LobbyPlayers ?? new List<string>());
+            if (MPConfig.DedicatedHost) all.Remove(MPConfig.PlayerId);
+            return all;
+        }
+        private static List<string> _stateVoters = new();
+
+        public static bool HasVote(string playerId, out double goal)
+        {
+            foreach (var v in Votes)
+                if (v.PlayerId == playerId) { goal = v.GoalMinutes; return true; }
+            goal = 0; return false;
+        }
+
+        // ── Per-frame tick (main thread, MP active + in game) ─────────────────
+        public static void Tick()
+        {
+            EnsureExitHookForWork();   // H-WORKPANEL-1
+            // Taxi instant arrival runs at FRAME cadence (the 0.3s beat matters):
+            // stop the ride's machine — its end handler teleports the player;
+            // the clock never moved.
+            if (_taxiStopAt > 0f && Time.unscaledTime >= _taxiStopAt)
+            {
+                _taxiStopAt = 0f;
+                _taxiPendingUntil = 0f;
+                StopLocalMachine();
+                SetMachineCanvasVisible(true);   // restore for future rest skips
+                Plugin.Logger.LogInfo("[Taxi] instant arrival — machine stopped, no time cost.");
+            }
+
+            if (Time.unscaledTime < _nextPollAt) return;
+            _nextPollAt = Time.unscaledTime + 0.5f;
+
+            // Watchdog: nothing may freeze time outside our explicit systems.
+            // (Not while a taxi ride is mid-handoff — the ride machine briefly
+            // owns the pause state.)
+            if (!TimeSync.ManualPaused && !TimeSync.IsStartupHeld && !TaxiRidePending)
+                GameStateReader.EnsureTimeNotLocked();
+
+            // Seated state from the game's activity system.
+            UpdateSeated();
+
+            // Self-healing nav watchdog (round-73 — REPLACES the old diagnostic, which was
+            // BLIND in MP: its signal, PlayerActivityUI.HasNavigationDisabled (:157), only
+            // reports while IsPanelOpen — and Rest v5 force-hides that panel, so it said
+            // "fine" straight through two field strandings (Baydos 20260723-165848 + our
+            // live repro). Read the PlayerController's blocker set directly instead.
+            //
+            // ROOT CAUSE (confirmed live 2026-07-24, NavProbe): the native activity arms its
+            // navigation blocker from a DEFERRED lambda (RestActivity.<StartResting>b__15_1,
+            // fired later by PlayerController.Update). A fast exit — which our dock's
+            // auto-start + instant cancel / movement-key hatch makes one frame wide — races
+            // it in either order and strands the lock: navDisabled forever, avatar stuck
+            // seated on every machine, dock + hatch gated off by the same desync, chair
+            // owned by the half-dead activity. Vanilla can't reach the race (its panel flow
+            // makes the earliest exit seconds late).
+            //
+            // The heal: out of ANY activity for a SUSTAINED 2s (Seated covers all nine
+            // IPlayerActivity kinds) but an ACTIVITY-class blocker still held → release it
+            // via the game's own unset call, loudly. Non-activity blockers (Map, Vehicle,
+            // PlacementMode, …) belong to other systems and are never touched.
+            if (Seated || SkipActive)
+            {
+                _notSeatedSince = Time.unscaledTime;
+                if (_foreignHeldSince.Count > 0) _foreignHeldSince.Clear();   // round-90: activities hold keys legitimately
+                if (_stuckObs.Count > 0) _stuckObs.Clear();                   // round-90b: same reset
+            }
+            else if ((MPServer.IsRunning || MPClient.IsClientInWorld)
+                     && Time.unscaledTime >= _navHealNext
+                     && Time.unscaledTime - _notSeatedSince >= 2f)
+            {
+                _navHealNext = Time.unscaledTime + 2f;
+                try
+                {
+                    var pc = InstanceBehavior<GameManager>.Instance?.playerController;
+                    if (pc != null)
+                    {
+                        // 1. Blocker layer: release stranded ACTIVITY-class keys; note any FOREIGN key
+                        //    (another system's lock) — its presence means hands off the physical layer.
+                        bool foreignHeld = false;
+                        _navBlockerSetField ??= HarmonyLib.AccessTools.Field(typeof(PlayerController), "_activeNavigationBlockers");
+                        if (_navBlockerSetField?.GetValue(pc) is System.Collections.IEnumerable held)
+                        {
+                            List<NavigationBlocker>? stranded = null;
+                            List<NavigationBlocker>? foreignNow = null;
+                            foreach (var b in held)
+                            {
+                                if (b is not NavigationBlocker key) continue;
+                                if (System.Array.IndexOf(ActivityBlockers, key) >= 0)
+                                    (stranded ??= new List<NavigationBlocker>()).Add(key);
+                                else
+                                {
+                                    // foreignHeld stays TRUE for legitimate holders — it is the
+                                    // heal's hands-off signal, and excluding e.g. Vehicle would
+                                    // let the physical-layer heal fire mid-drive.
+                                    foreignHeld = true;
+                                    // Round-90c precision (2026-08-18, field 20260818-114209):
+                                    // these keys are LEGITIMATELY held outside any activity —
+                                    // driving holds Vehicle for the whole ride (CarController
+                                    // :477 set / :511 unset), the open map holds Map, an open
+                                    // preview holds BuildingPreview.  The watch warned on 30s of
+                                    // NORMAL driving/map browsing, which cost a session's triage
+                                    // chasing a phantom leak.  Excluded from WARN tracking while
+                                    // legitimate; tracking restarts when the owner state ends, so
+                                    // a key STILL held 30s after car-exit/map-close warns exactly
+                                    // as round-90 intended.
+                                    bool legit = false;
+                                    try
+                                    {
+                                        legit = (key == NavigationBlocker.Vehicle && !string.IsNullOrEmpty(SaveGameManager.Current?.ActiveVehicleId))
+                                             || (key == NavigationBlocker.Map && CityMap.IsOpen)
+                                             || (key == NavigationBlocker.BuildingPreview && UI.BuildingPreview.isPreviewing)
+                                             || (key == NavigationBlocker.PlacementMode && BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode);   // round-279: live placement holds it legitimately
+                                    }
+                                    catch { }
+                                    if (!legit) (foreignNow ??= new List<NavigationBlocker>()).Add(key);
+                                }
+                            }
+                            // Round-90 (user-approved) FOREIGN-BLOCKER WATCH — log-only, never heals.
+                            // ANY held blocker silently no-ops the building exit trigger
+                            // (ExitZoneDespawner:18) AND freezes WASD (PlayerController:241-247), and
+                            // the heal below deliberately never touches non-activity keys — so a
+                            // stranded Map/Placement/DeliveryJob/... lock was the last "stuck in the
+                            // building" shape no instrument could see (field 20260725-000353 class).
+                            // Name it after 30s of persistence, re-warn each 60s.
+                            try
+                            {
+                                float nowT = Time.unscaledTime;
+                                if (foreignNow == null)
+                                {
+                                    if (_foreignHeldSince.Count > 0) _foreignHeldSince.Clear();
+                                    if (_stuckObs.Count > 0) _stuckObs.Clear();   // round-90b
+                                }
+                                else
+                                {
+                                    foreach (var k in new List<NavigationBlocker>(_foreignHeldSince.Keys))
+                                        if (!foreignNow.Contains(k)) _foreignHeldSince.Remove(k);
+                                    foreach (var k in foreignNow)
+                                        if (!_foreignHeldSince.ContainsKey(k)) _foreignHeldSince[k] = nowT;
+                                    if (nowT >= _foreignWarnNext)
+                                    {
+                                        // Round-279: name EVERY key over threshold in one line — the old
+                                        // break-after-first left simultaneous strands invisible (field
+                                        // 20260818-223659 triage had to reconstruct them by hand).
+                                        List<string>? overdue = null;
+                                        foreach (var kv in _foreignHeldSince)
+                                            if (nowT - kv.Value >= 30f)
+                                            {
+                                                // Round-205: the host soft-hold deliberately parks this
+                                                // blocker while the world populates — not a wedge.
+                                                if (kv.Key == NavigationBlocker.CasinoEntrySequence && MPCanvasUI.HostSoftHoldActive) continue;
+                                                (overdue ??= new List<string>()).Add($"'{kv.Key}' {nowT - kv.Value:F0}s");
+                                            }
+                                        if (overdue != null)
+                                        {
+                                            _foreignWarnNext = nowT + 60f;
+                                            Plugin.Logger.LogWarning(
+                                                $"[Rest] FOREIGN BLOCKER HELD (round-90, log-only): {string.Join(", ", overdue)} outside any activity — building exits silently dead and WASD frozen while it persists. No action taken.");
+                                            // PROBE-START: P-ENTRY-BAIL (wedge census — rides the 60s-throttled watchdog WARN above)
+                                            // Field 150521: a held PurchaseUI + an unmanned till is the "stuck in the
+                                            // supermarket" signature (the self-checkout queue joined, nobody to serve).
+                                            // One census line pairs the wedge with the staffing state of the building
+                                            // the player is actually inside — same two station sources [StaffSpawn]
+                                            // walks. Log-only.
+                                            try
+                                            {
+                                                var bmP = InstanceBehavior<BuildingManager>.Instance;
+                                                var regP = bmP?.buildingRegistration;
+                                                if (regP != null && BuildingManager.IsInsideBuilding)
+                                                {
+                                                    int stationsP = 0, mannedP = 0;
+                                                    void CountP(Transform root)
+                                                    {
+                                                        if (root == null) return;
+                                                        foreach (var stP in root.GetComponentsInChildren<EmployeeStationController>(true))
+                                                        { if (stP == null) continue; stationsP++; try { if (stP.employeeInstance != null) mannedP++; } catch { } }
+                                                    }
+                                                    try { CountP(bmP!.IndoorItemContainer); CountP(bmP.currentLayout); } catch { }
+                                                    bool ownedP = false; try { ownedP = bmP!.IsPlayerOwnedBusiness; } catch { }
+                                                    Plugin.Logger.LogWarning($"[PROBE] EntryBail/wedge census: inside='{GameStateReader.AddressKey(regP)}' playerOwned={ownedP} stations={stationsP} (incl. inactive) manned={mannedP} — pairs the held blocker above with the staffing state of this building.");
+                                                }
+                                            }
+                                            catch { }
+                                            // PROBE-END: P-ENTRY-BAIL (wedge census)
+                                        }
+                                    }
+
+                                    // Round-198 (field 20260730-221621): the two TRANSIT keys upgrade from
+                                    // log-only to HEAL under provably-safe conditions — a dead map-close
+                                    // coroutine (null POI, or any other mid-close death) strands 'Map'
+                                    // (and, via the subway ride waiting on that close, 'Subway' + the
+                                    // riding flag + the pause) FOREVER; nothing legitimately holds Map
+                                    // with the map closed for 30s, and no real ride lasts 2 minutes.
+                                    // The heal mirrors what the dead completion would have done — never
+                                    // warps, never touches a pushed cart.
+                                    if (_foreignHeldSince.TryGetValue(NavigationBlocker.Map, out var mapSince)
+                                        && nowT - mapSince >= 30f && !CityMap.IsOpen)
+                                    {
+                                        pc.UnsetNavigationBlocker(NavigationBlocker.Map);
+                                        _foreignHeldSince.Remove(NavigationBlocker.Map);
+                                        Plugin.Logger.LogWarning("[Rest] TRANSIT HEAL: released stranded 'Map' blocker (held 30s+ with the map closed — a dead map-close skipped its release; round-198). Movement restored.");
+                                    }
+                                    if (_foreignHeldSince.TryGetValue(NavigationBlocker.Subway, out var subSince)
+                                        && nowT - subSince >= 120f)
+                                    {
+                                        pc.UnsetNavigationBlocker(NavigationBlocker.Subway);
+                                        _foreignHeldSince.Remove(NavigationBlocker.Subway);
+                                        try { pc.Character?.ToggleVisibility(show: true); } catch { }
+                                        try { HarmonyLib.AccessTools.PropertySetter(typeof(SubwaySystem), "IsRiding")?.Invoke(null, new object[] { false }); } catch { }
+                                        Plugin.Logger.LogWarning("[Rest] TRANSIT HEAL: released stranded 'Subway' blocker (held 120s+ — the ride's completion never ran; visibility restored, riding flag cleared; round-198). Movement restored.");
+                                    }
+
+                                    // Round-279 (field 20260818-223659): a stranded 'PlacementMode' is a
+                                    // TOTAL interaction wedge — every entity click, WASD, click-to-move and
+                                    // the building exit gate on NavigationDisabled — and its only native
+                                    // release is the last line of CancelPlacementMode's camera coroutine,
+                                    // so a bare StopPlacingItem or a dead coroutine strands it forever.
+                                    // No heal covered it, and foreignHeld SUPPRESSES the physical restore
+                                    // on top.  The oracle cannot be stale (see BlockerOwnerOpen): 10s held
+                                    // with no live placement = stranded.  Time control is restored too —
+                                    // the native start disabled it alongside setting the blocker.
+                                    if (_foreignHeldSince.TryGetValue(NavigationBlocker.PlacementMode, out var pmSince)
+                                        && nowT - pmSince >= 10f
+                                        && !BigAmbitions.PlacementSystem.PlacementSystem.IsInPlacementMode)
+                                    {
+                                        pc.UnsetNavigationBlocker(NavigationBlocker.PlacementMode);
+                                        _foreignHeldSince.Remove(NavigationBlocker.PlacementMode);
+                                        try { InstanceBehavior<UI.UIs>.Instance?.gameSpeed?.DisableTimeControl(false); } catch { }
+                                        Plugin.Logger.LogWarning("[Rest] PLACEMENT HEAL: released stranded 'PlacementMode' blocker (held 10s+ with no live placement — a bare StopPlacingItem or dead cancel-coroutine stranded it; round-279). Movement and interaction restored.");
+                                    }
+
+                                    // Round-90b (user-directed 2026-08-17): the 30s persistence warn cannot
+                                    // tell "in use" from "stuck" — a player reading the map for a minute looks
+                                    // identical to a stranded lock. For keys with a KNOWN owning surface, read
+                                    // the owner LIVE: held while the owner is CLOSED cannot happen in normal
+                                    // play. Two consecutive observations (this tick runs each ~2s; a closing
+                                    // panel removes its key the same frame) = confirmed stuck — state-stability
+                                    // confirmation, not a wall-clock proxy. DETECT-ONLY here; the round-198
+                                    // heals above stay the only releases.
+                                    foreach (var k in new List<NavigationBlocker>(_stuckObs.Keys))
+                                        if (!foreignNow.Contains(k)) _stuckObs.Remove(k);
+                                    foreach (var k in foreignNow)
+                                    {
+                                        if (BlockerOwnerOpen(k) != false) { _stuckObs.Remove(k); continue; }
+                                        int n = _stuckObs.TryGetValue(k, out var prev) ? prev + 1 : 1;
+                                        _stuckObs[k] = n;
+                                        if (n == 2 || (n > 2 && n % 30 == 0))
+                                            Plugin.Logger.LogWarning(
+                                                $"[Rest] STUCK BLOCKER (round-90b, detect-only): '{k}' held while its owning surface is CLOSED ({n} consecutive checks) — walking and building exits are dead on this machine until it clears.");
+                                    }
+                                }
+                            }
+                            catch { }
+                            if (stranded != null)
+                                foreach (var key in stranded)
+                                {
+                                    pc.UnsetNavigationBlocker(key);
+                                    Plugin.Logger.LogWarning($"[Rest] NAV HEAL: released stranded '{key}' blocker (no activity for 2s — deferred-set race, round-73). Movement restored.");
+                                }
+                        }
+
+                        // 2. Physical layer (round-73b, live repro: blocker healed but the avatar stayed
+                        //    seated — could spin, not walk): the raced CancelResting skips the ENTIRE
+                        //    physical teardown that Finish() runs — SitOnChair left the nav agent disabled
+                        //    (updatePosition/Rotation off, enabled=false), the rigidbody kinematic, and the
+                        //    seat claimed. ThirdPersonCharacter.Reset() (:771) is the game's own catch-all
+                        //    restore (re-enables the agent, releases the seat THROUGH the seat's callback,
+                        //    clears the anchor + kinematic state) and is what every proper teardown calls.
+                        //    STRICT ownership guard: never while ANY foreign blocker is held (vehicle,
+                        //    casino, map, placement, sequences — those systems legitimately pin the
+                        //    character) and never while using a vehicle.
+                        if (!foreignHeld && !Helpers.PlayerHelper.IsUsingVehicle)
+                        {
+                            var ch = pc.Character;
+                            if (ch != null)
+                            {
+                                bool agentOff = false, seatHeld = false, posOff = false, kinematic = false;
+                                try
+                                {
+                                    _navAgentField ??= HarmonyLib.AccessTools.Field(ch.GetType(), "navmeshAgent");
+                                    if (_navAgentField?.GetValue(ch) is UnityEngine.AI.NavMeshAgent ag)
+                                    {
+                                        agentOff = !ag.enabled;
+                                        posOff = ag.enabled && !ag.updatePosition;   // round-195: ForceToTransform leaves this off
+                                    }
+                                }
+                                catch { }
+                                try
+                                {
+                                    _sittingOnField ??= HarmonyLib.AccessTools.Field(ch.GetType(), "isSittingOn");
+                                    seatHeld = _sittingOnField?.GetValue(ch) is UnityEngine.Object o && o != null;
+                                }
+                                catch { }
+                                try
+                                {
+                                    _charRbField ??= HarmonyLib.AccessTools.Field(ch.GetType(), "characterRigidbody");
+                                    if (_charRbField?.GetValue(ch) is Rigidbody rb) kinematic = rb.isKinematic;
+                                }
+                                catch { }
+                                // Round-195 (field 20260730-194909 'stuck in cashier'): a raced
+                                // CancelWorking leaves the STATION's Employee brain component ON the
+                                // player's character (WorkActivity Started assigns the player as the
+                                // station's employee; only Finish() unassigns). Outside any activity
+                                // that component is always residue — the game never staffs the player
+                                // without a WorkActivity in the slot. Release through the game's own
+                                // UnassignEmployee (destroys the component player-safely, restores
+                                // appearance/hands, frees the station) exactly as Finish() would.
+                                Employee emp = null;
+                                try { emp = ch.GetComponent<Employee>(); } catch { }
+                                if (agentOff || seatHeld || posOff || kinematic || emp != null)
+                                {
+                                    if (emp != null)
+                                    {
+                                        try
+                                        {
+                                            var st = emp.employeeStationController;
+                                            if (st != null && ReferenceEquals(st.employee, emp)) st.UnassignEmployee();
+                                            else UnityEngine.Object.Destroy(emp);   // station lost the back-ref — remove the brain directly
+                                        }
+                                        catch { }
+                                        try { Helpers.EnergyHelper.RemoveEnergySpender("work"); } catch { }
+                                    }
+                                    ch.Reset();
+                                    ExitRescue.Arm("after the sit repair (NAV HEAL)", 0.3f);   // EXIT-NAVMESH-1: the reset can leave it beside the mesh
+                                    Plugin.Logger.LogWarning($"[Rest] NAV HEAL: physical restore via Character.Reset() (agentOff={agentOff} seatHeld={seatHeld} posOff={posOff} kinematic={kinematic} employeeResidue={emp != null}) — a raced cancel skipped the native teardown (round-73b/195).");
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Rest] nav heal: {ex.Message}"); }
+            }
+
+            // Round-83 (user-approved): SILENT-CLASS TRIPWIRE — log-only, never heals, never
+            // touches behavior. The round-73 heal above deliberately skips players using a
+            // vehicle, so a player stranded WHILE attached to a hand truck/flatbed (KILOKEN
+            // 20260724-170745: own loaded flatbed, map-taxi mid-push, auto-entry at own shop,
+            // frozen at the door — the ring held 91s of NOTHING) leaves zero log evidence.
+            // While pushing, the character is agent-driven: agent enabled + updatePosition on
+            // + non-kinematic is the only healthy steady state; door transitions break it only
+            // transiently. Any of them wrong for 5s+ → ONE warn naming the exact broken
+            // component (re-warned each 60s while it persists), so the next field report of
+            // this class names its own cause.
+            try
+            {
+                HandTruck? cart = null;
+                if (MPServer.IsRunning || MPClient.IsClientInWorld)
+                    try { cart = Helpers.VehicleHelper.GetCurrentVehicleBase() as HandTruck; } catch { }
+                if (cart == null) _cartBadSince = -1f;
+                else
+                {
+                    var chC = InstanceBehavior<GameManager>.Instance?.playerController?.Character;
+                    bool cAgentOff = false, cPosOff = false, cKinematic = false;
+                    if (chC != null)
+                    {
+                        _navAgentField ??= HarmonyLib.AccessTools.Field(chC.GetType(), "navmeshAgent");
+                        if (_navAgentField?.GetValue(chC) is UnityEngine.AI.NavMeshAgent cAg)
+                        { cAgentOff = !cAg.enabled; cPosOff = cAg.enabled && !cAg.updatePosition; }
+                        cKinematic = chC.isKinematic;
+                    }
+                    if (!(cAgentOff || cPosOff || cKinematic)) _cartBadSince = -1f;
+                    else
+                    {
+                        if (_cartBadSince < 0f) { _cartBadSince = Time.unscaledTime; _cartWarnNext = 0f; }
+                        if (Time.unscaledTime - _cartBadSince >= 5f && Time.unscaledTime >= _cartWarnNext)
+                        {
+                            _cartWarnNext = Time.unscaledTime + 60f;
+                            string vType = "?", vId = "", vMine = "?";
+                            try
+                            {
+                                vType = cart.vehicleInstance?.vehicleTypeName ?? cart.name;
+                                vId   = cart.vehicleInstance?.id ?? "";
+                                vMine = (cart.vehicleInstance != null
+                                         && SaveGameManager.Current?.VehicleInstances?.Contains(cart.vehicleInstance) == true)
+                                        ? "True" : "False";
+                            }
+                            catch { }
+                            string blockers = "";
+                            try
+                            {
+                                var pcC = InstanceBehavior<GameManager>.Instance?.playerController;
+                                _navBlockerSetField ??= HarmonyLib.AccessTools.Field(typeof(PlayerController), "_activeNavigationBlockers");
+                                if (pcC != null && _navBlockerSetField?.GetValue(pcC) is System.Collections.IEnumerable heldC)
+                                    foreach (var b in heldC) blockers += (blockers.Length > 0 ? "," : "") + b;
+                            }
+                            catch { }
+                            Plugin.Logger.LogWarning(
+                                $"[Rest] CART STUCK (round-83, log-only): pushing '{vType}' id='{vId}' mine={vMine} — "
+                                + $"agentOff={cAgentOff} updatePosOff={cPosOff} kinematic={cKinematic} blockers=[{blockers}] "
+                                + $"held {Time.unscaledTime - _cartBadSince:F0}s. No action taken.");
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            // Sitting is INDEFINITE: the game's default duration (30 min) was
+            // auto-standing players while they pondered the dock ("the window
+            // auto-closed").  Top the activity up so only X / walking ends it.
+            // H-SHIFTEND-1 (2026-09-26): EXCEPT a work shift — EnsureActivityCovers
+            // leaves a WorkActivity alone, so the game ends it at the shift end.
+            if (Seated)
+            {
+                double need = _localVoteActive ? Math.Max(30, _localGoal - NowMinutes()) : 30;
+                EnsureActivityCovers(NowMinutes() + need + 10);
+            }
+
+            // Vote lifecycle: standing up (or losing the activity) drops it — unless the
+            // vote is a LOITER vote, which lives standing by definition (its lifecycle is
+            // SetLoitering: the button, the dock's X, or sitting-down conversion).
+            if (_localVoteActive)
+            {
+                if (!Seated && !Loitering)
+                {
+                    _localVoteActive = false;
+                    SendVote(false, 0, "");
+                    Plugin.Logger.LogInfo($"[Rest] vote OFF (stood up). Activity end: {(_lastEndReason.Length > 0 ? _lastEndReason : "not readable")}.");
+                }
+                else if (!SkipActive && NowMinutes() >= _localGoal - 0.1)
+                {
+                    _localVoteActive = false;
+                    SendVote(false, 0, "");
+                    // H-WORKSTAND-1 (2026-09-26): a player WORKING a station — any EmployeeStationController
+                    // click that starts the game's WorkActivity (register, hairdresser chair, DJ booth, ticket
+                    // booth, coat check, desk...) — is NOT stood up at the goal: the vote still goes OFF, the
+                    // shift goes on (standing him up left the till dead, run T-WORKSKIP-B2-20260926-144732).
+                    // Read from the game's own current activity TYPE, not a name. Resting seats (bench, bed,
+                    // anything not a WorkActivity) keep the wake-up below.
+                    // Review F1+F2 (2026-09-26): a worker stays ONLY when all hold - Seated; the game's current
+                    // activity IS a WorkActivity; its GetState() is Running or Started (the game's own "is working"
+                    // test, PlayerHelper.IsPlayerWorkingAtRegistration); and the shift is still on by the game's
+                    // private WorkActivity.IsJobShiftActive() (reflection, cached; any failure -> treated as over
+                    // -> the old stand-up, logged once). Everything else keeps the old stand-up path unchanged.
+                    bool working = false, shiftOn = false, shiftKnown = false;
+                    try
+                    {
+                        var wa = Seated ? GetCurrentActivity().act as global::PlayerActivity.WorkActivity : null;
+                        if (wa != null)
+                        {
+                            var wst = wa.GetState();
+                            if (wst == global::PlayerActivityState.Running || wst == global::PlayerActivityState.Started)
+                            {
+                                working = true;
+                                shiftKnown = TryIsJobShiftActive(wa, out shiftOn);
+                            }
+                        }
+                    }
+                    catch { working = false; shiftOn = false; shiftKnown = false; }
+                    if (working && shiftKnown && shiftOn)
+                    {
+                        Plugin.Logger.LogInfo("[Rest] vote OFF (goal time reached) - working, stays at the station (shift on).");
+                    }
+                    else
+                    {
+                        string shiftNote = (working && shiftKnown) ? " (shift over)" : "";
+                        Plugin.Logger.LogInfo($"[Rest] vote OFF (goal time reached){(Seated ? " — standing up" : "")}{shiftNote}.");
+                        // Review MINOR-3: a loiterer has nothing to stand from — the old unconditional
+                        // call routed into a STALE CancelButtonIndex from the last seat.
+                        if (Seated) StandUp();   // wake a RESTING player at the chosen time, like vanilla — movement restored
+                        // REST-AUTOCLOSE-1 (user 2026-11-08: "wenn die Zeit vorgespult ist, kann es sich automatisch schließen"): a
+                        // standing fast-forward (the ⏩ button) is over once its goal is reached - its window closes. Seated players
+                        // stand up above (that closes it as well); a worker at a station stays, and the window with him.
+                        else if (Loitering)
+                        {
+                            Plugin.Logger.LogInfo("[Rest] fast-forward done - the window closes (REST-AUTOCLOSE-1).");
+                            SetLoitering(false);
+                        }
+                    }
+                }
+            }
+
+            if (MPServer.IsRunning) HostTick();
+        }
+
+        // Review F2 (2026-09-26): the game's private WorkActivity.IsJobShiftActive() (WorkActivity.cs:249-268 on
+        // the 0923 decompile) - in the player's own building: an opening-hour slot of today covers the current
+        // hour; elsewhere: a job work shift of today covers it. Returns false when it could not be asked
+        // (method gone, exception) - the caller then takes the old stand-up path; the reason is logged once.
+        private static System.Reflection.MethodInfo? _isJobShiftActiveMi;
+        private static bool _isJobShiftActiveLooked, _isJobShiftActiveWarned;
+        private static bool TryIsJobShiftActive(global::PlayerActivity.WorkActivity wa, out bool on)
+        {
+            on = false;
+            try
+            {
+                if (!_isJobShiftActiveLooked)
+                {
+                    _isJobShiftActiveLooked = true;
+                    _isJobShiftActiveMi = HarmonyLib.AccessTools.Method(typeof(global::PlayerActivity.WorkActivity), "IsJobShiftActive");
+                }
+                if (_isJobShiftActiveMi == null)
+                {
+                    if (!_isJobShiftActiveWarned) { _isJobShiftActiveWarned = true; Plugin.Logger.LogWarning("[Rest] WorkActivity.IsJobShiftActive not found - a worker is stood up at the goal as before."); }
+                    return false;
+                }
+                on = _isJobShiftActiveMi.Invoke(wa, null) is bool b && b;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                on = false;
+                if (!_isJobShiftActiveWarned) { _isJobShiftActiveWarned = true; Plugin.Logger.LogWarning($"[Rest] WorkActivity.IsJobShiftActive failed ({(ex.InnerException ?? ex).Message}) - a worker is stood up at the goal as before."); }
+                return false;
+            }
+        }
+
+        // ── H-WORKPANEL-1 (user-approved 2026-09-27; bundle 20260922-141939, host, own CLOSED car dealership) ─────────
+        // A work desk clicked at a closed own shop opens a WorkActivity in NotStarted with NO Start button (Start only
+        // when the shop opens within 2 h, WorkActivity.GetButtons :425-463). MP suppresses the native pause of
+        // ShowActivity, so the player can walk out with it open; outside, BuildingManager.buildingRegistration is null
+        // and every GetButtons read throws at :454 (this poll, Escape via PlayerActivityUI.OnPlayerActionPressed
+        // :445-472, the dock X / WASD StandUp -> Finish) and the slot stays occupied until a reload.
+        // THE CLOSE: the Cancel button's own handler, the private WorkActivity.CancelWorking (:224-229: state ->
+        // Finished, _stateBeforeFinishing = NotStarted; reads neither GetButtons nor the registration). The panel's own
+        // Update then runs the game's teardown, PlayerActivityUI.OnActivityFinished (PlayerActivityUI.cs:400-423:
+        // panel off, time control, slot cleared, activityfinished event) - the panel is re-activated here if it was
+        // inactive, exactly as the round-194 wedge heal does. NotStarted armed nothing physical (StartWorking :93-131
+        // sets the blocker / station employee only on arrival), so the state flip is the whole teardown - the same
+        // reasoning StandUp's native-cancel branch rests on. Triggers: (a) GlobalEvents.onExitBuilding (the game's
+        // exit signal, fired after the street teleport), (b) the mod's movement stand-up (StandUp) and (c) this 0.5 s
+        // poll, which skips the buttons read of such an activity when there is no registration (no log spam).
+        private static System.Reflection.MethodInfo? _cancelWorkingMi;
+        private static bool _cancelWorkingLooked, _cancelWorkingWarned;
+        private static Delegate? _exitForWorkDelegate;
+        private static Delegate? _exitHookSeen;   // fold A5: the onExitBuilding value last checked (a delegate is immutable - any change is a new reference)
+
+        private static bool BuildingRegistrationMissing()
+        {
+            try { return InstanceBehavior<BuildingManager>.Instance?.buildingRegistration == null; }
+            catch { return true; }
+        }
+
+        private static void EnsureExitHookForWork()
+        {
+            try
+            {
+                var cur = GlobalEvents.onExitBuilding;
+                if (_exitForWorkDelegate != null && cur != null && ReferenceEquals(cur, _exitHookSeen)) return;   // fold A5: unchanged - no per-frame GetInvocationList
+                if (_exitForWorkDelegate != null && cur != null && Array.IndexOf(cur.GetInvocationList(), _exitForWorkDelegate) >= 0) { _exitHookSeen = cur; return; }
+                GlobalEvents.onExitBuilding += _ => OnExitBuildingForWork();
+                var list = GlobalEvents.onExitBuilding?.GetInvocationList();
+                _exitForWorkDelegate = list != null && list.Length > 0 ? list[list.Length - 1] : null;
+                _exitHookSeen = GlobalEvents.onExitBuilding;
+            }
+            catch { }
+        }
+
+        private static void OnExitBuildingForWork()
+        {
+            try
+            {
+                var (act, _) = GetCurrentActivity();
+                if (act != null) CloseNotStartedWork(act, "left the building");
+            }
+            catch { }
+        }
+
+        /// <summary>H-WORKPANEL-1: close a NOT-STARTED WorkActivity through WorkActivity.CancelWorking. True when closed.
+        /// MP only (single-player keeps the native pause that makes this unreachable).</summary>
+        private static bool CloseNotStartedWork(object? act, string why)
+        {
+            try
+            {
+                if (!(MPServer.IsRunning || MPClient.IsClientInWorld)) return false;
+                if (act is not global::PlayerActivity.WorkActivity wa) return false;
+                if (wa.GetState() != global::PlayerActivityState.NotStarted) return false;
+                if (!_cancelWorkingLooked)
+                {
+                    _cancelWorkingLooked = true;
+                    _cancelWorkingMi = HarmonyLib.AccessTools.Method(typeof(global::PlayerActivity.WorkActivity), "CancelWorking");
+                }
+                if (_cancelWorkingMi == null)
+                {
+                    if (!_cancelWorkingWarned) { _cancelWorkingWarned = true; Plugin.Logger.LogWarning("[Rest] WorkActivity.CancelWorking not found - a not-started work panel cannot be closed after leaving."); }
+                    return false;
+                }
+                _cancelWorkingMi.Invoke(wa, null);
+                try
+                {
+                    var (ui, _) = GetActivityUiCached();
+                    if (ui is MonoBehaviour mb && !mb.gameObject.activeSelf) mb.gameObject.SetActive(true);   // its Update runs OnActivityFinished
+                }
+                catch { }
+                Plugin.Logger.LogInfo($"[Rest] work panel closed - not started and the player left ({why}).");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[Rest] work panel close failed ({why}): {(ex.InnerException ?? ex).Message}");
+                return false;
+            }
+        }
+
+        // Part 2b (log-only, pre-approved 2026-09-27): why the last seated activity ended, read from the game's own
+        // state at the moment the slot emptied - printed next to '[Rest] vote OFF (stood up)'.
+        private static object? _lastSeenAct;
+        private static string _lastEndReason = "";
+        private static float _lastStandUpAt = -100f;
+        private static string _lastStandUpBranch = "";
+
+        private static string DescribeActivityEnd(object? act)
+        {
+            try
+            {
+                if (Time.unscaledTime - _lastStandUpAt < 2f) return $"stand-up by the mod ({_lastStandUpBranch})";
+                if (act == null) return "";
+                string nm = act.GetType().Name;
+                int st = -1, before = -1;
+                try { var m = act.GetType().GetMethod("GetState"); if (m != null) st = Convert.ToInt32(m.Invoke(act, null)); } catch { }
+                try { var m = act.GetType().GetMethod("GetStateBeforeFinishing"); if (m != null) before = Convert.ToInt32(m.Invoke(act, null)); } catch { }
+                float energy = float.NaN;
+                try { energy = SaveGameManager.Current != null ? SaveGameManager.Current.Energy : float.NaN; } catch { }
+                string why;
+                if (st != (int)PlayerActivityState.Finished) why = $"slot cleared while {(PlayerActivityState)st} (walk-over cancel)";
+                else if (before == (int)PlayerActivityState.NotStarted) why = "cancel (never started)";
+                else if (!float.IsNaN(energy) && energy <= 0f) why = "energy (out of energy)";
+                else why = $"finish (the game ended it from {(PlayerActivityState)before}: time up or Stop)";
+                return $"{why}; {nm} energy={energy:0.#}";
+            }
+            catch { return ""; }
+        }
+
+        private static void UpdateSeated()
+        {
+            try
+            {
+                var (act, nm) = GetCurrentActivity();
+                // ANY PlayerActivityUI activity is ours — the vanilla panel is dead, so we replace it for
+                // every activity (Rest/Sleep/Work/Workout/Hygiene/Entertain/Study/Swimming/Paid). The taxi
+                // is NOT an IPlayerActivity, so it never reaches here — there is nothing to exclude.
+                bool seated = act != null;
+                if (!seated && Seated) _lastEndReason = DescribeActivityEnd(_lastSeenAct);   // part 2b
+                if (seated) _lastSeenAct = act;
+                if (seated != Seated)
+                    Plugin.Logger.LogInfo($"[Rest] seated → {seated}{(seated ? $" ({nm})" : "")}");
+                Seated = seated;
+                bool loiterConverted = false;
+                if (seated && Loitering)
+                {
+                    // Ruling #2: sitting down converts loitering to the seated contract — the
+                    // vote carries; the dock re-titles itself; standing now cancels normally.
+                    Loitering = false; loiterConverted = true;
+                    Plugin.Logger.LogInfo("[Rest] loitering → seated (vote carries; seated rules apply).");
+                }
+                _curAct = seated ? act : null;
+                _curActRef = _curAct;   // Mono: object identity replaces pointer identity
+                if (!seated) _buttonsReadStackLogged = false;   // round-266: re-arm the one-shot stack per activity
+                if (!seated) _suppressedActRef = null;   // gone — clear the wedge guard
+                if (!seated) MPNeedsTuning.SetPowerNap(false);   // POWERNAP: leaving the bed (any stand-up route) ends the nap
+                ActivityName = seated ? nm : "";
+                ActivityState = -1;
+                DockButtons.Clear();
+                CancelButtonIndex = -1;   // review MINOR-3: never leave a stale index from the last seat
+                // Review MAJOR-2: the carried vote still says "loitering" on every OTHER machine —
+                // re-send it under the real activity now that ActivityName is current.
+                if (loiterConverted && _localVoteActive) SendVote(true, _localGoal, ActivityName);
+                if (!seated) return;
+
+                // (Instant-study removed 2026-06-12: superseded by the honorary-
+                //  degree dialog — the school door now opens a confirm GUI and
+                //  the StudyActivity never starts in MP.)
+
+                // State + button passthrough for the dock.
+                try
+                {
+                    var sm = act!.GetType().GetMethod("GetState");
+                    if (sm != null) ActivityState = Convert.ToInt32(sm.Invoke(act, null));
+                }
+                catch { }
+
+                // Round-194 (field 20260729-220133): a Finished activity stranded in the
+                // slot while the panel GameObject is INACTIVE is a permanent wedge — the
+                // game's teardown (OnActivityFinished: slot clear, mouse reset, time-control
+                // restore) runs ONLY from the panel's own Update, and the native walk-away
+                // cancel (CancelActivityMovement) deactivates the panel while KEEPING the
+                // slot. Any button-invoke that lands Finished in that state (our dock's
+                // CancelRest did) locks out every activity start and vehicle entry.
+                // Reactivate the panel so the game runs its OWN teardown — it deactivates
+                // itself again in the same pass. No out-of-band slot clearing (2026-06-10:
+                // that skips the seat release and bricks the bench).
+                if (ActivityState == (int)PlayerActivityState.Finished
+                    && (MPServer.IsRunning || MPClient.IsClientInWorld))
+                {
+                    try
+                    {
+                        var (ui, _) = GetActivityUiCached();
+                        if (ui is MonoBehaviour mb && !mb.gameObject.activeSelf)
+                        {
+                            mb.gameObject.SetActive(true);
+                            Plugin.Logger.LogWarning("[Rest] WEDGE HEAL: Finished activity stranded with panel inactive — panel reactivated so the game's own teardown runs (round-194).");
+                        }
+                    }
+                    catch { }
+                }
+                // H-WORKPANEL-1: a not-started WorkActivity with no building registration throws in GetButtons (:454) on
+                // every read - close it instead of reading (and never spam the buttons-read warning).
+                bool skipButtonsRead = false;
+                if (act is global::PlayerActivity.WorkActivity && ActivityState == (int)PlayerActivityState.NotStarted && BuildingRegistrationMissing())
+                {
+                    skipButtonsRead = true;
+                    CloseNotStartedWork(act, "outside a building - buttons poll");
+                }
+                if (!skipButtonsRead)
+                try
+                {
+                    var gb = act!.GetType().GetMethod("GetButtons");
+                    if (gb?.Invoke(act, null) is System.Collections.IEnumerable arr)
+                    {
+                        foreach (var b in arr)
+                        {
+                            if (b == null || DockButtons.Count >= 4) continue;
+                            var bt = b.GetType();
+                            bool inter = true;
+                            try { inter = (bool)(MPReflect.Get(bt, b, "interactable") ?? true); } catch { }
+                            if (!inter) continue;
+                            string label = "";
+                            try { label = MPReflect.Get(bt, b, "name") as string ?? ""; } catch { }
+                            if (string.IsNullOrEmpty(label))
+                            {
+                                try { label = MPReflect.Get(bt, b, "key") as string ?? ""; } catch { }
+                                if (label.Contains('.')) label = label.Substring(label.LastIndexOf('.') + 1);
+                            }
+                            object? oc = null;
+                            try { oc = MPReflect.Get(bt, b, "onClick"); } catch { }
+                            DockButtons.Add(new DockButton { Label = string.IsNullOrEmpty(label) ? "Action" : label, OnClick = oc });
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Round-266 (field 20260815-134731): 87 identical "Exception has been thrown by the
+                    // target of an invocation" lines — the WRAPPER message, with the real thrower
+                    // unknowable. Unwrap TargetInvocationException, name the activity, and print the
+                    // inner stack ONCE per session so the next bundle names the throwing native method
+                    // (the two candidates — null buildingRegistration vs schedule walk — are decided
+                    // by one stack frame). The empty dock is deliberately left as-is (user ruling
+                    // 2026-08-17: the lack of an exit motivates the report).
+                    var inner = ex; int hops = 0;
+                    while (inner is System.Reflection.TargetInvocationException tie && tie.InnerException != null && hops++ < 4)
+                        inner = tie.InnerException;
+                    string actName = "?"; try { actName = _curAct?.GetType()?.Name ?? "?"; } catch { }
+                    if (!_buttonsReadStackLogged)
+                    {
+                        _buttonsReadStackLogged = true;
+                        Plugin.Logger.LogWarning($"[Rest] buttons read ({actName}): {inner.GetType().Name}: {inner.Message}\n{inner.StackTrace}");
+                    }
+                    else Plugin.Logger.LogWarning($"[Rest] buttons read ({actName}): {inner.GetType().Name}: {inner.Message}");
+                }
+
+                // Classify: Start is AUTO-pressed (click bench → character sits,
+                // no redundant button); Stop/Cancel renders as the header X.
+                CancelButtonIndex = -1;
+                int startIdx = -1;
+                for (int i = 0; i < DockButtons.Count; i++)
+                {
+                    string l = DockButtons[i].Label.ToLowerInvariant();
+                    if (startIdx < 0 && l.Contains("start")) startIdx = i;
+                    else if (CancelButtonIndex < 0 && (l.Contains("stop") || l.Contains("cancel"))) CancelButtonIndex = i;
+                }
+                // Auto-press Start so clicking a bench walks you over and sits — no redundant native Start
+                // button. Fire ONCE per activity INSTANCE (tracked by ref), IMMEDIATELY: the old 1.5s
+                // re-fire gate was a time-based stand-in for "don't press the same activity twice" and it
+                // stalled every click. The post-StandUp window still guards the re-sit, but ONLY for the
+                // instance we stood up from — so a NEW bench starts walking instantly (user 2026-06-22).
+                bool alreadyAutoStarted = ReferenceEquals(_curActRef, _lastAutoStartedActRef);
+                bool suppressedNow = ReferenceEquals(_curActRef, _suppressedActRef) && Time.unscaledTime < _suppressAutoStartUntil;
+                if (startIdx >= 0 && !alreadyAutoStarted && !suppressedNow)
+                {
+                    _lastAutoStartedActRef = _curActRef;
+                    InvokeDockButton(startIdx);
+                    Plugin.Logger.LogInfo("[Rest] auto-start invoked — sit immediately, no Start button.");
+                }
+            }
+            catch { }
+        }
+
+        // ── Host: consensus + clock executor ─────────────────────────────────
+        public static void HostHandleVote(RestVotePayload p)
+        {
+            if (p == null || string.IsNullOrEmpty(p.PlayerId)) return;
+            if (p.Active)
+                _hostVotes[p.PlayerId] = new RestVoteEntry { PlayerId = p.PlayerId, GoalMinutes = p.GoalMinutes, Activity = p.Activity };
+            else
+                _hostVotes.Remove(p.PlayerId);
+            // Round-277 (field 20260818-215459 paper trail): every tally change logs.
+            // That session's two sleeps NEVER reached consensus (1/3 votes) and the log
+            // was silent about it — "skip request ON" then nothing, unreadable in triage.
+            int req = HostVoters().Count;
+            Plugin.Logger.LogInfo($"[Rest] skip vote {(p.Active ? $"ON (until {Fmt(p.GoalMinutes)}, {p.Activity})" : "OFF")} from '{p.PlayerId}' — tally {_hostVotes.Count}/{req}.");
+            _voteWaitLogNext = 0f;   // a change re-arms the prompt waiting line
+            HostBroadcastState();
+        }
+
+        private static void HostTick()
+        {
+            var voters = HostVoters();
+            int required = voters.Count;
+            // SKIP-LOOP-1: a vote whose goal the clock already reached is fulfilled - it never counts again (the voter's
+            // own OFF arrives a moment later, its clock trailing the host's; it used to re-trigger CONSENSUS/GOAL dozens of times)
+            double nowM = NowMinutes();
+            int counted = 0;
+            foreach (var v in voters) if (_hostVotes.TryGetValue(v, out var hv) && hv.GoalMinutes > nowM) counted++;
+            bool consensus = required > 0 && counted >= required;
+
+            if (!SkipActive && consensus)
+            {
+                _skipGoalMinutes = double.MaxValue;
+                foreach (var v in _hostVotes.Values)
+                    if (v.GoalMinutes > nowM && v.GoalMinutes < _skipGoalMinutes) _skipGoalMinutes = v.GoalMinutes;
+                SkipActive = true;
+                Plugin.Logger.LogInfo($"[Rest] CONSENSUS ({_hostVotes.Count}/{required}) — skipping to {Fmt(_skipGoalMinutes)}.");
+                HostBroadcastState();
+            }
+            else if (SkipActive && !consensus)
+            {
+                SkipActive = false;
+                Plugin.Logger.LogInfo("[Rest] skip STOPPED (a vote dropped).");
+                HostBroadcastState();
+            }
+            // Round-277: the not-yet-consensus limbo names itself — who is holding the
+            // skip up, once a minute while any vote waits.  Time passes at NORMAL speed
+            // in this state; the field session's sleeps lived (and died) entirely here.
+            else if (!SkipActive && _hostVotes.Count > 0 && Time.unscaledTime >= _voteWaitLogNext)
+            {
+                _voteWaitLogNext = Time.unscaledTime + 60f;
+                var missing = new List<string>();
+                try { foreach (var lp in voters) if (!_hostVotes.ContainsKey(lp)) missing.Add(lp); } catch { }
+                Plugin.Logger.LogInfo($"[Rest] skip vote WAITING: {_hostVotes.Count}/{required} — missing: {string.Join(", ", missing)}; time passes at normal speed until every player requests a skip.");
+            }
+
+            if (SkipActive)
+            {
+                double now = NowMinutes();
+                if (now >= _skipGoalMinutes)
+                {
+                    SkipActive = false;
+                    // SKIP-LOOP-1: drop the votes this skip fulfilled, so they cannot start it again
+                    var done = new List<string>();
+                    foreach (var kv in _hostVotes) if (kv.Value.GoalMinutes <= now) done.Add(kv.Key);
+                    foreach (var k in done) _hostVotes.Remove(k);
+                    Plugin.Logger.LogInfo($"[Rest] skip GOAL reached ({Fmt(_skipGoalMinutes)}){(done.Count > 0 ? $" - {done.Count} fulfilled vote(s) cleared" : "")}.");
+                    HostBroadcastState();
+                    return;
+                }
+                // The executor runs at frame rate, not at this 0.5s poll.
+            }
+        }
+
+        /// <summary>Per-frame skip executor — runs on HOST and CLIENTS while a consensus skip is active.
+        /// Instead of WRITING the clock forward (which silently bypassed the game's per-hour/per-day economy
+        /// tick → no business revenue for the skipped time), this DRIVES the game's own RunMainGameTick fast,
+        /// so the skipped hours are actually simulated on every machine — each owner earns their own income
+        /// locally (cash is self-reported per machine). The shared world stays consistent via the existing
+        /// client-suppressions + the post-skip re-broadcast, exactly as in normal (un-skipped) play.
+        /// Called every frame from MPCanvasUI for smoothness; Tick() itself is throttled to 0.5s.</summary>
+        public static void TickSkipFrame()
+        {
+            // Skip stopwatch (batch-21): this is the only frame-resolution site that runs on host AND
+            // clients whether or not a skip is active, so the start/stop edge is read here. Two compares
+            // per frame in the common case - no work, no allocation.
+            if (SkipActive != _skipWasActive)
+            {
+                _skipWasActive = SkipActive;
+                try
+                {
+                    if (SkipActive) { _skipStartedReal = Time.unscaledTime; _skipStartedMin = NowMinutes(); }
+                    else if (_skipStartedReal > 0f)
+                    {
+                        PrevSkipRealSeconds  = LastSkipRealSeconds;
+                        LastSkipRealSeconds  = Time.unscaledTime - _skipStartedReal;
+                        LastSkipStartMinutes = _skipStartedMin;
+                        LastSkipEndMinutes   = NowMinutes();
+                        LastSkipGoalMinutes  = _skipGoalMinutes;
+                        _skipStartedReal     = 0f;
+                    }
+                    // D-SKIPPACE-1: the shop's visual pace lives on this SAME edge - one apply pass when
+                    // a skip starts, one restore pass when it ends. Nothing in between, nothing per frame.
+                    if (SkipActive) SkipPaceBodies.OnSkipStarted(); else SkipPaceBodies.RestoreAll();
+                    // PROBE-START: P-CARSTACK  (log-only; the SkipActive TRUE->FALSE edge is one of its triggers)
+                    try { CarStackProbe.NoteSkipActive(SkipActive); } catch { }
+                    // PROBE-END: P-CARSTACK
+                }
+                catch { }
+            }
+            if (!SkipActive) return;
+            double now = NowMinutes();
+            if (now >= _skipGoalMinutes) return;   // reached the goal; HostTick / the state broadcast closes it out
+            double advance = Math.Min(_skipGoalMinutes - now,
+                                      Math.Min(SkipMinutesPerRealSecond * Time.unscaledDeltaTime, MaxSkipMinutesPerFrame));
+            if (advance <= 0d) return;
+            var gm = InstanceBehavior<GameManager>.Instance;
+            if (gm != null) gm.RunMainGameTick((float)advance);   // advances the clock AND runs the skipped economy
+        }
+
+        private static void HostBroadcastState()
+        {
+            var voters = HostVoters();
+            var st = new RestSkipStatePayload { Required = voters.Count, SkipActive = SkipActive, GoalMinutes = _skipGoalMinutes, Voters = voters };
+            foreach (var v in _hostVotes.Values) st.Votes.Add(v);
+            ApplyState(st);
+            MPServer.BroadcastRestState(st);
+        }
+
+        /// <summary>Host: a player disconnected — drop their time-skip vote so consensus is re-evaluated
+        /// against who's actually present (a lingering ghost vote would keep a skip running, and a lone
+        /// remaining player couldn't stop it). HostTick re-checks consensus on the next tick.</summary>
+        public static void RemovePlayer(string playerId)
+        {
+            if (string.IsNullOrEmpty(playerId)) return;
+            if (_hostVotes.Remove(playerId)) HostBroadcastState();
+        }
+
+        public static void ApplyState(RestSkipStatePayload? st)
+        {
+            if (st == null) return;
+            Votes.Clear();
+            Votes.AddRange(st.Votes);
+            RequiredVotes = st.Required;
+            _stateVoters = st.Voters ?? new List<string>();
+            if (!MPServer.IsRunning)
+            {
+                SkipActive       = st.SkipActive;
+                _skipGoalMinutes = st.GoalMinutes;   // clients need the goal to fast-run their own sim to it
+            }
+        }
+
+        // ── Plumbing ──────────────────────────────────────────────────────────
+        private static void SendVote(bool active, double goalMinutes, string activity)
+        {
+            var p = new RestVotePayload { PlayerId = MPConfig.PlayerId, Active = active, GoalMinutes = goalMinutes, Activity = activity };
+            if (MPServer.IsRunning) HostHandleVote(p);
+            else if (MPClient.IsConnected) MPClient.SendRestVote(p);
+        }
+
+        // The live PlayerActivityUI + current activity.  Read the instance FRESH every call from the plain
+        // UIs.playerActivityUI field (cheap) — caching the instance let a stale wrapper report
+        // GetCurrentActivity==null while the game's current panel had a live activity, which made the
+        // vanilla panel leak and the dock never appear (2026-06-22).  Only the Type is cached.
+        private static Type?   _uiType;
+        private static object? _curAct;
+
+        private static (object? ui, Type? type) GetActivityUiCached()
+        {
+            try
+            {
+                var ui = UI.UIs.Instance?.playerActivityUI;
+                if (ui == null) return (null, null);
+                _uiType ??= ui.GetType();
+                return (ui, _uiType);
+            }
+            catch { return (null, null); }
+        }
+
+        /// <summary>Current player activity short name ("" = none).  The game
+        /// strips "Activity": working a station reads as "Work" — drives the
+        /// register-duty broadcast (MPRegisterSync.TickDuty).</summary>
+        public static string CurrentActivityName()
+        {
+            var (_, nm) = GetCurrentActivity();
+            return nm;
+        }
+
+        private static (object? act, string name) GetCurrentActivity()
+        {
+            try
+            {
+                var (ui, uiType) = GetActivityUiCached();
+                if (ui == null) return (null, "");
+                var act = uiType!.GetProperty("GetCurrentActivity")?.GetValue(ui);
+                if (act == null) return (null, "");
+                string nm;
+                try
+                {
+                    var io = act;
+                    nm = io?.GetType()?.Name?.Replace("Activity", "") ?? "Rest";
+                }
+                catch { nm = "Rest"; }
+                return (act, nm);
+            }
+            catch { return (null, ""); }
+        }
+
+        // ── Native TimeMachine helpers (neutralizer only) ─────────────────────
+        private static object? _machine;
+        private static Type?   _machineType;
+
+        private static object? GetMachine()
+        {
+            try
+            {
+                _machineType ??= VehicleManager.FindGameType("Timemachine.TimeMachine")
+                              ?? VehicleManager.FindGameType("TimeMachine");
+                if (_machineType == null) return null;
+                if (_machine == null)
+                {
+                    var objs = UnityEngine.Object.FindObjectsOfType(_machineType, true);
+                    if (objs == null || objs.Length == 0) return null;
+                    _machine = objs[0];   // Mono: the found object IS the typed instance
+                }
+                return _machine;
+            }
+            catch { return null; }
+        }
+
+        private static void StopLocalMachine()
+        {
+            try
+            {
+                var m = GetMachine();
+                var mm = _machineType?.GetMethod("StopTimeMachine");
+                if (m != null && mm != null) mm.Invoke(m, new object[] { 0f });
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Rest] StopLocalMachine: {ex.Message}"); }
+        }
+
+        /// <summary>Hide/show the native skip overlay (taxi rides hide it: its
+        /// frozen clock and wrong day are misleading; restored after).</summary>
+        private static void SetMachineCanvasVisible(bool visible)
+        {
+            try
+            {
+                var m = GetMachine();
+                var canvas = MPReflect.Get(_machineType, m, "canvas") as Canvas;
+                if (canvas != null) canvas.enabled = visible;
+            }
+            catch { }
+        }
+
+        /// <summary>The English form for the test rig's answers (its scenarios match "Day N · hh:mm").</summary>
+        public static string FmtLog(double totalMinutes)
+        {
+            int d = (int)(totalMinutes / 1440.0);
+            double rem = totalMinutes - d * 1440.0;
+            int hh = (int)(rem / 60.0);
+            int mm = (int)(rem - hh * 60.0);
+            return $"Day {d} · {hh:D2}:{mm:D2}";
+        }
+
+        public static string Fmt(double totalMinutes)
+        {
+            int d = (int)(totalMinutes / 1440.0);
+            double rem = totalMinutes - d * 1440.0;
+            int hh = (int)(rem / 60.0);
+            int mm = (int)(rem - hh * 60.0);
+            return Loc.T("gps_rest_day", "Day {0}", d) + $" · {hh:D2}:{mm:D2}";   // REST-UI-2
+        }
+
+        /// <summary>Day and time as separate strings (for clear UI display).</summary>
+        public static (string day, string time) FmtParts(double totalMinutes)
+        {
+            int d = (int)(totalMinutes / 1440.0);
+            double rem = totalMinutes - d * 1440.0;
+            int hh = (int)(rem / 60.0);
+            int mm = (int)(rem - hh * 60.0);
+            return (Loc.T("gps_rest_day", "Day {0}", d), $"{hh:D2}:{mm:D2}");   // REST-UI-2: in the player's language
+        }
+
+        /// <summary>The NEXT occurrence of a clock time (today if still ahead,
+        /// else tomorrow) as total game-minutes.</summary>
+        public static double NextOccurrence(int hour, int minute = 0)
+        {
+            double now = NowMinutes();
+            int day = (int)(now / 1440.0);
+            double candidate = day * 1440.0 + hour * 60.0 + minute;
+            if (candidate <= now + 1) candidate += 1440.0;
+            return candidate;
+        }
+    }
+}

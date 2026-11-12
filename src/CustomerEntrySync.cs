@@ -1,0 +1,1361 @@
+using System;
+using System.Collections.Generic;
+using AI.Customers.CustomerEntries;
+using BigAmbitions.DayNightCycle;
+using Buildings;
+using Entities;
+using HarmonyLib;
+using Helpers;
+
+namespace BigAmbitionsMP
+{
+    /// <summary>Round-39d — Phase 3 (register work) slice 2, step 1: CUSTOMER PRESENCE on non-owner
+    /// machines. NPC shoppers are machine-local: IndoorCustomerSpawner spawns them from
+    /// CustomerEntriesHelper's per-address CustomerEntry list, gated on isOpen + customerCapacity. That
+    /// list gets player-business entries ONLY on the owner's machine (UpdateCustomerEntriesForPlayerBusiness
+    /// early-returns on !RentedByPlayer), and the AI fallback (GenerateAiEntries) permanently CACHES an
+    /// EMPTY list when it runs before the shop has products — so a helper in the owner's shop saw no
+    /// shoppers, ever (field-confirmed 2026-07-07). The owner's entries ride the interior snapshot
+    /// (BuildSnapshot → CustomerEntries); receivers seed their local table here and the game's own
+    /// spawner takes over. Guest-side commerce stays COSMETIC for now — every economic step gates on the
+    /// unflipped IsPlayerOwnedBusiness (order recording, revenue, bag charges), so nothing double-counts;
+    /// order forwarding is slice-2 step 2.</summary>
+    internal static class CustomerEntrySync
+    {
+        private const int MaxEntries = 300;   // wire sanity cap; a shop day is typically tens
+
+        private static readonly System.Reflection.FieldInfo? _entriesField =
+            AccessTools.Field(typeof(CustomerEntriesHelper), "BusinessCustomerEntries");
+
+        private static Dictionary<Address, List<CustomerEntry>>? Table()
+            => _entriesField?.GetValue(null) as Dictionary<Address, List<CustomerEntry>>;
+
+        // ── Round-39f: entry identity (the order-forwarding claim key) ─────────────────────────────
+        // Spawn times MUTATE (TrySpawnCustomer rewrites spawnTime/order.timestamp on late spawns), so
+        // identity is a minted GUID: the OWNER stamps each entry at first capture (weak-keyed — dies
+        // with the entry object, so regenerated schedules mint fresh ids); receivers map each seeded
+        // entry's ORDER object to the id (the live Customer holds that Order ref through the whole
+        // shopping trip, surviving table re-seeds).
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<CustomerEntry, string> _ownerIds = new();
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Order, string> _seededOrderIds = new();
+        private static readonly Dictionary<string, int> _capCapped = new();        // C1 (2026-09-18): addr → the game day the MaxEntries cap was last reported for
+        private static readonly Dictionary<string, int> _lastSeedLogged = new();   // DIAG(econ-verify)
+        private static readonly Dictionary<string, int> _lastCapacitySig = new();  // round-213: capacity recompute only on real seed changes
+        private static int _idCounter;
+
+        // ── H-SALEHOLE-1 instruments (LOG-ONLY, 2026-09-19) ───────────────────────────
+        // FIXED 2026-09-19 (batch 16b, H1): the seed guard below now reads MergerFlip.TrulyMine, so a
+        // MEMBER standing in a merger-FLIPPED partner shop seeds the OWNER's shopper schedule like any
+        // other receiver. (It used to read the RAW RentedByPlayer, which the flip makes TRUE there, so the
+        // schedule was dropped on the floor and nothing that member sold could ever be forwarded.) These
+        // lines keep the verdict visible in the field log; they still decide nothing.
+        private const int SeedLogBudget = 60;                                             // INFO lines per session
+        private static int _seedLogLines;
+        private static readonly Dictionary<string, (int day, string verdict)> _seedLogState = new();
+
+        /// <summary>One INFO line per address per GAME DAY, and one more whenever the verdict changes.</summary>
+        private static void SeedVerdictLine(string addressKey, string body, string verdict)
+        {
+            try
+            {
+                if (_seedLogLines >= SeedLogBudget) return;
+                int day = -1; try { day = GameStateReader.GetGameTime().day; } catch { }
+                if (_seedLogState.TryGetValue(addressKey, out var last) && last.day == day && last.verdict == verdict) return;
+                _seedLogState[addressKey] = (day, verdict);
+                _seedLogLines++;
+                Plugin.Logger.LogInfo($"[Customers] seed {addressKey}: {body}");
+            }
+            catch { }
+        }
+
+        /// <summary>Caller-side companion (the interior apply in GameStatePatcher): a FLIPPED address whose
+        /// interior payload brought NO shopper schedule at all, so <see cref="SeedFor"/> is never even reached.
+        /// Batch 16b: the line NAMES THE BUSINESS TYPE, because a non-retail address (HQ, warehouse, empty unit)
+        /// legitimately has no shoppers at all and must not be read as a hole.</summary>
+        internal static void NoteEmptyInteriorPayload(string addressKey, bool authoritative, string businessType)
+            => SeedVerdictLine(addressKey ?? "", $"payload carried no entries (authoritative={authoritative} type={(string.IsNullOrEmpty(businessType) ? "?" : businessType)})", $"empty:{authoritative}");
+
+        /// <summary>H-SALEHOLE-1 rig read-only: how many entries in THIS machine's table for an address
+        /// carry a seeded (owner-minted) id — i.e. how many could ever forward a sale to the owner.</summary>
+        internal static int SeededIdCountFor(Address? address)
+        {
+            try
+            {
+                var table = Table();
+                if (table == null || address == null || !table.TryGetValue(address, out var entries) || entries == null) return 0;
+                int n = 0;
+                foreach (var e in entries) if (e?.order != null && _seededOrderIds.TryGetValue(e.order, out _)) n++;
+                return n;
+            }
+            catch { return 0; }
+        }
+
+        /// <summary>K1 fold rig read-only: of the seeded (owner-minted) entries here, how many are for TODAY - the partner's
+        /// copy of the owner's current-day schedule.</summary>
+        internal static int SeededTodayCountFor(Address? address)
+        {
+            try
+            {
+                var table = Table();
+                if (table == null || address == null || !table.TryGetValue(address, out var entries) || entries == null) return 0;
+                int today = GameStateReader.GetGameTime().day, n = 0;
+                foreach (var e in entries)
+                    if (e?.order != null && e.spawnTime != null && e.spawnTime.Day == today && _seededOrderIds.TryGetValue(e.order, out _)) n++;
+                return n;
+            }
+            catch { return 0; }
+        }
+
+        // K1 fold (2026-09-28): the owner's last schedule seeded here, per shop - re-seeded after this machine's own midnight
+        // clears the table (see Patch_CustomerEntries_AllPlayerBusinesses_KeepOwnerSchedule).
+        private static readonly Dictionary<string, KeyValuePair<BuildingRegistration, List<CustomerEntryInfo>>> _lastSeed = new();
+
+        /// <summary>K1 fold, MAIN THREAD (postfix of this machine's UpdateCustomerEntriesForAllPlayerBusinesses): the native
+        /// midnight clear (CustomerEntriesHelper.cs:28) also wiped the owner's schedule seeded here. When that seeded copy is
+        /// already the owner's schedule for TODAY (the owner's midnight ran first and its push arrived), seed it again - the
+        /// owner's change gate will not send the same schedule twice. A copy of an older day is left alone: the owner's
+        /// new-day schedule is a change and its gate sends it.</summary>
+        internal static void ReseedAfterLocalMidnight()
+        {
+            if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+            if (_lastSeed.Count == 0) return;
+            int today = GameStateReader.GetGameTime().day;
+            foreach (var kv in new List<KeyValuePair<string, KeyValuePair<BuildingRegistration, List<CustomerEntryInfo>>>>(_lastSeed))
+            {
+                try
+                {
+                    var reg = kv.Value.Key; var entries = kv.Value.Value;
+                    if (reg == null || entries == null || entries.Count == 0) continue;
+                    if (MergerFlip.BooksHere(reg)) continue;
+                    int ofToday = 0;
+                    foreach (var d in entries) if (d != null && d.SpawnDay == today) ofToday++;
+                    if (ofToday == 0) continue;
+                    SeedFor(reg, entries);
+                    Plugin.Logger.LogInfo($"[Customers] re-seeded the owner's day-{today} schedule for '{kv.Key}' after this machine's midnight cleared it ({ofToday} of {entries.Count} entr(ies) are today's).");
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[Customers] re-seed '{kv.Key}': {ex.Message}"); }
+            }
+        }
+
+        /// <summary>H-SALEHOLE-1 rig read-only: forwarded orders this session's owner side ADOPTED for an
+        /// address (never drained, unlike the econ-digest tally).</summary>
+        private static readonly Dictionary<string, int> _adoptedSession = new();
+        internal static int AdoptedCountFor(string addressKey)
+            => !string.IsNullOrEmpty(addressKey) && _adoptedSession.TryGetValue(addressKey, out var n) ? n : 0;
+
+        private static string IdOf(CustomerEntry e)
+        {
+            if (_ownerIds.TryGetValue(e, out var id)) return id;
+            id = $"{MPConfig.PlayerId}-{System.Threading.Interlocked.Increment(ref _idCounter)}";
+            _ownerIds.Add(e, id);
+            return id;
+        }
+
+        // ── H-HOURROLL H1 (review of 480184b, 2026-09-28): the entry ids this OWNER actually SENT to partners ──
+        // Per shop: the ids actually HANDED TO THE TRANSPORT today (Cur, NoteSent - K1 fold 2026-09-28: building a snapshot
+        // records nothing, many builds are never sent) and yesterday (Prev - only for an hour-23 pass that runs
+        // after midnight). A new owner day starts Cur empty. Only these entries can sit on a partner's schedule with this
+        // owner's id, so only they may be set aside by the owner's hourly pass (BookOnce.HourlyBegin); ids are minted per
+        // entry object, so a regenerated schedule never matches an old record.
+        private sealed class SentRecord { public int Day = int.MinValue; public HashSet<string> Cur = new(); public HashSet<string> Prev = new(); }
+        private static readonly Dictionary<string, SentRecord> _sent = new();
+        // DEV lever hourroll unsend: ids kept OUT of the record for good - a later re-push (NoteSent on the next send of the
+        // schedule) would otherwise record them again (rig run T-HANDOFF3-20260928-052416: 4 dropped, all 7 set aside).
+        private static readonly HashSet<string> _devUnsent = new();
+        /// <summary>Fold (review of f31b633, 2026-09-28): an id the DEV hourroll-unsend lever took out of the sent record (the
+        /// owner's pass billed it, so a late partner sale of it is refused as consumed by design - the F1C rig counter skips it).</summary>
+        internal static bool DevUnsent(string id) => !string.IsNullOrEmpty(id) && _devUnsent.Contains(id);
+
+        private static SentRecord? SentRecordFor(string addr)
+        {
+            if (string.IsNullOrEmpty(addr)) return null;
+            int day = GameStateReader.GetGameTime().day;
+            if (!_sent.TryGetValue(addr, out var r)) { r = new SentRecord { Day = day }; _sent[addr] = r; return r; }
+            if (r.Day != day)
+            {
+                r.Prev = r.Day == day - 1 ? r.Cur : new HashSet<string>();   // the owner's new day: the record starts over
+                r.Cur = new HashSet<string>();
+                r.Day = day;
+            }
+            return r;
+        }
+
+        /// <summary>H1: was this owner entry sent to partners (today, or yesterday for a late hour-23 pass)?</summary>
+        internal static bool WasSent(BuildingRegistration reg, CustomerEntry e)
+        {
+            try
+            {
+                if (reg == null || e == null || !_ownerIds.TryGetValue(e, out var id)) return false;
+                var r = SentRecordFor(GameStateReader.AddressKey(reg));
+                return r != null && (r.Cur.Contains(id) || r.Prev.Contains(id));
+            }
+            catch { return false; }
+        }
+
+        /// <summary>H1 rig read-only: ids in the sent record for this shop.</summary>
+        internal static int SentCountFor(string addr)
+        {
+            try { var r = SentRecordFor(addr); return r == null ? 0 : r.Cur.Count + r.Prev.Count; } catch { return -1; }
+        }
+
+        /// <summary>K1 fold (re-check of ef9cf41, 2026-09-28): record the entry ids of a schedule that is ACTUALLY handed
+        /// to the transport (a host send to subscribers or to one player, or the owner's push to the host). Building a
+        /// snapshot records nothing - many builds are never sent (the 2 s change checks, the audit hash, the owner's tick
+        /// push that strips the schedule, NoteOwnerDeltaApplied). Only this owner's own ids (minted by IdOf) are recorded;
+        /// a partner owner's schedule the host relays is not this machine's to set aside. Main thread.</summary>
+        internal static void NoteSent(string addressKey, List<CustomerEntryInfo>? entries, string site)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(addressKey) || entries == null || entries.Count == 0) return;
+                string mine = MPConfig.PlayerId + "-";
+                var r = SentRecordFor(addressKey);
+                if (r == null) return;
+                int added = 0, ofMine = 0, day = int.MinValue;
+                foreach (var d in entries)
+                {
+                    if (d == null || string.IsNullOrEmpty(d.EntryId) || !d.EntryId.StartsWith(mine, StringComparison.Ordinal)) continue;
+                    ofMine++;
+                    if (d.SpawnDay > day) day = d.SpawnDay;
+                    if (_devUnsent.Contains(d.EntryId)) continue;
+                    if (r.Cur.Add(d.EntryId)) added++;
+                }
+                if (added > 0)
+                    Plugin.Logger.LogInfo($"[Customers] schedule '{addressKey}' handed to the transport ({site}): {ofMine} entr{(ofMine == 1 ? "y" : "ies")} of day {day}, {added} id(s) newly recorded as sent (record today={r.Cur.Count} yesterday={r.Prev.Count}).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Customers] note sent: {ex.Message}"); }
+        }
+
+        /// <summary>K1 fold: the schedule's change signature - each entry's spawn day and id (completion flags excluded, so a
+        /// customer finishing is not a change; the spawner only flags entries, IndoorCustomerSpawner.cs:209). 0 = no
+        /// schedule. Any owner's ids count: the host relays a partner owner's cached schedule through the same gate.</summary>
+        internal static int ScheduleSig(List<CustomerEntryInfo>? entries)
+        {
+            try
+            {
+                if (entries == null || entries.Count == 0) return 0;
+                unchecked
+                {
+                    int h = 17, n = 0;
+                    foreach (var d in entries)
+                    {
+                        if (d == null || string.IsNullOrEmpty(d.EntryId)) continue;
+                        h = h * 31 + d.SpawnDay;
+                        h = h * 31 + MPAudit.StableHash(d.EntryId);
+                        n++;
+                    }
+                    if (n == 0) return 0;
+                    h = h * 31 + n;
+                    return h == 0 ? 1 : h;
+                }
+            }
+            catch { return 0; }
+        }
+
+        /// <summary>I1 fold (re-check of 7348b28, 2026-09-28): what the last FULL send of a shopper schedule carried, per
+        /// address - its latest spawn day and its entry ids. A schedule forces an immediate full send only when it GAINS
+        /// against this mark (an id not carried before, or a new day). A removal-only change - every forwarded partner sale
+        /// retires the claimed entry from the owner's list (HandleForwardedOrder, 'retire claimed entry') - rides the next
+        /// ordinary send: the partner already marked that entry completed. Stamped only where a schedule is really sent.</summary>
+        internal sealed class ScheduleMark { public int Day = int.MinValue; public HashSet<string> Ids = new(StringComparer.Ordinal); }
+
+        /// <summary>I1 fold: the mark of a schedule (null = no schedule).</summary>
+        internal static ScheduleMark? MarkOf(List<CustomerEntryInfo>? entries)
+        {
+            try
+            {
+                if (entries == null || entries.Count == 0) return null;
+                var m = new ScheduleMark();
+                foreach (var d in entries)
+                {
+                    if (d == null || string.IsNullOrEmpty(d.EntryId)) continue;
+                    m.Ids.Add(d.EntryId);
+                    if (d.SpawnDay > m.Day) m.Day = d.SpawnDay;
+                }
+                return m.Ids.Count == 0 ? null : m;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>I1 fold: does this schedule GAIN against the last sent mark - an id the mark does not hold, a different
+        /// latest day, or no mark at all? A schedule that only LOST ids (claimed by forwarded sales) does not. No schedule = false.</summary>
+        internal static bool ScheduleGained(List<CustomerEntryInfo>? entries, ScheduleMark? last)
+        {
+            try
+            {
+                if (entries == null || entries.Count == 0) return false;
+                int day = int.MinValue;
+                bool any = false, gained = false;
+                foreach (var d in entries)
+                {
+                    if (d == null || string.IsNullOrEmpty(d.EntryId)) continue;
+                    any = true;
+                    if (d.SpawnDay > day) day = d.SpawnDay;
+                    if (last == null || !last.Ids.Contains(d.EntryId)) gained = true;
+                }
+                return any && (gained || last == null || day != last.Day);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>I1 fold: stamp the mark where a full send really carried the schedule. An empty schedule leaves the old mark
+        /// (as the K1 signature did), unless clearWhenEmpty (the entry serve: that send carried no schedule).</summary>
+        internal static void StampMark(Dictionary<string, ScheduleMark> marks, string addressKey, List<CustomerEntryInfo>? entries, bool clearWhenEmpty = false)
+        {
+            try
+            {
+                if (marks == null || string.IsNullOrEmpty(addressKey)) return;
+                var m = MarkOf(entries);
+                if (m != null) marks[addressKey] = m;
+                else if (clearWhenEmpty) marks.Remove(addressKey);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Customers] stamp schedule mark: {ex.Message}"); }
+        }
+
+        /// <summary>H1 DEV lever (hourroll unsend): drop every other SENT id among this hour's entries from the record, as if
+        /// the partner held them without this owner's id (its midnight, a stale schedule, the cap).</summary>
+        internal static string DevUnsend(BuildingRegistration reg, int hour)
+        {
+            try
+            {
+                var table = Table();
+                if (reg == null || table == null || !table.TryGetValue(reg.Address, out var entries) || entries == null) return "no schedule";
+                var r = SentRecordFor(GameStateReader.AddressKey(reg));
+                if (r == null) return "no address";
+                int seen = 0, dropped = 0, kept = 0;
+                foreach (var e in entries)
+                {
+                    if (e?.spawnTime == null || e.spawnTime.Hour != hour || !_ownerIds.TryGetValue(e, out var id)) continue;
+                    if (!r.Cur.Contains(id) && !r.Prev.Contains(id)) continue;
+                    if (seen++ % 2 == 0) { r.Cur.Remove(id); r.Prev.Remove(id); _devUnsent.Add(id); dropped++; } else kept++;
+                }
+                Plugin.Logger.LogInfo($"[Customers] DEV unsend {GameStateReader.AddressKey(reg)} h{hour}: {dropped} id(s) dropped from the sent record, {kept} kept.");
+                return $"hour={hour} dropped={dropped} kept={kept} sent={r.Cur.Count + r.Prev.Count}";
+            }
+            catch (Exception ex) { return "ERR " + ex.Message; }
+        }
+
+        /// <summary>The synced-schedule id of a PAID order on a receiver machine — null for orders that
+        /// didn't come from the owner's schedule (nothing to forward against).</summary>
+        internal static string? EntryIdOf(Order order)
+            => order != null && _seededOrderIds.TryGetValue(order, out var id) ? id : null;
+
+        /// <summary>Econ-digest consumer (2026-07-09): today's entry stats for one shop —
+        /// (total scheduled, completed). (-1,-1) when the table has no row for the address.</summary>
+        internal static (int total, int completed) EntryStatsFor(Address address)
+        {
+            try
+            {
+                var table = Table();
+                if (table == null || address == null || !table.TryGetValue(address, out var entries) || entries == null)
+                    return (-1, -1);
+                int done = 0;
+                foreach (var e in entries) if (e != null && e.completed) done++;
+                return (entries.Count, done);
+            }
+            catch { return (-1, -1); }
+        }
+
+        /// <summary>Round-43 (puppet identity): the schedule-entry id behind a LIVE customer's order, on
+        /// EITHER side — seeded map on receivers, owner table (minting like CaptureFor) on the owner.
+        /// "" = no mapping (a stray — churns on handoff, the rare fallback).</summary>
+        internal static string EntryIdForOrder(BuildingRegistration? reg, Order? order)
+        {
+            try
+            {
+                if (order == null) return "";
+                if (_seededOrderIds.TryGetValue(order, out var id)) return id;
+                if (reg == null) return "";
+                var table = Table();
+                if (table == null || !table.TryGetValue(reg.Address, out var entries) || entries == null) return "";
+                foreach (var e in entries)
+                    if (e != null && ReferenceEquals(e.order, order)) return IdOf(e);
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>Round-43 (smooth handoff): find the local schedule entry with this id — checks the
+        /// owner id table and the seeded map alike.</summary>
+        internal static CustomerEntry? TryFindEntry(BuildingRegistration? reg, string entryId)
+        {
+            try
+            {
+                if (reg == null || string.IsNullOrEmpty(entryId)) return null;
+                var table = Table();
+                if (table == null || !table.TryGetValue(reg.Address, out var entries) || entries == null) return null;
+                foreach (var e in entries)
+                {
+                    if (e == null) continue;
+                    if (_ownerIds.TryGetValue(e, out var oid) && oid == entryId) return e;
+                    if (e.order != null && _seededOrderIds.TryGetValue(e.order, out var sid) && sid == entryId) return e;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>OWNER side (BuildSnapshot): capture this business's pending shopper schedule.</summary>
+        internal static List<CustomerEntryInfo> CaptureFor(BuildingRegistration reg)
+        {
+            var list = new List<CustomerEntryInfo>();
+            try
+            {
+                var table = Table();
+                if (table == null || reg == null || !table.TryGetValue(reg.Address, out var entries) || entries == null)
+                    return list;
+                if (entries.Count > MaxEntries)
+                {   // C1 (log-only, 2026-09-18): the snapshot stops at the cap without a word, so a receiver simply
+                    // never hears about the shoppers past it. Once per address per game day.
+                    string capAddr = ""; try { capAddr = GameStateReader.AddressKey(reg); } catch { }
+                    int capDay = -1;    try { capDay = GameStateReader.GetGameTime().day; } catch { }
+                    if (!_capCapped.TryGetValue(capAddr, out var lastDay) || lastDay != capDay)
+                    {
+                        _capCapped[capAddr] = capDay;
+                        int done = 0;     try { foreach (var e in entries) if (e != null && e.completed) done++; } catch { }
+                        string capType = ""; try { capType = reg.businessTypeName ?? ""; } catch { }
+                        Plugin.Logger.LogWarning($"[Customers] CAPPED '{capAddr}' pending={entries.Count} cap={MaxEntries} type={capType} completed={done} day={capDay}");
+                    }
+                }
+                for (int i = 0; i < entries.Count && list.Count < MaxEntries; i++)
+                {
+                    var e = entries[i];
+                    if (e?.spawnTime == null) continue;
+                    var dto = new CustomerEntryInfo
+                    {
+                        EntryId     = IdOf(e),
+                        SpawnDay    = e.spawnTime.Day,
+                        SpawnHour   = e.spawnTime.Hour,
+                        SpawnMinute = e.spawnTime.Minute,
+                        Completed   = e.completed,
+                    };
+                    var oes = e.order?.entries;
+                    if (oes != null)
+                        for (int j = 0; j < oes.Count; j++)
+                        {
+                            var oe = oes[j];
+                            if (oe == null || string.IsNullOrEmpty(oe.itemName)) continue;
+                            dto.Items.Add(new OrderEntryInfo
+                            {
+                                ItemName       = oe.itemName,
+                                Price          = oe.price,
+                                WholesalePrice = oe.wholesalePrice,
+                            });
+                        }
+                    var dem = e.order?.customerDemandTypes;
+                    if (dem != null)
+                        for (int j = 0; j < dem.Count; j++)
+                            if (!string.IsNullOrEmpty(dem[j])) dto.Demands.Add(dem[j]);
+                    list.Add(dto);
+                }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Customers] capture: {ex.Message}"); }
+            return list;
+        }
+
+        /// <summary>RECEIVER side (interior apply): seed the local entry table so the native spawner
+        /// produces the owner's shoppers. Local completed flags are preserved by identity key so a
+        /// re-push never re-spawns a customer this machine already spawned. Never runs on the owner
+        /// (their table is the source). MAIN THREAD.</summary>
+        internal static void SeedFor(BuildingRegistration reg, List<CustomerEntryInfo> entries)
+        {
+            try
+            {
+                if (reg == null || entries == null) return;
+                // H-SALEHOLE-1 (log-only): the verdict the guard below is about to reach, and the three
+                // flags it turns on. `rentedRaw` true + `flipped` true = a PARTNER's shop wearing my name
+                // for the native menus; the owner's schedule is dropped here and the member books nothing.
+                try
+                {
+                    bool seedRented  = reg.RentedByPlayer;
+                    string seedKey   = GameStateReader.AddressKey(reg);
+                    bool seedFlipped = MergerFlip.IsFlipped(seedKey);
+                    bool seedMine    = MergerFlip.TrulyMine(reg);
+                    // Batch 16b: the verdict follows the guard below, which is now TrulyMine — a FLIPPED
+                    // shop is SEEDED here; only a shop this machine really owns is skipped.
+                    string seedVerdict = seedMine ? "SKIPPED own" : MergerFlip.BooksHere(reg) ? "SKIPPED stand-in" : "seeded";
+                    SeedVerdictLine(seedKey,
+                        $"entries={entries.Count} rentedRaw={seedRented} flipped={seedFlipped} trulyMine={seedMine} -> {seedVerdict}",
+                        seedVerdict);
+                }
+                catch { }
+                // H-SALEHOLE-1 (H1), fixed 2026-09-19: TrulyMine, NOT the raw flag. The flip makes
+                // RentedByPlayer true on a MEMBER for a PARTNER's shop, so this line used to drop the owner's
+                // schedule there — no seeded entry, no EntryId on any checkout, nothing to forward.
+                if (MergerFlip.BooksHere(reg)) return;   // I really own it (or stand in for its absent owner) → my table is authoritative
+                // An AI shop PASSES this guard; what keeps the UpdateCustomerCapacity call below off AI replicas is the
+                // capture side (InteriorSync captures entries only for TrulyMine shops). If entries are ever captured for
+                // a non-owned shop, that call rebuilds cachedAvailableProducts from the replica's (empty) shelves and
+                // wipes the host-supplied H-AICAT-1 product list (review 2026-09-10 #3).
+                var table = Table();
+                if (table == null) return;
+
+                // EntryIds this machine already SPAWNED (a re-push must never re-spawn them).
+                var doneLocally = new HashSet<string>();
+                if (table.TryGetValue(reg.Address, out var prev) && prev != null)
+                    foreach (var p in prev)
+                        if (p != null && p.completed && p.order != null
+                            && _seededOrderIds.TryGetValue(p.order, out var pid))
+                            doneLocally.Add(pid);
+
+                var fresh = new List<CustomerEntry>(entries.Count);
+                foreach (var d in entries)
+                {
+                    if (d == null) continue;
+                    var ce = new CustomerEntry
+                    {
+                        spawnTime = new Timestamp(d.SpawnDay, d.SpawnHour, d.SpawnMinute),
+                        completed = d.Completed,
+                    };
+                    if (d.Items != null)
+                        foreach (var it in d.Items)
+                        {
+                            if (it == null || string.IsNullOrEmpty(it.ItemName)) continue;
+                            ce.order.entries.Add(new OrderEntry
+                            {
+                                itemName       = it.ItemName,
+                                price          = it.Price,
+                                wholesalePrice = it.WholesalePrice,
+                            });
+                        }
+                    if (d.Demands != null)
+                        foreach (var dm in d.Demands)
+                            if (!string.IsNullOrEmpty(dm)) ce.order.customerDemandTypes.Add(dm);
+                    ce.order.timestamp = ce.spawnTime;
+                    if (!string.IsNullOrEmpty(d.EntryId))
+                    {
+                        _seededOrderIds.Add(ce.order, d.EntryId);   // fresh Order object each seed → no key clash
+                        if (!ce.completed && doneLocally.Contains(d.EntryId))
+                            ce.completed = true;   // already spawned here — don't spawn twice
+                    }
+                    fresh.Add(ce);
+                }
+                table[reg.Address] = fresh;
+                try { _lastSeed[GameStateReader.AddressKey(reg)] = new KeyValuePair<BuildingRegistration, List<CustomerEntryInfo>>(reg, entries); } catch { }   // K1 fold
+
+                // DIAG:FIELD (promoted from INVESTIGATION 2026-08-26, user ruling: these ship) — presence
+                // visibility: one line per seed whose entry
+                // count CHANGED (re-pushes with an unchanged schedule stay silent).
+                try
+                {
+                    string ak = GameStateReader.AddressKey(reg);
+                    int pending = 0; foreach (var f in fresh) if (f != null && !f.completed) pending++;
+                    if (!_lastSeedLogged.TryGetValue(ak, out var last) || last != fresh.Count * 1000 + pending)
+                    {
+                        _lastSeedLogged[ak] = fresh.Count * 1000 + pending;
+                        Plugin.Logger.LogInfo($"[Customers] seeded {fresh.Count} shopper entr(ies) for '{ak}' ({pending} pending spawn here).");
+                    }
+                }
+                catch { }
+
+                // The spawner refuses when customerCapacity is 0 — the replica's is often unset (the
+                // native computation runs owner-side). Data-level recompute from the synced items.
+                // Round-213: the recompute tail (→ RemoveUnusedRetailPrices → demand recomputes) ran
+                // on EVERY re-push — pure churn while the interior re-send loop was live. Only when
+                // the seeded set actually changed, or capacity is still unset (the reason it exists).
+                try
+                {
+                    int sig = fresh.Count;
+                    foreach (var f in fresh) if (f?.order != null) sig = sig * 31 + f.order.entries.Count;
+                    string akCap = GameStateReader.AddressKey(reg);
+                    bool capacityUnset = false; try { capacityUnset = reg.customerCapacity <= 0; } catch { }
+                    if (capacityUnset || !_lastCapacitySig.TryGetValue(akCap, out var prevSig) || prevSig != sig)
+                    {
+                        _lastCapacitySig[akCap] = sig;
+                        BusinessHelper.UpdateCustomerCapacity(reg);
+                    }
+                }
+                catch { }
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Customers] seed: {ex.Message}"); }
+        }
+
+        // ── Round-39f: owner-side adoption of a helper-machine sale ────────────────────────────────
+
+        /// <summary>Idempotency ledger — every forwarded EntryId is processed at most once per session.</summary>
+        private static readonly HashSet<string> _processedForwards = new();
+
+        /// <summary>H-HANDOFF-1 book-once (2026-09-27): a forward for this id was adopted here and put an Order in the
+        /// till. The hand-off marks that used to live here (step 8, folds F1/F4/F6) are replaced by BookOnce.</summary>
+        private static readonly HashSet<string> _bookedForwards = new();
+        internal static bool ForwardBooked(string entryId)
+            => !string.IsNullOrEmpty(entryId) && _bookedForwards.Contains(entryId);
+        /// <summary>Fold L (2026-09-27): per session, like the book-once registry (BookOnce.Reset).</summary>
+        internal static void ClearBookedForwards()
+        {
+            try
+            {
+                int retired = RetireForwardKept();
+                if (retired > 0) Plugin.Logger.LogInfo($"[Business] session wipe: {retired} forward-settled entr{(retired == 1 ? "y" : "ies")} taken out of the schedule lists (their hourly set-aside ends with this session's ledgers).");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] retire kept forwards: {ex.Message}"); }
+            try { _bookedForwards.Clear(); _lastSeed.Clear(); } catch { }   // K1 fold: the stored seeds are per session too
+        }
+
+        // Rotation fix B (2026-09-28): an entry a partner's sale forward claimed STAYS in the owner's table, completed -
+        // single-player keeps a served entry (CustomerEntriesHelper.cs:42/59 counts it against its hour's quota, so a later
+        // legit rebuild mints no replacement), as BookOnce U5 does for walk-outs. The owner's hourly pass never bills it
+        // (BookOnce.HourlyBegin sets it aside by this mark). The set-aside runs only while MP runs and lives as long as this
+        // session's ledgers, so the session wipe (ClearBookedForwards) takes the kept entries out of the table (fold H1's
+        // reason for retiring them at the forward itself).
+        private static System.Runtime.CompilerServices.ConditionalWeakTable<CustomerEntry, object> _forwardKept = new();
+        private static readonly List<WeakReference<CustomerEntry>> _forwardKeptList = new();
+        // Fold Q3 (review of f31b633, 2026-09-28): true only while a kept entry is still in a live schedule list. The day roll
+        // rebuilds the whole table (CustomerEntriesHelper.cs:28), so yesterday's marks are forgotten here instead of keeping
+        // this true all session (it gates BookOnce.HourlyBegin's early out).
+        internal static bool AnyForwardKept
+        {
+            get
+            {
+                if (_forwardKeptList.Count == 0) return false;
+                try
+                {
+                    var table = Table();
+                    if (table == null) return true;
+                    foreach (var kv in table)
+                        if (kv.Value != null)
+                            foreach (var x in kv.Value)
+                                if (x != null && _forwardKept.TryGetValue(x, out _)) return true;
+                    _forwardKept = new System.Runtime.CompilerServices.ConditionalWeakTable<CustomerEntry, object>();
+                    _forwardKeptList.Clear();
+                    return false;
+                }
+                catch { return true; }
+            }
+        }
+        internal static bool ForwardKept(CustomerEntry? e) => e != null && _forwardKept.TryGetValue(e, out _);
+        private static void KeepForwarded(CustomerEntry e)
+        {
+            try
+            {
+                if (e == null || _forwardKept.TryGetValue(e, out _)) return;
+                _forwardKept.Add(e, e);
+                if (_forwardKeptList.Count >= 4000) _forwardKeptList.RemoveAll(w => !w.TryGetTarget(out _));
+                _forwardKeptList.Add(new WeakReference<CustomerEntry>(e));
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] keep forwarded entry: {ex.Message}"); }
+        }
+        private static int RetireForwardKept()
+        {
+            int n = 0;
+            try
+            {
+                if (_forwardKeptList.Count == 0) return 0;
+                var table = Table();
+                if (table != null)
+                    foreach (var kv in table)
+                        if (kv.Value != null) n += kv.Value.RemoveAll(x => x != null && _forwardKept.TryGetValue(x, out _));
+            }
+            finally
+            {
+                _forwardKept = new System.Runtime.CompilerServices.ConditionalWeakTable<CustomerEntry, object>();
+                _forwardKeptList.Clear();
+            }
+            return n;
+        }
+
+        // Rotation readout: per shop, forwards adopted whose entry id this owner no longer held ('schedule rotated').
+        private static readonly Dictionary<string, int> _fwdUnknown = new();
+        internal static int FwdUnknownFor(string addressKey)
+            => !string.IsNullOrEmpty(addressKey) && _fwdUnknown.TryGetValue(addressKey, out var n) ? n : 0;
+
+        /// <summary>Fold M4: the schedule id this machine already gave an entry (never mints one).</summary>
+        internal static string? KnownIdOf(CustomerEntry? e)
+            => e != null && _ownerIds.TryGetValue(e, out var id) ? id : null;
+
+#if BAMP_DEV
+        // H1 rig oracle (t-handoff2): every forward booked here with the entry Order it claimed. Survives the
+        // session wipe on purpose - a second booking of the same visit after the wipe is what it must catch.
+        private static readonly List<(string id, string addr, Order? entryOrder, Order fwd)> _devFwdPairs = new();
+        internal static string ForwardDoubleReport(BuildingRegistration reg)
+        {
+            try
+            {
+                string key = GameStateReader.AddressKey(reg);
+                var till = reg.unprocessedCompletedOrders;
+                int n = 0, dbl = 0, fwdIn = 0;
+                var bad = new List<string>();
+                foreach (var pr in _devFwdPairs)
+                {
+                    if (pr.addr != key) continue;
+                    n++;
+                    bool fIn = false, eIn = false;
+                    if (till != null)
+                        foreach (var o in till)
+                        {
+                            if (o == null) continue;
+                            if (ReferenceEquals(o, pr.fwd)) fIn = true;
+                            else if (pr.entryOrder != null && ReferenceEquals(o, pr.entryOrder) && o.completed && o.entries != null && o.entries.Exists(x => x != null && x.paid)) eIn = true;
+                        }
+                    if (fIn) fwdIn++;
+                    if (fIn && eIn) { dbl++; bad.Add(pr.id); }
+                }
+                return $"fwdPairs={n} fwdInTill={fwdIn} fwdDouble={dbl} fwdDoubleIds={(bad.Count == 0 ? "-" : string.Join(";", bad))}";
+            }
+            catch (Exception ex) { return "fwdERR " + ex.Message; }
+        }
+
+        /// <summary>Rotation readout (t-handoff3): this machine's schedule list for a shop - entries, completed, kept after a
+        /// forward, per-hour counts (hour:total/completed), forwards adopted and those with an unknown id.</summary>
+        internal static string RotationReport(BuildingRegistration reg)
+        {
+            try
+            {
+                string key = GameStateReader.AddressKey(reg);
+                var entries = EntriesOf(reg);
+                int total = 0, done = 0, kept = 0;
+                var byHour = new SortedDictionary<int, (int t, int d)>();
+                if (entries != null)
+                    foreach (var e in entries)
+                    {
+                        if (e == null) continue;
+                        total++;
+                        if (e.completed) done++;
+                        if (ForwardKept(e)) kept++;
+                        int h = e.spawnTime != null ? e.spawnTime.Hour : -1;
+                        byHour.TryGetValue(h, out var c);
+                        byHour[h] = (c.t + 1, c.d + (e.completed ? 1 : 0));
+                    }
+                var hs = new List<string>();
+                foreach (var kv in byHour) hs.Add($"{kv.Key}:{kv.Value.t}/{kv.Value.d}");
+                int hour = -1, day = -1; try { hour = SaveGameManager.Current.Hour; day = TimeHelper.CurrentDay; } catch { }
+                return $"day={day} hour={hour} entries={total} completed={done} fwdKept={kept} hours=[{string.Join(",", hs)}] fwdAdopted={AdoptedCountFor(key)} fwdUnknown={FwdUnknownFor(key)}";
+            }
+            catch (Exception ex) { return "rotERR " + ex.Message; }
+        }
+#endif
+
+        /// <summary>BookOnce's hourly set-aside: this machine's live schedule list for a shop (the list the native
+        /// simulators read through CustomerEntriesHelper.GetEntriesByAddress). Null when it holds none.</summary>
+        internal static List<CustomerEntry>? EntriesOf(BuildingRegistration? reg)
+        {
+            try
+            {
+                var table = Table();
+                if (reg == null || table == null || !table.TryGetValue(reg.Address, out var entries)) return null;
+                return entries;
+            }
+            catch { return null; }
+        }
+
+        // Recheck B1 (helper side): live citizen per order, recorded at Customer.Init so the forward
+        // at Order.Pay can judge price acceptability without a scene sweep. Weak-keyed — orders die
+        // with their customers.
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Order, AI.Citizens.CitizenData> _citizenByOrder = new();
+        internal static void RecordCitizen(Order order, AI.Citizens.CitizenData citizen)
+        {
+            try { _citizenByOrder.Remove(order); _citizenByOrder.Add(order, citizen); } catch { }
+        }
+        internal static AI.Citizens.CitizenData? CitizenFor(Order? order)
+            => order != null && _citizenByOrder.TryGetValue(order, out var c) ? c : null;
+
+        // DIAG:FIELD (promoted 2026-08-26) — running tally of adopted forwarded orders per
+        // business, drained into the [EconProbe] daily-revenue line so the books attribute what came
+        // from helper-hosted sales. Retire with the EconProbe once the loop is trusted.
+        private static readonly Dictionary<string, (int orders, float revenue)> _adoptedTally = new();
+
+        internal static (int orders, float revenue) TakeAdoptedTally(string addressKey)
+        {
+            if (string.IsNullOrEmpty(addressKey) || !_adoptedTally.TryGetValue(addressKey, out var t)) return (0, 0f);
+            _adoptedTally.Remove(addressKey);
+            return t;
+        }
+
+        /// <summary>OWNER, MAIN THREAD: a customer order paid on a helper's machine arrives. Claim the
+        /// source entry (my table is the single-writer ledger: already-completed = my machine spawned or
+        /// served that customer → reject, my side counts it), deduct the sold items + a paper bag from
+        /// REAL stock (a forwarded sale must drain shelves like a live one, or revenue is minted from
+        /// nothing), PRICE each item from the owner's own table (the helper's copy carries none — see the
+        /// field note in the loop), record the order in reg.unprocessedCompletedOrders (the hourly
+        /// calculator subtracts it from the simulated quota — native anti-double-count), and re-sync.</summary>
+        internal static void OwnerAdoptForwardedOrder(HelperOrderPayload p)
+        {
+            try
+            {
+                try { CustomerHandoff.NoteLife(p.PlayerId, p.AddressKey, "sale forward"); } catch { }   // H-HOURROLL H3
+                if (p == null || string.IsNullOrEmpty(p.AddressKey) || string.IsNullOrEmpty(p.EntryId)) return;
+                if (_processedForwards.Contains(p.EntryId)) return;
+
+                var gi = SaveGameManager.Current;
+                if (gi?.BuildingRegistrations == null) return;
+                BuildingRegistration? reg = null;
+                foreach (var r in gi.BuildingRegistrations)
+                    if (r != null && GameStateReader.AddressKey(r) == p.AddressKey) { reg = r; break; }
+                // Batch 16b: TrulyMine, not the raw flag — under a flip a MEMBER would otherwise accept a
+                // forward for a PARTNER's shop and book it a second time against its own replica.
+                if (reg == null || !MergerFlip.BooksHere(reg))
+                {
+                    Plugin.Logger.LogWarning($"[Business] forwarded order for '{p.AddressKey}' — not my business, dropped.");
+                    return;
+                }
+
+                // Claim. Completed on MY table = my spawner consumed that customer (I'm inside; my live
+                // body will/did complete it natively) - reject so it counts exactly once.
+                // H-HANDOFF-1 BOOK ONCE (2026-09-27): a visit that crossed a hand-off is registered in BookOnce, and the
+                // registry alone decides: booked already (by a checkout, an hourly pass, a gym fee or an earlier forward)
+                // -> this forward is suppressed; not booked yet -> this forward books it, whatever the entry's
+                // 'consumed by the spawner' flag says (that flag is set at every spawn, paid or not).
+                bool registered = BookOnce.IsRegistered(p.EntryId);
+                if (registered && BookOnce.IsBooked(p.EntryId))
+                {
+                    BookOnce.TryBook(p.EntryId, "forwarded sale", null);   // logs the suppression
+                    _processedForwards.Add(p.EntryId);
+                    CustomerHandoff.NoteForward(p.EntryId, null);   // H-HANDOFF-1 till ledger (rig oracle)
+                    return;
+                }
+                bool claimed = false, known = false;
+                CustomerEntry? claimedEntry = null;
+                var table = Table();
+                List<CustomerEntry>? entries = null;
+                if (table != null && table.TryGetValue(reg.Address, out entries) && entries != null)
+                    foreach (var e in entries)
+                    {
+                        if (e == null || !_ownerIds.TryGetValue(e, out var id) || id != p.EntryId) continue;
+                        known = true;
+                        if (registered || !e.completed) { e.completed = true; claimed = true; claimedEntry = e; }
+                        else _processedForwards.Add(p.EntryId);
+                        break;
+                    }
+                if (known && !claimed)
+                {
+                    Plugin.Logger.LogInfo($"[Business] forwarded order {p.EntryId} rejected — entry already consumed on the owner's machine (counts natively).");
+                    CustomerHandoff.NoteForward(p.EntryId, null);   // H-HANDOFF-1 till ledger (rig oracle)
+                    return;
+                }
+                if (registered)
+                    Plugin.Logger.LogInfo($"[Business] forwarded order {p.EntryId} accepted (book once) — the first booking of a visit that crossed a hand-off, from '{p.PlayerId}'.");
+                // Recheck B2 (double-book): the owner's hourly abstract simulator processes every entry
+                // of the hour with NO completed filter (RetailBusinessSimulator.ProcessAllCustomersFromThisHour
+                // :171-186, ProcessCustomer :207+), so a claimed-but-listed entry was booked AGAIN at the
+                // hour-end tick whenever the owner stood outside. Retire the claimed entry from the live
+                // list: the adopted Order below (timestamp now) still feeds the daily quota subtraction.
+                // Fold H1 (2026-09-27): a REGISTERED entry is retired too. Kept in the table it relied on the registry's
+                // hourly set-aside, and the registry is wiped at scene-ready only (a host that stops hosting and plays on alone keeps it - out of scope by user ruling 2026-09-28) (CustomerPuppets.Reset ->
+                // CustomerHandoff.Reset -> BookOnce.Reset): the next native pass then booked the entry's own Order a
+                // second time. A later take-back of the visit adopts from a stand-alone entry built from the row
+                // (CustomerPuppets.AdoptPuppetAsNative, 'registered visit whose entry left this machine's table').
+                // Rotation fix B (2026-09-28): the claimed entry STAYS listed, completed (single-player parity - a served entry
+                // counts against its hour's quota); BookOnce.HourlyBegin sets it aside (ForwardKept), and the session wipe
+                // takes it out of the table (ClearBookedForwards), which answers fold H1.
+                if (claimedEntry?.order != null) BookOnce.MapOrder(claimedEntry.order, p.EntryId);   // fold M4 (and H2(a): its live body)
+                int leftThisHour = -1;
+                if (claimedEntry != null && entries != null)
+                {
+                    try
+                    {
+                        KeepForwarded(claimedEntry);   // rotation fix B: stays in the list, completed; never billed by a pass
+                        int hourNow = SaveGameManager.Current.Hour;
+                        leftThisHour = 0;
+                        foreach (var e in entries) if (e != null && e.spawnTime != null && e.spawnTime.Hour == hourNow && !e.completed) leftThisHour++;
+                    }
+                    catch (Exception rx) { Plugin.Logger.LogWarning($"[Business] keep claimed entry: {rx.Message}"); }
+                }
+                // Unknown id = the schedule rotated since the helper's copy; adopt anyway (the order
+                // still displaces the sim quota) — logged for the audit trail.
+
+                // Deduct real stock: one display-slot unit per paid item; items with no stock left are
+                // dropped from the sale (the shop can't sell what it doesn't have).
+                // Fold Q5 (review of f31b633, 2026-09-28): a known entry stamps the adopted order with the entry's own spawn time
+                // (a copy - native reassigns spawnTime on a late spawn), so the order sits in the visit's hour, not the hour the
+                // forward arrived; an unknown id keeps the arrival time.
+                Timestamp oTs = TimeHelper.Now();
+                try { var st = claimedEntry?.spawnTime; if (st != null) oTs = new Timestamp(st.Day, st.Hour, st.Minute); } catch { }
+                var o = new Order { completed = true, timestamp = oTs };
+                try { o.cleanliness = Buildings.BuildingTypes.Shared.Dirtiness.BuildingCleanlinessHelper.GetCleanliness(reg); } catch { }
+                // Field 20260831-224923 (approved 2026-09-01): the helper's copy of the order carries
+                // NO prices — native FullServiceEmployee.CheckConditions (:175-185) writes
+                // orderEntry.price only when IsPlayerOwnedBusiness on the serving machine, which a
+                // helper's replica never is, so every forwarded item arrived at $0 and the owner
+                // booked nothing for 87 sales in one day. The OWNER's price table is the truth
+                // anyway (a helper's synced copy can lag a re-price), so price here from it, and
+                // take the cost basis from the shelf slot the unit is actually deducted from.
+                // The forwarded Price is kept only as an audit figure in the log line below.
+                int sold = 0, dropped = 0, refused = 0, feeLines = 0;
+                float forwardedTotal = 0f, repricedTotal = 0f;
+                // Fold K3 (2026-09-26): a PAID entrance-fee line rides in the sale of a fee shop (the fee was judged and
+                // paid at the door - IndoorCustomerSpawner.TryToProcessEntranceFeeEntryToOrder :284-307). It is no
+                // shelf item, so DeductDisplayStock never finds it: it was dropped, and a fee-only sale was dropped
+                // whole as 'no coverable items' while its entry was consumed above. It is booked at the OWNER's price,
+                // without touching stock and without a paper bag.
+                string feeName = "";
+                try { feeName = BusinessTypeHelper.GetEntranceFeeNameForBusinessType(BusinessTypeHelper.GetData(reg)) ?? ""; } catch { }
+                // H-HANDOFF-1 STOCK ONCE: units this machine's shelves already gave this visit - the ones that left with a
+                // handed-off body (CustomerHandoff.TakeOut), then the ones a live body of the same visit holds here (its
+                // order is finished once this forward books) - are booked without a second deduction.
+                var credits = CustomerHandoff.TakeOut(p.EntryId);
+                CustomerHandoff.AddSettledCredits(p.EntryId, credits);   // H1 backstop: units an unsold settle of this visit wrote off
+                var liveCredits = CustomerPuppets.LiveTakenOf(p.EntryId, reg);
+                var tillCredits = CustomerHandoff.TillTakenOf(reg, p.EntryId);   // then the visit's snapshot lines in the till
+                int credited = 0; bool bagCredited = false; float bagWs = 0f;
+                if (p.Items != null)
+                    foreach (var it in p.Items)
+                    {
+                        if (it == null || string.IsNullOrEmpty(it.ItemName)) continue;
+                        if (feeName.Length > 0 && it.ItemName == feeName)
+                        {
+                            try
+                            {
+                                float feePrice;
+                                try { feePrice = ItemHelper.GetPrice(feeName, reg); } catch { feePrice = it.Price; }
+                                if (feePrice <= 0f) feePrice = it.Price;
+                                forwardedTotal += it.Price; repricedTotal += feePrice;
+                                o.entries.Add(new OrderEntry
+                                {
+                                    itemName = feeName, price = feePrice, wholesalePrice = 0f,
+                                    available = true, priceAccceptable = true, paid = true, processed = true,
+                                });
+                                sold++; feeLines++;
+                            }
+                            catch (Exception fx) { Plugin.Logger.LogWarning($"[Business] forwarded fee line {p.EntryId}: {fx.Message}"); }
+                            continue;
+                        }
+                        // H-HANDOFF-1 STOCK ONCE: a paper-bag line is no shelf item. The bag an earlier serve of this visit
+                        // took here stands for the sale's bag below; otherwise the line is ignored (the bag below is the one).
+                        if (CustomerHandoff.IsPaperBag(it.ItemName))
+                        {
+                            if (!bagCredited && (CustomerHandoff.UseCredit(credits, it.ItemName, out bagWs) || CustomerHandoff.UseCredit(liveCredits, it.ItemName, out bagWs))) bagCredited = true;
+                            continue;
+                        }
+                        // Recheck B1: the helper judged this item too expensive for that customer —
+                        // native returns it to the shelf unsold (ReturnUnacceptablePriceItems), so it
+                        // is neither deducted nor booked here.
+                        if (!it.Acceptable) { refused++; continue; }
+                        float slotWholesale = 0f;
+                        bool fromOut = CustomerHandoff.UseCredit(credits, it.ItemName, out slotWholesale);
+                        bool fromLive = !fromOut && CustomerHandoff.UseCredit(liveCredits, it.ItemName, out slotWholesale);
+                        bool fromTill = !fromOut && !fromLive && CustomerHandoff.UseLine(tillCredits, it.ItemName, out slotWholesale);
+                        if (fromOut) CustomerHandoff.StockFwdCredited++;
+                        if (fromTill) CustomerHandoff.StockFwdTillCredited++;
+                        if (fromLive) CustomerHandoff.StockFwdLiveCredited++;
+                        if (fromOut || fromLive || fromTill) credited++;
+                        if (fromOut || fromLive || fromTill || DeductDisplayStock(reg, it.ItemName, out slotWholesale))
+                        {
+                            float ownerPrice;
+                            try { ownerPrice = ItemHelper.GetPrice(it.ItemName, reg); }   // owner's retailPrices, market default on a miss
+                            catch { ownerPrice = it.Price; }
+                            if (ownerPrice <= 0f) ownerPrice = it.Price;   // never price BELOW what the helper saw (a $0 table miss)
+                            forwardedTotal += it.Price; repricedTotal += ownerPrice;
+                            o.entries.Add(new OrderEntry
+                            {
+                                itemName       = it.ItemName,
+                                price          = ownerPrice,
+                                wholesalePrice = slotWholesale > 0f ? slotWholesale : it.WholesalePrice,
+                                available      = true,
+                                paid           = true,
+                            });
+                            sold++;
+                        }
+                        else dropped++;
+                    }
+                // H-HANDOFF-1 STOCK ONCE: units taken here for this visit that the sale does not carry (refused on price,
+                // dropped on the partner's machine) go back on a shelf, as the native serve / walk-out would put them.
+                if (credits.Count > 0) CustomerHandoff.ReturnLeftovers(reg, credits, p.EntryId, "not in the forwarded sale");
+                if (sold == 0)
+                {
+                    _processedForwards.Add(p.EntryId);
+                    Plugin.Logger.LogInfo(refused > 0 && dropped == 0
+                        ? $"[Business] forwarded order {p.EntryId}: every item priced too high for that customer — left without buying (entry consumed, nothing booked)."
+                        : $"[Business] forwarded order {p.EntryId} had no coverable items (stock raced away{(refused > 0 ? $", {refused} refused on price" : "")}) — dropped.");
+                    return;
+                }
+
+                // Paper bag: the sale consumes one from the register, priced like a live checkout
+                // (FullServiceEmployee :113 uses the register slot's pricePerUnit as the bag wholesale).
+                bool bagged = false;
+                try
+                {
+                    bool needsBags = sold > feeLines;   // fold K3: a fee-only sale takes no bag
+                    if (needsBags)
+                        try { needsBags = BusinessTypeHelper.GetData(reg)?.HasTag(BigAmbitions.Tags.TagRef.Businesstag.customersneedpaperbags) ?? true; } catch { }
+                    if (needsBags && bagCredited)
+                    {
+                        o.AddPaperBagEntry(bagWs);   // H-HANDOFF-1 stock once: the bag this visit already took here
+                        bagged = true;
+                        needsBags = false;
+                    }
+                    if (needsBags)
+                        foreach (var kv in reg.itemInstances)
+                        {
+                            var ii = kv.Value;
+                            if (ii?.ItemCached == null || (ii.ItemCached.type & BigAmbitions.Items.ItemType.PointOfSale) == 0) continue;
+                            var slot = (ii.cargoInstances != null && ii.cargoInstances.Count == 1) ? ii.cargoInstances[0] : null;
+                            if (slot == null || string.IsNullOrEmpty(slot.itemName) || slot.amount <= 0) continue;
+                            o.AddPaperBagEntry(slot.pricePerUnit);
+                            slot.amount--;
+                            try { ii.OnItemsInCargoUpdated()?.Invoke(); } catch { }
+                            bagged = true;
+                            break;
+                        }
+                }
+                catch { }
+
+                if (registered) BookOnce.TryBook(p.EntryId, "forwarded sale", o);   // first booking: marks the visit booked
+                reg.unprocessedCompletedOrders.Add(o);
+                _processedForwards.Add(p.EntryId);
+                if (_bookedForwards.Count >= 4000) _bookedForwards.Clear();   // fold L: never silently stop recording
+                _bookedForwards.Add(p.EntryId);
+#if BAMP_DEV
+                if (_devFwdPairs.Count < 3000) _devFwdPairs.Add((p.EntryId, p.AddressKey, claimedEntry?.order, o));
+#endif
+                CustomerHandoff.NoteForward(p.EntryId, o);   // H-HANDOFF-1 till ledger (rig oracle)
+                float orderRevenue = 0f;
+                foreach (var oe in o.entries) if (oe != null && oe.paid) orderRevenue += oe.price;
+                _adoptedTally.TryGetValue(p.AddressKey, out var tally);
+                _adoptedTally[p.AddressKey] = (tally.orders + 1, tally.revenue + orderRevenue);
+                _adoptedSession.TryGetValue(p.AddressKey, out var adoptedSoFar);   // H-SALEHOLE-1 rig counter (never drained)
+                _adoptedSession[p.AddressKey] = adoptedSoFar + 1;
+                if (!known) { _fwdUnknown.TryGetValue(p.AddressKey, out var unk); _fwdUnknown[p.AddressKey] = unk + 1; }   // rotation readout
+                BuildingStorageSync.OwnerBusinessTail(reg, reschedule: false);   // rotation fix A: a sale never rebuilds the schedule (single-player parity)
+                InteriorSync.PushOwnedBuildingNow(p.AddressKey);
+                Plugin.Logger.LogInfo($"[Business] adopted helper-served order {p.EntryId} from '{p.PlayerId}' @'{p.AddressKey}': {sold} item(s) ${repricedTotal:F2} (forwarded at ${forwardedTotal:F2}){(bagged ? " +bag" : "")}{(bagCredited ? " (its bag was already handed out here)" : "")}{(credited > 0 ? $" ({credited} unit(s) already taken off this machine's shelves for this visit - not deducted again)" : "")}{(feeLines > 0 ? $" (incl. {feeLines} entrance-fee line(s), no stock)" : "")}{(refused > 0 ? $" ({refused} refused on price)" : "")}{(dropped > 0 ? $" ({dropped} out-of-stock dropped)" : "")}{(known ? "" : " (entry unknown — schedule rotated)")}."
+                    + (claimedEntry != null ? $" [PROBE:P-HELPER-DOUBLEBOOK] entry kept in the live table, completed (set aside by the hourly pass){(registered ? " (book once)" : "")}; {leftThisHour} unserved left this hour."  : (known ? "" : " [PROBE:P-HELPER-DOUBLEBOOK] entry unknown — nothing to retire; quota relies on the adopted order's timestamp.")));
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Business] adopt forwarded order: {ex.Message}"); }
+        }
+
+        internal static string ShortItem(string n)
+            => string.IsNullOrEmpty(n) ? "" : (n.StartsWith("ba:itemname_", StringComparison.Ordinal) ? n.Substring(12) : n);
+
+        /// <summary>H-HANDOFF-1 stock once: is <paramref name="itemName"/> a display-shelf item of this shop (any showcase slot
+        /// set to it, stocked or not)? A fee or a service line is not, and never moves stock.</summary>
+        internal static bool IsShelfItem(BuildingRegistration reg, string itemName)
+        {
+            try
+            {
+                if (reg?.itemInstances == null || string.IsNullOrEmpty(itemName)) return false;
+                foreach (var kv in reg.itemInstances)
+                {
+                    var ii = kv.Value;
+                    if (ii?.ItemCached == null || (ii.ItemCached.type & BigAmbitions.Items.ItemType.ShowcaseShelf) == 0 || ii.cargoInstances == null) continue;
+                    foreach (var s in ii.cargoInstances) if (s != null && s.itemName == itemName) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>Reduce ONE unit of <paramref name="itemName"/> from a display (showcase-shelf) stock
+        /// slot — what a live customer's grab does physically. Display-only on purpose: customers never
+        /// shop from storage.</summary>
+        internal static bool DeductDisplayStock(BuildingRegistration reg, string itemName, out float slotWholesale)
+        {
+            slotWholesale = 0f;
+            try
+            {
+                if (reg.itemInstances == null) return false;
+                foreach (var kv in reg.itemInstances)
+                {
+                    var ii = kv.Value;
+                    if (ii?.ItemCached == null || (ii.ItemCached.type & BigAmbitions.Items.ItemType.ShowcaseShelf) == 0) continue;
+                    var slots = ii.cargoInstances;
+                    if (slots == null) continue;
+                    for (int i = 0; i < slots.Count; i++)
+                    {
+                        var s = slots[i];
+                        if (s == null || s.itemName != itemName || s.amount <= 0) continue;
+                        s.amount--;
+                        slotWholesale = (float)s.pricePerUnit;   // the owner's real cost basis for this unit
+#if BAMP_DEV
+                        CustomerHandoff.SdTraceNote(itemName, "DeductDisplayStock", 1);   // H-HANDOFF-1 stock oracle trace
+#endif
+                        try { ii.OnItemsInCargoUpdated()?.Invoke(); } catch { }
+                        return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+    }
+
+    /// <summary>H-SKIPDOUBLE-1 (2026-09-20) - THE ONE till-duplicate arithmetic, shared by the DEV
+    /// lever `tilldupes` (TestDrive.cs) and by the corrective tripwire on ProcessDailyOrders below, so
+    /// the number a measurement reports and the number a removal reports can never drift apart.
+    /// WHAT AN EXTRA REFERENCE IS WORTH: at the day roll BusinessHelper.CreateDailyOrderHistory
+    /// (:234-261) walks reg.unprocessedCompletedOrders per LIST ELEMENT (filter: order.completed &amp;&amp;
+    /// any entry paid) and hands each to AddOrderSales (:280-296), which sums OrderEntry.price for
+    /// every entry that is available &amp;&amp; priceAccceptable &amp;&amp; paid into the day's totalRevenue -
+    /// the figure ProcessDailyOrders (:223-232) pays out with ChangeMoneySafe. So a SECOND reference
+    /// to the same Order is paid a second time, and ExtraReferenceValue reproduces exactly that sum.</summary>
+    internal static class TillDupes
+    {
+        /// <summary>net48 has no ReferenceEqualityComparer, and the question here is precisely whether the
+        /// SAME object sits in a list twice - value equality would answer a different question.
+        /// RuntimeHelpers.GetHashCode is the identity hash, unaffected by any Equals/GetHashCode the type
+        /// may define. Used for Order (the till list) and for CustomerEntry (the skip sim's set-aside).</summary>
+        internal sealed class RefEq<T> : IEqualityComparer<T> where T : class
+        {
+            public bool Equals(T a, T b) => ReferenceEquals(a, b);
+            public int GetHashCode(T o) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o);
+        }
+
+        /// <summary>What ONE extra (duplicate) reference to this Order would be paid at the day roll.
+        /// Zero when the day roll would ignore it anyway (not completed, or nothing in it paid).</summary>
+        internal static double ExtraReferenceValue(Order? o)
+        {
+            if (o == null || !o.completed) return 0;        // the day roll skips it entirely
+            bool paid = false; double sum = 0;
+            if (o.entries != null)
+                foreach (var e in o.entries)
+                {
+                    if (e == null) continue;
+                    if (e.paid) paid = true;
+                    if (e.available && e.priceAccceptable && e.paid) sum += e.price;
+                }
+            return paid ? sum : 0;
+        }
+    }
+
+    // DIAG:FIELD (promoted 2026-08-26) — the user cannot see the books; this names the money
+    // truth at the exact moment it becomes money. BusinessHelper.ProcessDailyOrders is where a player
+    // business's completed orders (live, forwarded, and simulated alike) turn into an order-history
+    // entry + a ChangeMoneySafe revenue deposit, then clear. One line per business per daily processing:
+    // customers, revenue, what portion arrived via forwarded helper-hosted orders, and the item tally.
+    // The POSTFIX is observe-only. The PREFIX below is NOT: it is the H-SKIPDOUBLE-1 tripwire, the last
+    // gate before money moves, and it REMOVES duplicate references from the till list rather than only
+    // naming them - a duplicate that survives to here is paid out and cannot be taken back afterwards,
+    // so reporting alone would leave the user's books wrong. It lives on this patch because this is
+    // already the ProcessDailyOrders seam and both halves must see the same list.
+    // PERMANENT (user ruling 2026-08-26): the economic loop is the newest and least-tested
+    // system in the mod, and without these lines a "my money is wrong" report arrives with nothing to
+    // explain it. They are change-gated, so they cost a line only when something actually moves.
+    [HarmonyPatch]
+    public static class Probe_DailyRevenue
+    {
+        static System.Reflection.MethodBase? TargetMethod()
+            => AccessTools.Method(typeof(BusinessHelper), "ProcessDailyOrders");
+
+        /// <summary>H-SKIPDOUBLE-1 TRIPWIRE (2026-09-20) - CORRECTIVE. Reference-de-duplicates the till
+        /// list immediately before the day roll reads it, keeping the FIRST occurrence of each Order.
+        /// Multiplayer only, and only on the machine that BOOKS this shop (my own, or an absent owner's shop
+        /// I stand in for) - never on a replica, whose list is not the one that pays.
+        /// It is a backstop, not the fix: the fix is Patch_RunHourly_SimulateOccupiedShopDuringSkip setting
+        /// walked-in shoppers aside from the skip's hourly sim (MPPatches.cs). A WARNING here means some
+        /// path still doubles an order, and the amount says what that would have cost.</summary>
+        static void Prefix(BuildingRegistration registration)
+        {
+            if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+            try
+            {
+                if (registration == null || !MergerFlip.BooksHere(registration)) return;
+                var till = registration.unprocessedCompletedOrders;
+                if (till == null || till.Count < 2) return;
+                var seen = new HashSet<Order>(new TillDupes.RefEq<Order>());
+                int removed = 0; double amount = 0;
+                for (int i = 0; i < till.Count; i++)
+                {
+                    var o = till[i];
+                    if (o == null) continue;
+                    if (seen.Add(o)) continue;                       // the first reference is the legitimate one
+                    amount += TillDupes.ExtraReferenceValue(o);      // THE shared formula - never a second one
+                    till.RemoveAt(i); i--; removed++;
+                }
+                if (removed > 0)
+                    Plugin.Logger.LogWarning(
+                        $"[EconProbe] TRIPWIRE duplicate till entries removed before payout '{registration.BusinessName}' " +
+                        $"@'{GameStateReader.AddressKey(registration)}': removed={removed} amount=${amount:F2}");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[EconProbe] tripwire: {ex.Message}"); }
+        }
+
+        static void Postfix(BuildingRegistration registration)
+        {
+            if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+            try
+            {
+                if (registration == null || !MergerFlip.BooksHere(registration)) return;   // batch 16b: never report a partner's FLIPPED shop as my daily revenue (a stand-in's simulated shop IS booked here - review MEDIUM-2)
+                string ak = GameStateReader.AddressKey(registration);
+                Entities.OrderHistoryEntry? h = null;
+                var hist = registration.orderHistory;
+                if (hist != null && hist.Count > 0) h = hist[hist.Count - 1];
+                var (fOrders, fRevenue) = CustomerEntrySync.TakeAdoptedTally(ak);
+                string items = "";
+                if (h?.itemSales != null)
+                {
+                    var parts = new List<string>();
+                    foreach (var s in h.itemSales)
+                    {
+                        if (s == null) continue;
+                        parts.Add($"{CustomerEntrySync.ShortItem(s.itemName)}×{s.amountSold}");
+                        if (parts.Count >= 6) { parts.Add("…"); break; }
+                    }
+                    items = string.Join(", ", parts);
+                }
+                Plugin.Logger.LogInfo(
+                    $"[EconProbe] daily revenue '{registration.BusinessName}' @'{ak}': customers={h?.totalCustomers ?? 0} " +
+                    $"revenue=${(h?.totalRevenue ?? 0f):F2} deposited | forwarded helper orders since last: {fOrders} (${fRevenue:F2}) | items: {items}");
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[EconProbe] daily revenue: {ex.Message}"); }
+        }
+    }
+    /// <summary>H-SALEHOLE-1 ORIGIN PROBE (log-only, 2026-09-19, budget 20 lines/session, tag [Customers]).
+    /// The rig found a 151-entry shopper table on a MEMBER for a PARTNER's shop that no line explained. Two
+    /// native generators fill a reg's entry table and both can run on a machine that does not own the shop:
+    ///   • CustomerEntriesHelper.UpdateCustomerEntriesForPlayerBusiness (:38) gates on the RAW RentedByPlayer,
+    ///     which a merger flip makes true on a member. It IS in the authority veil's Steps table, so it should
+    ///     see native truth and early-return — a line from it here means the veil did NOT cover that call.
+    ///   • CustomerEntriesHelper.GenerateAiEntries (:90) runs for ANY address whose table has no row and builds
+    ///     a whole day from the REPLICA's products — the likely source of the 151.
+    /// Observe-only: no decision changes. After the H1 fix, SeedFor REPLACES table[reg.Address] wholesale, so a
+    /// locally generated table cannot survive the owner's first seed, and the completed flags the seed carries
+    /// over come only from entries that already held an OWNER-minted id.</summary>
+    internal static class CustomerEntryOrigin
+    {
+        private const int Budget = 20;
+        private static int _lines;
+
+        internal static void Note(string generator, BuildingRegistration? reg, Address? address, int generated)
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+                if (reg == null && address != null)
+                    try { reg = Helpers.BuildingHelper.GetBuildingRegistration(address); } catch { }
+                if (reg == null) return;
+                if (MergerFlip.TrulyMine(reg)) return;   // own shops: NoteOwn (probe A only)
+                if (_lines >= Budget) return;
+                string ak = ""; try { ak = GameStateReader.AddressKey(reg); } catch { }
+                string type = ""; try { type = reg.businessTypeName ?? ""; } catch { }
+                bool flipped = false; try { flipped = MergerFlip.IsFlipped(ak); } catch { }
+                _lines++;
+                Plugin.Logger.LogInfo($"[Customers] ORIGIN {generator} '{ak}': generated={generated} type={type} veilDepth={MergerFlip.VeilDepth} flipped={flipped} trulyMine=False");
+            }
+            catch { }
+        }
+
+        // Rotation probe (2026-09-28, log-only): a rebuild of MY OWN shop's schedule - entries after, entries it created
+        // (every unfinished entry is dropped and re-minted: CustomerEntriesHelper.cs:42/74-75), and who called it.
+        private const int OwnBudget = 60;
+        private static int _ownLines;
+        private sealed class OwnStat { public int Regens, New, Dropped; public readonly Dictionary<string, int> Callers = new(); }
+        private static readonly Dictionary<string, OwnStat> _own = new();
+
+        internal static void NoteOwn(BuildingRegistration? reg, int before, int doneBefore, int after)
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+                if (reg == null || !MergerFlip.TrulyMine(reg)) return;
+                string ak = ""; try { ak = GameStateReader.AddressKey(reg); } catch { }
+                if (!_own.TryGetValue(ak, out var st)) { st = new OwnStat(); _own[ak] = st; }
+                int created = after - doneBefore; if (created < 0) created = 0;
+                int dropped = before - doneBefore; if (dropped < 0) dropped = 0;
+                string caller = Caller();
+                st.Regens++; st.New += created; st.Dropped += dropped;
+                st.Callers.TryGetValue(caller, out var cn); st.Callers[caller] = cn + 1;
+                if (_ownLines >= OwnBudget) return;
+                _ownLines++;
+                int hour = -1; try { hour = SaveGameManager.Current.Hour; } catch { }
+                Plugin.Logger.LogInfo($"[Customers] ORIGIN own shop UpdateCustomerEntriesForPlayerBusiness '{ak}' h{hour}: entries {before} -> {after}, {dropped} unfinished dropped, {created} created; caller={caller}.");
+            }
+            catch { }
+        }
+
+        internal static string OwnReport(string ak)
+        {
+            try
+            {
+                if (!_own.TryGetValue(ak ?? "", out var st)) return "regens=0 regenNew=0 regenDropped=0 regenCallers=[]";
+                var cs = new List<string>();
+                foreach (var kv in st.Callers) cs.Add($"{kv.Key}:{kv.Value}");
+                return $"regens={st.Regens} regenNew={st.New} regenDropped={st.Dropped} regenCallers=[{string.Join(",", cs)}]";
+            }
+            catch (Exception ex) { return "ownERR " + ex.Message; }
+        }
+
+        private static string Caller()
+        {
+            try
+            {
+                var st = new System.Diagnostics.StackTrace(1, false);
+                var names = new List<string>();
+                for (int i = 0; i < st.FrameCount && names.Count < 2; i++)
+                {
+                    var m = st.GetFrame(i)?.GetMethod();
+                    if (m == null) continue;
+                    string t = m.DeclaringType?.Name ?? "";
+                    if (m.Name.Contains("UpdateCustomerEntriesFor") || t.StartsWith("Probe_", StringComparison.Ordinal)
+                        || t == nameof(CustomerEntryOrigin) || t.StartsWith("Harmony", StringComparison.Ordinal)) continue;
+                    names.Add(t + "." + m.Name);
+                }
+                return names.Count == 0 ? "?" : string.Join("<", names);
+            }
+            catch { return "?"; }
+        }
+    }
+
+    /// <summary>ORIGIN PROBE A — the PLAYER-business generator. See <see cref="CustomerEntryOrigin"/>.</summary>
+    [HarmonyPatch]
+    public static class Probe_CustomerEntryOrigin_PlayerBusiness
+    {
+        static System.Collections.Generic.IEnumerable<System.Reflection.MethodBase> TargetMethods()
+        {
+            System.Reflection.MethodBase? m = null;
+            try { m = AccessTools.Method(typeof(CustomerEntriesHelper), "UpdateCustomerEntriesForPlayerBusiness"); } catch { }
+            if (m == null) Plugin.Logger.LogError("[Customers] origin probe: CustomerEntriesHelper.UpdateCustomerEntriesForPlayerBusiness not found — that generator goes UNWATCHED.");
+            else yield return m;
+        }
+
+        static void Prefix(BuildingRegistration registration, out (int total, int done) __state)
+        {
+            __state = (0, 0);
+            try
+            {
+                if (registration == null) return;
+                var (t, d) = CustomerEntrySync.EntryStatsFor(registration.Address);
+                __state = (t < 0 ? 0 : t, d < 0 ? 0 : d);
+            }
+            catch { }
+        }
+
+        static void Postfix(BuildingRegistration registration, (int total, int done) __state)
+        {
+            try
+            {
+                if (registration == null) return;
+                var (total, _) = CustomerEntrySync.EntryStatsFor(registration.Address);
+                if (MergerFlip.TrulyMine(registration)) { CustomerEntryOrigin.NoteOwn(registration, __state.total, __state.done, total < 0 ? 0 : total); return; }
+                if (total <= 0) return;
+                CustomerEntryOrigin.Note("UpdateCustomerEntriesForPlayerBusiness", registration, null, total);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Customers] origin probe (player business): {ex.Message}"); }
+        }
+    }
+
+    /// <summary>ORIGIN PROBE B — the AI-shop fallback generator. See <see cref="CustomerEntryOrigin"/>.</summary>
+    [HarmonyPatch]
+    public static class Probe_CustomerEntryOrigin_AiEntries
+    {
+        static System.Collections.Generic.IEnumerable<System.Reflection.MethodBase> TargetMethods()
+        {
+            System.Reflection.MethodBase? m = null;
+            try { m = AccessTools.Method(typeof(CustomerEntriesHelper), "GenerateAiEntries"); } catch { }
+            if (m == null) Plugin.Logger.LogError("[Customers] origin probe: CustomerEntriesHelper.GenerateAiEntries not found — that generator goes UNWATCHED.");
+            else yield return m;
+        }
+
+        static void Postfix(Address address, List<CustomerEntry> __result)
+        {
+            try
+            {
+                int n = __result?.Count ?? 0;
+                if (n <= 0) return;
+                CustomerEntryOrigin.Note("GenerateAiEntries", null, address, n);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Customers] origin probe (ai entries): {ex.Message}"); }
+        }
+    }
+
+    /// <summary>K1 fold (re-check of ef9cf41, 2026-09-28): this machine's OWN midnight (BusinessHelper.cs:173 ->
+    /// UpdateCustomerEntriesForAllPlayerBusinesses, CustomerEntriesHelper.cs:28) clears the whole entry table, the owner's
+    /// schedule seeded for a partner's shop included. See CustomerEntrySync.ReseedAfterLocalMidnight.</summary>
+    [HarmonyPatch(typeof(CustomerEntriesHelper), nameof(CustomerEntriesHelper.UpdateCustomerEntriesForAllPlayerBusinesses))]
+    public static class Patch_CustomerEntries_AllPlayerBusinesses_KeepOwnerSchedule
+    {
+        static void Postfix()
+        {
+            try { CustomerEntrySync.ReseedAfterLocalMidnight(); }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[Customers] keep owner schedule: {ex.Message}"); }
+        }
+    }
+}

@@ -1,0 +1,1175 @@
+using System.Collections.Generic;
+using System.Reflection;
+using HarmonyLib;
+using UnityEngine;
+using Helpers;
+
+namespace BigAmbitionsMP
+{
+    // A STRIPPED vehicle ghost has no EntityController, so MouseController sees currentTargetEntity==null
+    // and treats a click on it as plain click-to-move (SetNewDestination, removeGoal:true) — walking the player
+    // to the clicked car body and fighting our directed walk. An interactive entity click suppresses
+    // click-to-move; this does the same for a ghost click. Our SetGoal uses removeGoal:false, so it's untouched.
+    [HarmonyPatch(typeof(PlayerController), nameof(PlayerController.SetNewDestination))]
+    public static class Patch_PlayerController_SetNewDestination_GhostClick
+    {
+        static bool Prefix(bool removeGoal) => !(removeGoal && PassengerRide.IsHoveringGhost);
+    }
+
+    // ONE DECIDER PER CLICK (car package, 2026-08-25; F-2026-08-25-D field case): a DRIVABLE ghost
+    // KEEPS its VehicleController and stays registered, so the game's own click machinery ran in
+    // FULL on it — the mod decided on mouse-DOWN from its manifest while native decided on mouse-UP
+    // from the instance, and one physical click could open the native Enter/Manage overlay AND arm
+    // the mod's walk-to-enter (which then hid that overlay on arrival: menu vanished into an
+    // enter). Route the native vehicle click on any BAMP_ ghost into the mod's single handler and
+    // consume it — the mod's rules, the mod's data, exactly once per click (the per-frame token in
+    // PassengerRide dedups against the mod's own release-branch, which stays alive for STRIPPED
+    // ghosts native cannot resolve: MouseController requires the EntityController on the hit
+    // transform itself).
+    [HarmonyPatch(typeof(VehicleController), nameof(VehicleController.OnIoLeftClick))]
+    public static class Patch_VehicleController_OnIoLeftClick_GhostSingleDecider
+    {
+        static bool Prefix(VehicleController __instance, ref bool __result)
+        {
+            try
+            {
+                if (__instance == null) return true;
+                string id = __instance.vehicleInstance?.id ?? "";
+                if (id.Length == 0 || !id.StartsWith("BAMP_")) return true;   // real vehicles: native
+                // Review MAJOR-2: BAMP_TESTRIG ids are REAL player-owned vehicles on pre-release
+                // rig saves (the five sibling sites all carry this exemption) — consuming their
+                // clicks would make them permanently unclickable with no heal.
+                if (id.StartsWith("BAMP_TESTRIG")) return true;
+                // Review MAJOR-1: a proxy the LOCAL player POSSESSES (pushing a cart, driving) keeps
+                // NATIVE click handling — HandleUnlockedClick's possessed branches deliberately do
+                // nothing because the native menu owns that click (loaded-cart deposit/manage lives
+                // there). The single-decider routing is for clicks on ghosts we are NOT possessing —
+                // the parked-car case where the double-decider bug lived.
+                if (VehicleManager.PossessedByLocal(__instance.gameObject)) return true;
+                __result = true;   // consumed — the native cta/overlay path never runs for a ghost
+                PassengerRide.RouteGhostClick(id.Substring(5), "native-cta");
+                return false;
+            }
+            catch { return true; }
+        }
+    }
+
+    /// <summary>
+    /// Passenger ("ride shotgun") gameplay layer. Consumes the host-authoritative occupancy +
+    /// locks in <see cref="PassengerSync"/> and turns them into the visible ride: the LOCAL
+    /// player walking to a ghost car's passenger door, pinning into the seat (own model hidden,
+    /// the camera keeps following the pinned character), and stepping out beside the car; plus
+    /// rendering OTHER players who are riding (their avatar pinned to the seat, nametag floating).
+    /// The feature ships — only the F7 board/exit TEST trigger is dev-gated, a stand-in until the
+    /// in-car "Ride" CTA lands. Driven once per frame from MPCanvasUI.Update. See
+    /// docs/PASSENGER-SYSTEM.md.
+    /// </summary>
+    // ── Field 20260901-213253 (user-approved 2026-09-02): a pinned PASSENGER's car sleep ─────────────────
+    // PassengerHud.OnSleep starts the game's SleepActivity with no entity. SleepActivity's one-frame start check
+    // (SleepActivity.cs :110-125) asks VehicleHelper.IsInsideMotorVehicle(), which reads ActiveVehicleId — never set
+    // for a rider, by design (StartPin leaves the two driver-only lines alone) — gets false, falls to
+    // ExistsRoute(null) and throws (client log :17941). The activity then sits in MovingTowardsActivity forever:
+    // the dock's AvatarInActivity gate never opens and the rider has no skip control ("can't wait in friend's
+    // car"). Answer YES for exactly that decision: MP, rider pinned, and the game's CURRENT activity is a
+    // SleepActivity still in MovingTowardsActivity — read live from the game's own objects, so the gate closes the
+    // moment the game moves it to Started. The 10 other native callers of IsInsideMotorVehicle see the override
+    // only inside that window. From there the game runs Started + the sleep nav blocker. NOT the energy lines:
+    // SleepActivity keeps RemoveEnergySpender / SetCurrentEnergyRegen / the multiplier / ForceTimeMachine behind
+    // `if (_entityController != null)` (:82-106 on the update), and a rider's entity is null by construction —
+    // RiderSleepEnergy below supplies those three energy lines (review #4 MAJOR, 2026-09-02).
+    [HarmonyPatch(typeof(Helpers.VehicleHelper), nameof(Helpers.VehicleHelper.IsInsideMotorVehicle))]
+    public static class Patch_IsInsideMotorVehicle_RiderSleepStart
+    {
+        private static int _answered;
+        private static bool _warned;   // review #4 MINOR: the old `_answered == 0` test never limited (the counter moved after the throw site)
+        static void Postfix(ref bool __result)
+        {
+            try
+            {
+                if (__result) return;
+                if (!MPServer.IsRunning && !MPClient.InMpGame) return;
+                if (!PassengerRide.IsSeated) return;
+                var ui = UI.UIs.Instance?.playerActivityUI;
+                if (ui?.GetCurrentActivity is not PlayerActivity.SleepActivity sleep) return;
+                if (sleep.GetState() != PlayerActivityState.MovingTowardsActivity) return;
+                __result = true;
+                _answered++;
+                if (_answered <= 5 || _answered % 50 == 0)
+                    Plugin.Logger.LogInfo($"[Ride] in-vehicle answered YES for a pinned passenger's sleep start (#{_answered}) — the game's own start branch runs instead of ExistsRoute(null).");
+            }
+            catch (System.Exception ex)
+            {
+                if (!_warned) { _warned = true; Plugin.Logger.LogWarning($"[Ride] rider sleep-start answer: {ex.GetType().Name}: {ex.Message}"); }
+            }
+        }
+    }
+
+    /// <summary>Review #4 MAJOR (2026-09-02): a pinned passenger's car sleep reaches Started but the game's energy
+    /// lines sit behind its `_entityController != null` check, so the energy bar never moved while the happiness
+    /// bonus and the "energy increased" event still fired. Apply the same three lines once per sleep instance the
+    /// moment it is Started/Running; SleepActivity.Finish resets the regen to None unconditionally (:154-156), so
+    /// nothing is left behind. Values read from the activity's own SleepEnvironment (the Car config).</summary>
+    internal static class RiderSleepEnergy
+    {
+        private static object? _appliedFor;
+        private static System.Reflection.FieldInfo? _fEnv;
+        private static System.Reflection.MethodInfo? _mSetRegen, _mRemoveSpender;
+        private static bool _warned;
+
+        internal static void Tick()
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.InMpGame) return;
+                if (!PassengerRide.IsSeated) { _appliedFor = null; return; }
+                var ui = UI.UIs.Instance?.playerActivityUI;
+                if (ui?.GetCurrentActivity is not PlayerActivity.SleepActivity sleep) { _appliedFor = null; return; }
+                if (ReferenceEquals(_appliedFor, sleep)) return;
+                var st = sleep.GetState();
+                if (st != PlayerActivityState.Started && st != PlayerActivityState.Running) return;
+                _fEnv ??= AccessTools.Field(typeof(PlayerActivity.SleepActivity), "_sleepEnvironment");
+                var env = _fEnv?.GetValue(sleep) as PlayerActivity.SleepEnvironment;
+                if (env == null) { _appliedFor = sleep; return; }
+                _mRemoveSpender ??= AccessTools.Method(typeof(EnergyHelper), "RemoveEnergySpender", new[] { typeof(string) });
+                _mSetRegen      ??= AccessTools.Method(typeof(EnergyHelper), "SetCurrentEnergyRegen");
+                _mRemoveSpender?.Invoke(null, new object[] { "move" });
+                _mSetRegen?.Invoke(null, new object[] { env.EnergyRegen });
+                EnergyHelper.energyRegenMultiplier = EnergyHelper.DefaultEnergyRegenMultiplier;
+                _appliedFor = sleep;
+                Plugin.Logger.LogInfo($"[Ride] rider sleep energy armed: regen={env.EnergyRegen} (the game's own lines are skipped for an entity-less sleep).");
+            }
+            catch (System.Exception ex)
+            {
+                if (!_warned) { _warned = true; Plugin.Logger.LogWarning($"[Ride] rider sleep energy: {ex.GetType().Name}: {ex.Message}"); }
+            }
+        }
+    }
+
+    internal static class PassengerRide
+    {
+        // ── local ride ────────────────────────────────────────────────────────
+        private static string _localVeh  = "";    // what we're currently rendering as ridden ("" = on foot)
+        private static int    _localSeat = -1;
+        private static bool   _pinned;            // arrived at the seat and locked to it
+        private static float  _pinFallback;       // unscaled-time deadline to pin if the walk never arrives
+        private static bool   _following;         // [PassFollow] mid building enter/exit — re-pin once co-located with the ghost
+        // walk-to-deposit: pending deposit while the player walks to the vehicle's loading spot
+        private static string _depVid = "", _depOwner = "";
+        private static Vector3 _depSpot;
+        private static float  _depDeadline;
+        private static bool   _exitRequested;     // already asked the host to release us (car vanished)
+        private static float  _ghostGoneSince = -1f;   // when our ridden ghost first went missing (-1 = present)
+        private static Vector3 _parkedPos;             // RIDE-EXIT-1: where the real body was parked when this ride pinned
+        private static bool   _parkedValid;            // RIDE-EXIT-1: is _parkedPos meaningful for the current ride?
+        private static float  _offMeshSince = -1f;     // RIDE-EXIT-1: when the local agent first read off-mesh (-1 = on mesh)
+        private static float  _lastUnstuck  = -999f;   // RIDE-EXIT-1: unscaled time of the last Unstuck() (one per 30 s)
+
+        /// <summary>True once we're actually pinned in the seat — drives the passenger HUD so the
+        /// "Exit Vehicle" button only appears after we're really aboard, not on board-approval.</summary>
+        internal static bool IsSeated => _pinned && _localVeh != "";
+        /// <summary>The real id of the car this player rides in ("" = none) - PASSENGER-RADIO-1.</summary>
+        internal static string SeatedVehicleId => IsSeated ? _localVeh : "";
+
+        /// <summary>While seated as a passenger the real character is parked invisibly at the
+        /// boarding door, so world-streaming (traffic + parked-ghost culling) must follow the
+        /// RIDDEN car instead — else only the cars seen at entry stay visible. Returns the
+        /// ridden ghost's transform when seated, null otherwise.</summary>
+        internal static Transform? RideAnchorTransform()
+            => IsSeated ? VehicleManager.GhostTransform(_localVeh) : null;
+
+        // Colliders + controller dropped while seated so the parked-at-door character can't be
+        // a phantom obstacle (traffic braking for it, players bumping it); restored in EndLocalRide.
+        private static readonly System.Collections.Generic.List<Collider> _seatedColliders = new();
+        private static CharacterController? _seatedController;
+
+        // ── remote riders we've pinned (pid → vehicleId) ────────────────────
+        private static readonly Dictionary<string, string> _remotePinned = new();
+
+        public static void Update()
+        {
+            if (!MPServer.IsRunning && !MPClient.IsConnected)
+            {
+                if (_localVeh != "") EndLocalRide(beside: false);
+                if (_remotePinned.Count > 0) ClearRemotePins();
+                return;
+            }
+
+            try
+            {
+                TickHoverHighlight();   // cursor over an unlocked ghost → outline + board on click
+                TickLocalRide();
+                RiderSleepEnergy.Tick();   // review #4 MAJOR: energy regen for a rider's car sleep
+                TickDeposit();          // walk-to-deposit: deposit on arrival (proximity/timeout poll)
+                TickRemoteRiders();
+                TickOffMeshWatchdog();  // RIDE-EXIT-1: recover a player stranded off the NavMesh on foot
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Ride] Update: {ex.Message}"); }
+        }
+
+        // ── click-to-board + hover outline (mirrors a driver entering: hover → click) ──
+        private static string _hovered = "";
+        /// <summary>Cursor is currently over one of our vehicle ghosts — suppresses native click-to-move so a
+        /// ghost click behaves like an interactive-entity click (the mod handles it) instead of walking there.</summary>
+        public static bool IsHoveringGhost => _hovered != "";
+        private static readonly List<(GameObject go, int layer)> _hiLayers = new();
+        private static int _outlineLayer = -2;   // -2 = unresolved
+        private static int _pickMask;   // 0 = unresolved; the game's hover-layer mask (built once)
+#if BAMP_DEV
+        private static float _nextMissLog;
+#endif
+
+        // The game's own cursor-hover layer mask (= MouseController.DefaultObjectTypes), replicated so the
+        // passenger pick is IDENTICAL to the owner's car-hover (same layers, solid-only). Built once.
+        private static int PickMask()
+        {
+            if (_pickMask == 0)
+            {
+                _pickMask = LayerMask.GetMask("InteractiveItems", "InteractiveItemsOutlined", "Buildings",
+                                              "BuildingsOutlined", "Vehicles", "PlayerVehicles", "Ground");
+                if (_pickMask == 0) _pickMask = ~0;   // layer names not found — fall back to everything
+            }
+            // H-SVC-113 (2026-09-02): service look-alikes sit on the layer Gley brakes for (resolved from the traffic
+            // system's own LayerSetup, usually already in the list above); include it so they stay clickable either way.
+            int svc = TrafficSync.ServiceColliderLayer();
+            return svc >= 0 ? _pickMask | (1 << svc) : _pickMask;
+        }
+
+        private static void TickHoverHighlight()
+        {
+            if (PassengerSync.IsRiding(MPConfig.PlayerId)) { ClearHighlight(); return; }
+            if (VehicleStoragePanel.IsOpen) { ClearHighlight(); return; }   // storage panel up — don't world-click behind it
+
+            var cam = Camera.main;
+            string hit = "";
+#if BAMP_DEV
+            string missDbg = "";
+#endif
+            if (cam != null)
+            {
+                try
+                {
+                    // IDENTICAL to the native owner-highlight (MouseController.Run): the game's own hover
+                    // layer mask, 600 m, SOLID-only (QueryTriggerInteraction.Ignore). No invented range or
+                    // trigger params — the same query the game uses to outline a hovered car for the driver.
+                    // The earlier ~0 mask hit ground/clutter first ("too small"); triggers made it "too big".
+                    // GhostIdFor maps the hit to a ghost and returns "" for ground/buildings, so when the
+                    // cursor is over a ghost car the first solid hit is the car body — exactly like native.
+                    var ray = cam.ScreenPointToRay(Input.mousePosition);
+                    if (Physics.Raycast(ray, out var rh, 600f, PickMask(), QueryTriggerInteraction.Ignore) && rh.transform != null)
+                    {
+                        hit = VehicleManager.GhostIdFor(rh.transform);
+#if BAMP_DEV
+                        if (hit == "") missDbg = $"{(rh.collider != null ? rh.collider.name : "?")}@{rh.distance:F1}m(L{rh.transform.gameObject.layer})";
+#endif
+                    }
+                }
+                catch { }
+            }
+#if BAMP_DEV
+            // DIAG:INVESTIGATION(passenger-highlight) — if we're pointing near a car but mapping no
+            //   ghost, log the nearest non-ghost hit (throttled) so a persistent miss is diagnosable
+            //   without another test cycle. A successful hover logs below on change instead.
+            if (hit == "" && missDbg != "" && Time.unscaledTime > _nextMissLog)
+            {
+                _nextMissLog = Time.unscaledTime + 1f;
+                Plugin.Logger.LogInfo($"[RideHi] hover MISS — nearest non-ghost hit {missDbg} (no ghost mapped under cursor)");
+            }
+#endif
+            // Locked cars STILL highlight (so you can tell they're interactable) — clicking one
+            // tells you it's locked instead of boarding.
+            if (hit != _hovered)
+            {
+#if BAMP_DEV
+                // DIAG:INVESTIGATION(passenger-highlight) — is the cursor actually hitting a ghost,
+                //   and did the outline layer resolve? Distinguishes "raycast misses" from "outline
+                //   resolved but not rendering" (you reported not seeing the highlight this build).
+                if (hit != "")
+                    Plugin.Logger.LogInfo($"[RideHi] hover ghost '{hit}' locked={PassengerSync.IsLocked(hit)} outlineLayer={OutlineLayer()}");
+#endif
+                ClearHighlight(); if (hit != "") SetHighlight(hit); _hovered = hit;
+            }
+            // Car package (2026-08-25): process a click ONCE, on RELEASE, with native click
+            // semantics — the old mouse-DOWN trigger fired a full frame-and-a-half before the
+            // game's own mouse-UP handler and the two decided the same click twice from different
+            // trunk copies. Native parity: a press that drifted >7px is a drag, not a click
+            // (MouseController's hold guard), and clicks over UI don't reach the world.
+            if (Input.GetMouseButtonDown(0)) { _pressed = true; _pressPos = Input.mousePosition; }
+            if (Input.GetMouseButtonUp(0))
+            {
+                bool wasPress = _pressed; _pressed = false;
+                if (wasPress && _hovered != ""
+                    && (Input.mousePosition - _pressPos).magnitude <= 7f
+                    && !(UnityEngine.EventSystems.EventSystem.current != null
+                         && UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject()))
+                    RouteGhostClick(_hovered, "hover");
+            }
+        }
+
+        private static bool    _pressed;
+        private static Vector3 _pressPos;
+        private static int     _routedClickFrame = -1;
+
+        /// <summary>THE single ghost-click entry (car package, 2026-08-25). Both detectors — the
+        /// native VehicleController.OnIoLeftClick prefix (drivable ghosts keep their controller)
+        /// and the mod's own hover release-branch (stripped ghosts native cannot resolve) — land
+        /// here; both fire on the same release frame, so the frame token makes whichever runs
+        /// second a no-op. The token is deliberately vid-BLIND (review M4, accepted): keying it
+        /// (frame,vid) would let one physical click fire TWO different ghosts — strictly worse
+        /// than the rare overlapping-ghosts frame dropping one route (the next click serves it).
+        /// Every decision reads live state inside HandleUnlockedClick.</summary>
+        internal static void RouteGhostClick(string vid, string via)
+        {
+            if (string.IsNullOrEmpty(vid)) return;
+            if (Time.frameCount == _routedClickFrame) return;   // this click is already decided
+            _routedClickFrame = Time.frameCount;
+            Plugin.Logger.LogInfo($"[Ride] ghost click '{vid}' via {via}.");
+            // H-SVC-112 (field 2026-09-02): a SERVICE car (private driver / arrival car) is ridable by anyone — no lock,
+            // no key. Service ids never receive a lock message and would read LOCKED by default; ordinary cars keep
+            // the lock/grant rule below untouched (this branch is keyed on the service flag alone).
+            if (VehicleManager.IsServiceGhost(vid)) { HandleUnlockedClick(vid); return; }
+            // A granted player holds a "key": the lock doesn't apply to them (ride + cargo).
+            if (PassengerSync.IsLocked(vid) && !GrantSync.IsGranted(VehicleManager.OwnerIdFor(vid), MPConfig.PlayerId))
+                PassengerHud.Toast("Vehicle locked.");
+            else HandleUnlockedClick(vid);
+        }
+
+        private static void SetHighlight(string vid)
+        {
+            int layer = OutlineLayer();
+            if (layer < 0) return;   // unresolved — skip the visual; click-to-board still works
+            var t = VehicleManager.GhostTransform(vid);
+            if (t == null) return;
+            int n = 0;
+            foreach (var r in t.GetComponentsInChildren<Renderer>(true))
+            {
+                if (r == null) continue;
+                // NEVER capture the outlined layer as the "original" (round-14 #2): a GRANTED proxy is a
+                // REGISTERED vehicle, so the game's own hover (MouseController → OnIoEnter → SetOutline)
+                // outlines it too — capturing that as the restore target made ClearHighlight faithfully
+                // "restore" the outline = a highlight that never goes away. Restore to the vehicles layer.
+                int orig = r.gameObject.layer;
+                if (orig == layer) orig = LayerHelper.VehiclesLayerIndex;
+                _hiLayers.Add((r.gameObject, orig));
+                r.gameObject.layer = layer;
+                n++;
+            }
+#if BAMP_DEV
+            // DIAG:INVESTIGATION(passenger-highlight) — n=0 means the ghost has no renderers to
+            //   outline; n>0 but no visible outline means the game's outline pass isn't drawing our
+            //   ghosts on that layer (→ different fix needed).
+            Plugin.Logger.LogInfo($"[RideHi] highlight '{vid}': {n} renderer(s) → layer {layer}");
+#endif
+        }
+
+        private static void ClearHighlight()
+        {
+            for (int i = 0; i < _hiLayers.Count; i++)
+                if (_hiLayers[i].go != null) _hiLayers[i].go.layer = _hiLayers[i].layer;
+            _hiLayers.Clear();
+            // Belt (round-14 #2): whatever the native hover did in parallel, no renderer on the ghost we
+            // just left may stay outlined — force any stragglers back to the vehicles layer.
+            if (_hovered != "") VehicleManager.ClearGhostHighlight(_hovered);
+            _hovered = "";
+        }
+
+        // Resolve the game's outline layer once (reflection — tolerates a renamed field, see
+        // ANTIPATTERNS class 3; null-checked + logged, and the highlight is optional).
+        private static int OutlineLayer()
+        {
+            if (_outlineLayer != -2) return _outlineLayer;
+            _outlineLayer = -1;
+            try
+            {
+                var ty = AccessTools.TypeByName("LayerHelper")
+                      ?? AccessTools.TypeByName("Helpers.LayerHelper")
+                      ?? AccessTools.TypeByName("BigAmbitions.LayerHelper");
+                if (ty != null)
+                {
+                    var fi = ty.GetField("InteractiveItemsOutlinedLayerIndex", BindingFlags.Public | BindingFlags.Static);
+                    if (fi != null) _outlineLayer = (int)fi.GetValue(null);
+                    else
+                    {
+                        var pi = ty.GetProperty("InteractiveItemsOutlinedLayerIndex", BindingFlags.Public | BindingFlags.Static);
+                        if (pi != null) _outlineLayer = (int)pi.GetValue(null);
+                    }
+                }
+            }
+            catch { }
+            if (_outlineLayer < 0)
+                Plugin.Logger.LogWarning("[Ride] outline layer unresolved — hover highlight off (click-to-board still works).");
+            return _outlineLayer;
+        }
+
+        internal static void RequestBoard(string vehicleId)
+        {
+            if (MPServer.IsRunning) MPServer.HostBoardRequest(vehicleId);
+            else                    MPClient.SendBoardRequest(vehicleId);
+        }
+
+        // A non-owner clicked an UNLOCKED vehicle. Routing mirrors the native CTA:
+        //   • Genuinely controlling a flatbed/hand-truck → LOOT the target into it.
+        //   • Genuinely driving a car / on a scooter → no interaction (can't board or loot from there).
+        //   • On foot, flatbed/hand-truck (0 passenger seats) → its storage list.
+        //   • On foot, CAR with trunk items → the host-style menu (Enter Vehicle / Manage Storage).
+        //   • On foot, empty car → board straight away.
+        // We key off GetCurrentVehicle() (resolves ActiveVehicleId against the LOCAL vehicle list, so it's
+        // null on foot AND for a stale/unresolvable id) rather than raw IsUsingVehicle — the latter is just
+        // "ActiveVehicleId set", which a stale ghost id makes wrongly true and false-blocked an on-foot
+        // player with "Not while driving". Seat count is from the ghost's type + authored table (client-safe).
+        private static void HandleUnlockedClick(string vid)
+        {
+            string owner = VehicleManager.OwnerIdFor(vid);
+
+            // 2026-09-02: a mirrored private-driver / arrival car rides like a taxi without a fare — stop it, walk over,
+            // open the game's destination map (.modding/03-systems/private-driver-mp.md C). Never boarded/borrowed.
+            // Review MINOR-3: decided BEFORE the item-in-hands branch — a driver is never a container.
+            if (VehicleManager.IsServiceGhost(vid))
+            {
+                if (VehicleHelper.GetCurrentVehicle() == null) ServiceCars.RideFromGhost(vid, owner);
+                return;
+            }
+
+            // Holding an item on foot → walk to the vehicle's cargo-loading spot (the same place the owner
+            // goes) and deposit on arrival — mirrors VehicleController.MoveAndAddHeldItemToStorage. Cars AND carts.
+            if (VehicleHelper.GetCurrentVehicle() == null && PlayerHelper.ItemInstanceInHands != null)
+            {
+                WalkAndDeposit(vid, owner);
+                return;
+            }
+
+            bool hasCargo = VehicleManager.GhostCargoFor(vid).Count > 0;
+
+            var cur = VehicleHelper.GetCurrentVehicle();
+            if (cur != null)
+            {
+                bool canStore = cur.VehicleType != null && cur.VehicleType.spawnInPlayerObject && cur.VehicleType.maxCargoCapacity > 0;
+                if (canStore)   // pushing a flatbed/hand-truck
+                {
+                    // Parity with the owner (round-14 #1, refining round-12 #1a): the registered proxy already
+                    // opens the NATIVE vehicle menu on this same click, and the owner only deposits when its
+                    // "add items to storage" BUTTON is pressed — round-12's click-time auto-deposit beat the
+                    // menu to the choice. A LOADED truck now does nothing here (the button routes through the
+                    // MoveAndAddHandTruckItems redirect in VehicleProxyCargoGuard); an empty one keeps the
+                    // pre-round-12 take flow.
+                    bool truckLoaded = cur.cargoInstances != null && cur.cargoInstances.Count > 0;
+                    if (truckLoaded)   { /* the native menu owns the choice */ }
+                    else if (hasCargo) VehicleStoragePanel.Open(vid, owner);
+                    else               PassengerHud.Toast("Nothing to take.");
+                }
+                // else: driving a car / on a scooter — nothing to do here; stay silent rather than nag.
+                return;
+            }
+
+            // Round-33: pushed hand-vehicles (flatbed / hand truck) mirror the OWNER's interaction — click =
+            // take the handle and push, NO Enter/Manage window (that overlay is a car thing; user 2026-07-04).
+            // Once pushing, the proxy is a real local vehicle: its cargo shows and routes through the native
+            // flows (VehicleProxyCargoGuard redirects the mutations to the owner). Non-key-holders keep the
+            // storage panel below — unlocked-cart storage access is deliberate existing design.
+            bool pushedType = false;
+            try
+            {
+                var vt = Vehicles.VehicleTypes.VehicleTypeHelper.GetVehicleType(VehicleManager.TypeNameFor(vid));
+                pushedType = vt != null && vt.spawnInPlayerObject;
+            }
+            catch { }
+            if (pushedType && VehicleManager.CanDriveGhost(vid))
+            {
+                VehicleManager.TryDriveGhost(vid);
+                return;
+            }
+
+            // On foot. A granted key-holder DRIVES — but a vehicle WITH cargo offers the same Drive-vs-Storage
+            // choice the owner gets (was: drove immediately, ignoring the choice popup — bug #3, run-2026-06-29).
+            if (VehicleManager.CanDriveGhost(vid))
+            {
+                if (hasCargo) VehicleStoragePanel.OpenChoice(vid, owner, () => VehicleManager.TryDriveGhost(vid));
+                else          VehicleManager.TryDriveGhost(vid);
+                return;
+            }
+
+            // Not a key-holder → ride as a passenger (with the same cargo choice).
+            int seats = PassengerSync.PassengerSeatsForType(VehicleManager.TypeNameFor(vid));
+            if (seats <= 0)
+            {
+                if (hasCargo) VehicleStoragePanel.Open(vid, owner);
+                else          PassengerHud.Toast("Nothing to take.");
+                return;
+            }
+            if (hasCargo) VehicleStoragePanel.OpenChoice(vid, owner, () => RequestBoard(vid));
+            else          RequestBoard(vid);
+        }
+
+        // Walk to the vehicle's cargo-loading spot (the same place the owner would) and deposit what the
+        // accessor carries (hands or pushed hand-truck — RequestDeposit resolves the source) on arrival —
+        // mirrors VehicleController.MoveAndAddHeldItemToStorage. Falls back to depositing in place if we
+        // can't resolve a spot or the walk can't be issued.
+        internal static void WalkAndDeposit(string vid, string owner)
+        {
+            try
+            {
+                var pc = PlayerHelper.PlayerController;
+                var ghost = VehicleManager.GhostTransform(vid);
+                Vector3 spot = VehicleManager.LoadingSpotFor(vid);
+                if (pc == null || ghost == null || spot == Vector3.zero)
+                {
+                    VehicleStorageSync.RequestDeposit(vid, owner);   // can't walk → deposit in place
+                    VehicleManager.ClearGhostHighlight(vid);         // round-12 #3: our flow ends without a hover-exit
+                    return;
+                }
+                // Walk to the loading spot; deposit when we ARRIVE — polled by proximity/timeout in TickDeposit.
+                // (SetGoal's arrival callback is unreliable for ghosts; boarding uses the same atCar/timeout poll.)
+                _depVid = vid; _depOwner = owner; _depSpot = spot; _depDeadline = Time.unscaledTime + 10f;
+                pc.SetGoal(spot, new UnityEngine.Events.UnityAction(() => { }));
+            }
+            catch { VehicleStorageSync.RequestDeposit(vid, owner); VehicleManager.ClearGhostHighlight(vid); }
+        }
+
+        // Deposit when the player reaches the loading spot (proximity) or after a timeout backstop — mirrors the
+        // boarding atCar/_pinFallback poll instead of SetGoal's unreliable arrival callback.
+        private static void TickDeposit()
+        {
+            if (_depVid == "") return;
+            bool arrived = false;
+            try
+            {
+                var ch = PlayerHelper.PlayerController?.Character;
+                if (ch != null) arrived = Vector3.Distance(ch.transform.position, _depSpot) < 1.5f;
+            }
+            catch { }
+            if (arrived || Time.unscaledTime >= _depDeadline)
+            {
+                string vid = _depVid, owner = _depOwner;
+                _depVid = ""; _depOwner = "";   // clear first so the deposit fires exactly once
+                VehicleStorageSync.RequestDeposit(vid, owner);
+                VehicleManager.ClearGhostHighlight(vid);   // round-12 #3: our flow ends without a hover-exit
+            }
+        }
+
+        /// <summary>Leave the current ride (called by the passenger HUD's Exit Vehicle button).</summary>
+        internal static void RequestExit()
+        {
+            string vid = PassengerSync.LocalRidingVehicleId;
+            if (string.IsNullOrEmpty(vid)) return;
+            if (MPServer.IsRunning) MPServer.HostExit(vid);
+            else                    MPClient.SendPassengerExit(vid);
+        }
+
+        /// <summary>The transform of the car we're riding: the spawned ghost normally, OR — when WE own the
+        /// car (on our screen it's the real native vehicle, not a ghost) — our real vehicle by id. Lets the
+        /// OWNER ride their own car (driven by a borrower) and keep resolving it AFTER the borrower releases
+        /// the drive — so the ride doesn't false-trip "car gone" and the exit lands at the car's CURRENT door,
+        /// not the door we boarded from (the body stays parked there all ride, see StartPin). For a normal
+        /// passenger riding someone else's ghost the fallback is null (not our car), so behavior is unchanged.</summary>
+        private static Transform? RideCar(string vid)
+            => VehicleManager.GhostTransform(vid) ?? VehicleManager.LocalVehicleTransform(vid);
+
+        // ── local ride state machine (driven by PassengerSync.LocalRidingVehicleId) ──
+        private static void TickLocalRide()
+        {
+            HookParking();   // PASS-PARKING-1: once per process
+            string target = PassengerSync.LocalRidingVehicleId;
+
+            if (target != _localVeh)
+            {
+                if (string.IsNullOrEmpty(target)) EndLocalRide(beside: true);
+                else BeginLocalRide(target, PassengerSync.LocalSeat);
+            }
+
+            if (_localVeh == "") return;
+
+            var ghost = RideCar(_localVeh);
+            if (ghost == null)
+            {
+                // Our ridden car isn't here — either still spawning (board just approved) or it drove
+                // off / the owner left. Wait briefly; if it's truly gone, ask the host to release our
+                // seat so we don't hold a phantom occupancy. NEVER pin without a car — that used to
+                // freeze + hide the player in place ("got the Exit button but never got in").
+                if (_ghostGoneSince < 0f) _ghostGoneSince = Time.unscaledTime;
+                else if (Time.unscaledTime - _ghostGoneSince > 3f)
+                {
+                    // Car stayed gone — owner drove far / desynced / DISCONNECTED. Disembark LOCALLY:
+                    // revert to our normal avatar + restore camera/movement even if the host is gone
+                    // and can never confirm the exit. Never leave the passenger stuck hidden + frozen.
+                    RequestExit();                                 // best-effort host notify (no-op if host gone)
+                    PassengerSync.ApplyExit(MPConfig.PlayerId);    // clear our local ride mirror (prevents re-begin)
+                    EndLocalRide(beside: false);                   // ToggleVisibility(true) + unlock + restore camera
+                }
+                return;
+            }
+            _ghostGoneSince = -1f;
+
+            TickFollowGoal();   // [PassFollow] reconcile toward the driver's latest building transition (survives fast cycles)
+
+            // Become "seated" (which is what shows the Exit HUD) only once we've actually REACHED the
+            // car — not on a short timer while still walking up, and not if we never make it. The
+            // timeout is just a backstop for a failed walk path (then we warp into the seat).
+            if (!_pinned)
+            {
+                var ch = PlayerHelper.PlayerController?.Character;
+                bool atCar = ch != null &&
+                             Vector3.Distance(ch.transform.position, ghost.TransformPoint(DoorLocal(_localSeat))) < 2.5f;
+                // [PassFollow] after following the driver through a building transition, re-pin as soon as
+                // we and the ghost are co-located again (same scene — the ghost teleports to the new scene
+                // a beat after we transition), without waiting for the 2.5 m walk or the fallback timeout.
+                bool followReady = _following && ch != null && Vector3.Distance(ch.transform.position, ghost.position) < 30f;
+                if (atCar || followReady || Time.unscaledTime >= _pinFallback) { _following = false; StartPin(); }
+            }
+            else
+            {
+                // [PassFollow] Host-modeled camera, re-asserted every frame while pinned. The host's live
+                // cam stays IndoorVehicleCam (inside) / VehicleCam (outside) following the driven car; we
+                // mirror that, pointing Follow at the ghost. The building-entry transition switches the live
+                // cam to the on-foot IndoorCam (one-shot), so a single assignment at StartPin gets stranded
+                // — re-asserting wins it back the next frame. Idempotent (see EnsureRideCamera), so no flicker.
+                EnsureRideCamera(ghost);
+            }
+        }
+
+        private static void BeginLocalRide(string vehicleId, int seat)
+        {
+            _localVeh = vehicleId; _localSeat = seat; _pinned = false; _following = false;
+            _exitRequested = false; _ghostGoneSince = -1f; _camSaved = false; _goal = FollowGoal.None;
+            _camNotLiveSince = -1f; _camReassertLogged = false; _noGhostLogged = false; _noCamLogged = false;   // RIDECAM-1: per-ride once-flags
+            _pinFallback = Time.unscaledTime + 10f;   // backstop only: warp into the seat if the walk fails
+
+            var pc = PlayerHelper.PlayerController;
+            var ghost = VehicleManager.GhostTransform(vehicleId);
+            if (pc == null || ghost == null) return;   // no car yet — TickLocalRide waits / pins later
+            try
+            {
+                Vector3 door = ghost.TransformPoint(DoorLocal(seat));
+                pc.SetGoal(door, new UnityEngine.Events.UnityAction(StartPin));   // walk; pin on arrival
+            }
+            catch { /* walk failed — the pin fallback in TickLocalRide still seats us */ }
+        }
+
+        // ── the "in the car" transition — the EXACT native enter calls (minus ownership/drive) ──
+        private static Transform? _savedVcFollow,  _savedVcLook;    // [PassFollow] vehicleCamera originals (restored on exit)
+        private static Transform? _savedIvcFollow, _savedIvcLook;   // [PassFollow] indoorVehicleCamera originals (restored on exit)
+        private static bool       _camSaved;         // [PassFollow] captured both vehicle cams' pre-ride Follow yet?
+        private static bool       _camIndoor;        // [PassFollow] last asserted vehicle cam (true=indoorVehicleCamera)
+        private static float      _camNotLiveSince = -1f;   // RIDECAM-1: when the brain first reported us not live (-1 = live)
+        private static bool       _camReassertLogged;       // RIDECAM-1 (F1): one "ride cam not live" WARNING per ride
+        private static bool       _noGhostLogged, _noCamLogged;   // RIDECAM-1 (B2): one line per ride each
+        private static int        _followDiag;              // RIDECAM-1 (B3): capped at 40 lines per session
+
+        private static void StartPin()
+        {
+            if (_pinned || _localVeh == "") return;
+            _pinned = true;
+            try
+            {
+                var pc = PlayerHelper.PlayerController;
+                var ghost = VehicleManager.GhostTransform(_localVeh);
+                if (pc == null) return;
+                // RIDE-EXIT-1: remember where the real body is parked for this ride. It is a place the
+                // player legally walked to, so it is the last-resort exit spot when neither the ghost's
+                // pose nor a 25 m sample around it lands on the NavMesh.
+                try { var pch = pc.Character; _parkedValid = pch != null; if (pch != null) _parkedPos = pch.transform.position; }
+                catch { _parkedValid = false; }
+                // Same thing entering a car does (VehicleController/CarController.EnterVehicle): hide
+                // the avatar, lock independent movement, switch to the vehicle camera — minus the two
+                // driver-only lines (ActiveVehicleId + controlledByPlayer), which we must NOT set on
+                // another player's car. The camera is pointed at the ghost since it isn't our own.
+                try { pc.Character?.ToggleVisibility(false); } catch { }   // avatar disappears (native)
+                SetVehicleNavBlocker(true);                                // movement locked (native)
+                EnsureRideCamera(ghost);                                   // camera → car view (host-modeled; re-asserted each frame by TickLocalRide)
+                // The real character stays parked invisibly at the boarding door; drop its
+                // colliders + controller so it isn't a phantom obstacle there (passing traffic
+                // braking for it, players bumping it). Restored in EndLocalRide.
+                try
+                {
+                    var ch = pc.Character;
+                    if (ch != null)
+                    {
+                        _seatedColliders.Clear();
+                        foreach (var col in ch.GetComponentsInChildren<Collider>(true))
+                            if (col != null && col.enabled) { _seatedColliders.Add(col); col.enabled = false; }
+                        _seatedController = ch.GetComponentInChildren<CharacterController>(true);
+                        if (_seatedController != null && _seatedController.enabled) _seatedController.enabled = false;
+                        else _seatedController = null;
+                    }
+                }
+                catch { }
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Ride] StartPin: {ex.Message}"); }
+        }
+
+        /// <summary>The game's own movement lock (PlayerController.SetNavigationBlocker) via reflection
+        /// — same registry as Map/Sleep/etc.; the enum isn't directly referenceable. Vehicle = 26.</summary>
+        private static void SetVehicleNavBlocker(bool blocked)
+        {
+            try
+            {
+                var pc = PlayerHelper.PlayerController;
+                if (pc == null) return;
+                var m = pc.GetType().GetMethod(blocked ? "SetNavigationBlocker" : "UnsetNavigationBlocker",
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (m == null) return;
+                var enumType = m.GetParameters()[0].ParameterType;
+                m.Invoke(pc, new[] { System.Enum.ToObject(enumType, 26) });   // NavigationBlocker.Vehicle
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Ride] navblock: {ex.Message}"); }
+        }
+
+        // Capture both vehicle cams' pre-ride Follow/LookAt once, so EndLocalRide can fully restore them.
+        // The game leaves these bound to the local player; if we leave one chasing our ghost, the
+        // passenger's OWN future driving camera would track the wrong (possibly destroyed) transform.
+        private static void SaveCamsOnce(GameManager gm)
+        {
+            if (_camSaved) return;
+            _camSaved = true;
+            if (gm.vehicleCamera != null)       { _savedVcFollow  = gm.vehicleCamera.Follow;       _savedVcLook  = gm.vehicleCamera.LookAt; }
+            if (gm.indoorVehicleCamera != null) { _savedIvcFollow = gm.indoorVehicleCamera.Follow; _savedIvcLook = gm.indoorVehicleCamera.LookAt; }
+        }
+
+        // Host-modeled live camera while riding. Confirmed by probe: the HOST's live cam is IndoorVehicleCam
+        // (inside) / VehicleCam (outside), prio=1, following the driven car. We mirror that exactly, but
+        // point Follow at the synced ghost (we're not the driver) and pick indoor vs outdoor by
+        // BuildingManager.IsInsideBuilding (CarController.UpdateCamera does the same). Idempotent and
+        // re-asserted every frame by TickLocalRide: the building-entry transition switches the live cam to
+        // the on-foot IndoorCam (BuildingManager.cs:517), so we just re-claim Priority the next frame. The
+        // GetCurrentCamera()!=cam guard means we only call SetCamera when not already live → no flicker.
+        // RIDECAM-1 (F1, 2026-09-17): the brain "am I live?" read below is a DIAGNOSTIC ONLY — we never cut
+        // or re-assert on it. A vcam we cannot see in AllCameras is not ours to take back, and the instant
+        // re-assert this used to fire broke every later blend in the session (see the note at the read).
+        private static void EnsureRideCamera(Transform? ghost)
+        {
+            // RIDECAM-1 (B2): this was a silent return, so "the camera never moved" read identically to
+            // "there was nothing to follow". One line per ride tells the two apart.
+            if (ghost == null)
+            {
+                if (!_noGhostLogged)
+                { _noGhostLogged = true; Plugin.Logger.LogInfo($"[RideCam] no ghost (indoor={_camIndoor}) — nothing to follow"); }
+                return;
+            }
+            // Bug (2026-06-30): while the city map is open, YIELD the camera to the game's map view. We re-claim
+            // Priority every frame, which was stealing the camera straight back from the map (the owner-passenger's
+            // map opened but the view stayed on the car). CityMap.IsOpen is the game's own map-state flag; we
+            // re-assert the ride cam the frame the map closes.
+            if (CityMap.IsOpen) { _camNotLiveSince = -1f; return; }
+            try
+            {
+                var gm = InstanceBehavior<GameManager>.Instance;
+                if (gm == null) return;
+                SaveCamsOnce(gm);
+                _camIndoor = BuildingManager.IsInsideBuilding;
+                var cam = _camIndoor ? gm.indoorVehicleCamera : gm.vehicleCamera;
+                // RIDECAM-1 (B2): an indoor layout with no indoorVehicleCamera left cam null and the ride
+                // camera silently stopped being asserted — fall back to the outdoor vehicle cam.
+                if (cam == null && _camIndoor) { cam = gm.vehicleCamera; _camIndoor = false; }
+                if (cam == null)
+                {
+                    if (!_noCamLogged)
+                    { _noCamLogged = true; Plugin.Logger.LogInfo($"[RideCam] no camera (indoor={BuildingManager.IsInsideBuilding}) — nothing to follow"); }
+                    return;
+                }
+                if (cam.Follow != ghost)
+                {
+                    string oldName = cam.Follow != null ? cam.Follow.name : "-";
+                    cam.Follow = ghost; cam.LookAt = ghost;
+                    if (_followDiag < 40)   // RIDECAM-1 (B3), capped per session
+                    {
+                        _followDiag++;
+                        string brainLive = "-", prio1 = "-";
+                        try { brainLive = CameraHelper.GetCinemachineBrain()?.ActiveVirtualCamera?.Name ?? "-"; } catch { }
+                        try { prio1 = CameraHelper.GetCurrentCamera()?.name ?? "-"; } catch { }
+                        Plugin.Logger.LogInfo($"[RideCam] follow '{oldName}' -> '{ghost.name}' cam={cam.name} indoor={_camIndoor} brainLive={brainLive} prio1={prio1} seated={IsSeated}");
+                    }
+                }
+                if (CameraHelper.GetCurrentCamera() != cam) CameraHelper.SetCamera(cam);
+
+                // RIDECAM-1 (B1 read, F1 fix): GetCurrentCamera() is a PRIORITY read (CameraHelper.cs:23-25,
+                // FirstOrDefault(Priority==1)) and SetCamera only writes priorities and waits on the brain.
+                // A third-party camera vcam outside AllCameras is invisible to both, so the guard above
+                // believed it held the camera while another vcam actually rendered (bundle 20260917-220453).
+                // Ask the BRAIN who is live — and then do NOTHING but say so. The instant re-assert this used
+                // to fire was hosted on the target cam, and SetCameraInstant (Helpers/CameraHelper.cs:87-90)
+                // calls StopAllCoroutines() on the Priority-1 camera — itself — so its restore block never ran
+                // and every camera blend for the rest of the session became a hard cut; and against a foreign
+                // vcam it can never win the view anyway, so it looped every 0.5 s forever.
+                if (!_pinned) { _camNotLiveSince = -1f; return; }
+                bool live = true;
+                try { live = CameraHelper.GetCinemachineBrain()?.IsLive(cam) ?? true; } catch { }
+                if (live) { _camNotLiveSince = -1f; return; }
+                if (_camNotLiveSince < 0f) { _camNotLiveSince = Time.unscaledTime; return; }
+                if (Time.unscaledTime - _camNotLiveSince < 2f) return;
+                if (!_camReassertLogged)
+                {
+                    _camReassertLogged = true;
+                    string liveName = "-";
+                    try { liveName = CameraHelper.GetCinemachineBrain()?.ActiveVirtualCamera?.Name ?? "-"; } catch { }
+                    Plugin.Logger.LogWarning($"[RideCam] ride cam not live for 2 s — another camera holds the view (brainLive='{liveName}') — a camera mod? (RIDECAM-1)");
+                }
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Ride] camera assert (RIDECAM-1): {ex.Message}"); }
+        }
+
+        private static void RestoreCamera()
+        {
+            try
+            {
+                var gm = InstanceBehavior<GameManager>.Instance;
+                if (gm == null) return;
+                // Restore BOTH vehicle cams to their pre-ride Follow (so the player's own future driving
+                // camera doesn't chase our ghost), then hand back to the matching on-foot cam — indoorCamera
+                // inside, pedestrianCamera outside (mirrors BuildingManager.cs:517 / CarController.cs:502).
+                if (_camSaved)
+                {
+                    if (gm.vehicleCamera != null)       { gm.vehicleCamera.Follow = _savedVcFollow;       gm.vehicleCamera.LookAt = _savedVcLook; }
+                    if (gm.indoorVehicleCamera != null) { gm.indoorVehicleCamera.Follow = _savedIvcFollow; gm.indoorVehicleCamera.LookAt = _savedIvcLook; }
+                    _camSaved = false;
+                }
+                var footCam = BuildingManager.IsInsideBuilding ? gm.indoorCamera : gm.pedestrianCamera;
+                if (footCam != null) CameraHelper.SetCamera(footCam);
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Ride] camera exit: {ex.Message}"); }
+        }
+
+        /// <summary>RIDE-EXIT-1 (second lever): a player stranded off the NavMesh on foot (river, roof,
+        /// void) can neither walk nor click-to-move, and the game ships no recovery for it. When that
+        /// state lasts 2 s outside a seat, outside a vehicle and outside a building, call the game's own
+        /// PlayerController.Unstuck() — at most once per 30 s so a genuinely off-mesh scene can't loop.</summary>
+        private static void TickOffMeshWatchdog()
+        {
+            try
+            {
+                // Review H1: only in a running world (the same gate the ride ticks use at :90/:123). IsConnected
+                // is true from transport-connect on, and a freshly spawned character reads isOnNavMesh=false
+                // during the fenced load / join snap while unscaled time keeps counting - Unstuck() there would
+                // warp the player under the mod's own WorldReady placement.
+                if (!MPServer.IsRunning && !MPClient.InMpGame) { _offMeshSince = -1f; return; }
+                // Re-check R1: InMpGame latches as soon as the player object exists during the LOAD
+                // (MPCanvasUI.cs:1047), before the startup hold, the join snap and the WorldReady placement.
+                // The readiness authority (overlay down, registrations, role ready, 3 s settled) and, on a
+                // client, "world sync applied and the fresh spawn placed" are the states this protects.
+                if (!MPWorldReady.IsSettled) { _offMeshSince = -1f; return; }
+                if (MPClient.IsConnected && (!MPClient.WorldSyncApplied || MPClient.PendingFreshSpawn)) { _offMeshSince = -1f; return; }
+                if (_localVeh != "" || IsSeated) { _offMeshSince = -1f; return; }
+                if (BuildingManager.IsInsideBuilding) { _offMeshSince = -1f; return; }
+                if (VehicleHelper.GetCurrentVehicle() != null) { _offMeshSince = -1f; return; }
+                var agent = PlayerHelper.PlayerController?.Character?.navmeshAgent;
+                if (agent == null || !agent.enabled || agent.isOnNavMesh) { _offMeshSince = -1f; return; }
+                if (_offMeshSince < 0f) { _offMeshSince = Time.unscaledTime; return; }
+                if (Time.unscaledTime - _offMeshSince < 2f) return;
+                if (Time.unscaledTime - _lastUnstuck < 30f) return;
+                _lastUnstuck = Time.unscaledTime; _offMeshSince = -1f;
+                Plugin.Logger.LogWarning("[Ride] player off the navmesh for 2 s — Unstuck() called (RIDE-EXIT-1)");
+                PlayerController.Unstuck();
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Ride] off-mesh watchdog (RIDE-EXIT-1): {ex.Message}"); }
+        }
+
+        private static void EndLocalRide(bool beside)
+        {
+            if (_localVeh == "") return;
+            try
+            {
+                var pc = PlayerHelper.PlayerController;
+                var ch = pc?.Character;
+                var ghost = RideCar(_localVeh);   // ghost, or our own real car by id once the borrower released it
+
+                // Reverse the native enter (only if we actually got in): avatar back, movement
+                // unlocked, camera restored — then teleport to the exit door (a NavMesh-sampled
+                // spot beside the car's current pose; see RIDE-EXIT-1 below).
+                if (_pinned)
+                {
+                    try { ch?.ToggleVisibility(true); } catch { }   // re-activates the character
+                    SetVehicleNavBlocker(false);
+                    RestoreCamera();
+                }
+
+                // Restore the colliders/controller we dropped while seated — UNCONDITIONAL so we
+                // can never leave the player non-physical (falling through the world) even if the
+                // pin state got confused. No-op when nothing was dropped.
+                if (_seatedColliders.Count > 0 || _seatedController != null)
+                {
+                    try { foreach (var col in _seatedColliders) if (col != null) col.enabled = true; } catch { }
+                    try { if (_seatedController != null) _seatedController.enabled = true; } catch { }
+                    _seatedColliders.Clear(); _seatedController = null;
+                }
+
+                if (ch != null)
+                {
+                    // RIDE-EXIT-1: the ghost is DEAD-RECKONED, so its current pose is an extrapolation and
+                    // can sit anywhere — including over water (bundle 20260915-225458: the rider was put in
+                    // the river, agent off-mesh, hasPath=False; the game has no water recovery). Never warp
+                    // to a raw pose: sample the NavMesh around it (5 m, then 25 m), and if both miss put the
+                    // body back where it was parked when the ride pinned.
+                    Vector3 raw = (beside && ghost != null) ? ghost.TransformPoint(DoorLocal(_localSeat)) : ch.transform.position;
+                    Vector3 outPos = raw;
+                    string sampled = "none";
+                    try
+                    {
+                        if (UnityEngine.AI.NavMesh.SamplePosition(raw, out var hit5, 5f, UnityEngine.AI.NavMesh.AllAreas))
+                        { outPos = hit5.position; sampled = "5m"; }
+                        else if (UnityEngine.AI.NavMesh.SamplePosition(raw, out var hit25, 25f, UnityEngine.AI.NavMesh.AllAreas))
+                        { outPos = hit25.position; sampled = "25m"; }
+                        else if (_parkedValid)
+                        { outPos = _parkedPos; sampled = "parked"; }
+                    }
+                    catch { }
+                    try { ch.navmeshAgent?.Warp(outPos); } catch { try { ch.transform.position = outPos; } catch { } }
+                    bool onMesh = false;
+                    try { onMesh = ch.navmeshAgent != null && ch.navmeshAgent.enabled && ch.navmeshAgent.isOnNavMesh; } catch { }
+                    Plugin.Logger.LogInfo($"[Ride] exit warp → ({outPos.x:F1},{outPos.y:F1},{outPos.z:F1}) onNavMesh={onMesh} sampled={sampled} src={(beside ? "beside" : "inplace")} ghost={_localVeh} (RIDE-EXIT-1)");
+                }
+                try { pc?.ResetNavigation(); } catch { }
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Ride] EndLocalRide: {ex.Message}"); }
+            _localVeh = ""; _localSeat = -1; _pinned = false; _following = false; _parkedValid = false;
+            _exitRequested = false; _ghostGoneSince = -1f; _goal = FollowGoal.None;
+        }
+
+        /// <summary>[PassFollow] Reverse StartPin WITHOUT ending the ride, so we stay "riding" across a
+        /// building transition: re-activate the avatar, unlock movement, restore the camera, re-enable the
+        /// colliders we dropped while seated. Leaves _localVeh intact + arms _following so TickLocalRide
+        /// re-pins to the ghost once we're co-located again in the new scene.</summary>
+        private static void SoftUnpin()
+        {
+            if (_pinned)
+            {
+                try { PlayerHelper.PlayerController?.Character?.ToggleVisibility(true); } catch { }
+                SetVehicleNavBlocker(false);
+                RestoreCamera();
+            }
+            if (_seatedColliders.Count > 0 || _seatedController != null)
+            {
+                try { foreach (var col in _seatedColliders) if (col != null) col.enabled = true; } catch { }
+                try { if (_seatedController != null) _seatedController.enabled = true; } catch { }
+                _seatedColliders.Clear(); _seatedController = null;
+            }
+            _pinned = false;
+            _following = true;                       // re-pin promptly once co-located with the ghost
+            _pinFallback = Time.unscaledTime + 10f;  // backstop only
+        }
+
+        // ── [PassFollow] follow reconciler: latest-wins desired location, applied only when settled ──
+        // The driver can transition buildings faster than our own enter/exit coroutine finishes. Instead of
+        // acting on each Follow message immediately (which drops or garbles overlapping ones — the fast
+        // enter/exit/enter case), we record the LATEST desired location and let TickFollowGoal drive toward
+        // it whenever no transition is in flight. A newer goal overwrites the older — only the vehicle's
+        // final location matters. (Aligns with "sync toward the target, don't gate on event timing".)
+        private enum FollowGoal { None, Enter, Exit }
+        private static FollowGoal _goal = FollowGoal.None;
+        private static string     _goalAddr = "";    // Enter: AddressKey of the building to reach
+        private static int        _goalExitId;       // Exit: door to leave by
+
+        /// <summary>[PassFollow] Client rider (FollowEnter msg) / host rider (relay route): the driver took
+        /// our ridden vehicle INTO building AddressKey. Record it as the goal; TickFollowGoal reconciles.</summary>
+        public static void FollowDriverIntoByAddress(string addressKey)
+        {
+            if (_localVeh == "" || string.IsNullOrEmpty(addressKey)) return;
+            _goal = FollowGoal.Enter; _goalAddr = addressKey;
+            Plugin.Logger.LogInfo($"[PassFollow] goal = Enter '{addressKey}' (riding '{_localVeh}').");
+        }
+
+        /// <summary>[PassFollow] The driver took our ridden vehicle back OUT — record "outside" as the goal.</summary>
+        public static void FollowDriverOut(int targetExitId)
+        {
+            if (_localVeh == "") return;
+            _goal = FollowGoal.Exit; _goalExitId = targetExitId;
+            Plugin.Logger.LogInfo($"[PassFollow] goal = Exit (door {targetExitId}, riding '{_localVeh}').");
+        }
+
+        private static Buildings.Building? ResolveBuilding(string addressKey)
+        {
+            var cm = InstanceBehavior<CityManager>.Instance;
+            if (cm != null && cm.cityBuildingControllers != null)
+                foreach (var c in cm.cityBuildingControllers)
+                    if (c != null && c.building != null && GameStateReader.AddressKey(c.building) == addressKey) return c.building;
+            return null;
+        }
+
+        /// <summary>[PassFollow] Drive the passenger one step toward _goal (a building, or outside), only
+        /// while no building transition is running (enteringBuilding/exitingBuilding both clear — the game
+        /// guards re-entrant Enter/Exit anyway). Soft un-pins before each step so TickLocalRide re-pins to
+        /// the ghost once co-located in the new scene. If we're inside the WRONG building we step out first,
+        /// then enter the goal on a later tick. Clears the goal once reached.</summary>
+        private static void TickFollowGoal()
+        {
+            if (_goal == FollowGoal.None || _localVeh == "") return;
+            var bm = InstanceBehavior<BuildingManager>.Instance;
+            if (bm == null || bm.enteringBuilding || bm.exitingBuilding) return;   // wait for any transition to settle
+            try
+            {
+                if (_goal == FollowGoal.Exit)
+                {
+                    if (Parking.UndergroundParking.UndergroundParkingManager.IsInsideParking)   // PASS-PARKING-1
+                    {
+                        SoftUnpin();
+                        Parking.UndergroundParking.UndergroundParkingManager.ExitParking();
+                        return;
+                    }
+                    if (!BuildingManager.IsInsideBuilding) { _goal = FollowGoal.None; return; }   // already outside → done
+                    SoftUnpin();
+                    bm.ExitFromBuilding(_goalExitId);
+                    return;
+                }
+                // _goal == Enter
+                if (IsParkingKey(_goalAddr, out int parking)) { TickFollowParking(parking); return; }   // PASS-PARKING-1
+                if (BuildingManager.IsInsideBuilding)
+                {
+                    string here = bm.buildingRegistration != null ? GameStateReader.AddressKey(bm.buildingRegistration) : "";
+                    if (here == _goalAddr) { _goal = FollowGoal.None; return; }   // in the goal building → done
+                    SoftUnpin();
+                    bm.ExitFromBuilding(0);   // inside the WRONG building → step out first; enter on a later tick
+                    return;
+                }
+                var target = ResolveBuilding(_goalAddr);
+                if (target == null) { Plugin.Logger.LogWarning($"[PassFollow] goal Enter: can't resolve '{_goalAddr}' — dropping."); _goal = FollowGoal.None; return; }
+                SoftUnpin();
+                bm.EnterBuilding(target, false, false, 0, -1);   // 1.0 dropped 'force'; keep the goal until we confirm inside next tick
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[Ride] TickFollowGoal: {ex.Message}"); }
+        }
+
+        // ── PASS-PARKING-1 (user 2026-10-31: in an underground car park only the driver sees it, the passenger sees
+        // nothing): the game's car parks are no building - UndergroundParkingEntrance's trigger calls
+        // UndergroundParkingManager.EnterParking, which loads the car park's layout and moves the car in, on the driving
+        // machine only (no EnterBuildingWithVehicle, so the [PassFollow] building hooks never fired). The riders' machines
+        // never loaded it, so their camera followed the ghost into empty space. The driver now reports the car park
+        // through the same relay as a building, under the entrance's address ("N ba:street_parking"), and a rider enters
+        // and leaves it with the game's own EnterParking / ExitParking (as a pedestrian - the ride then re-pins to the
+        // ghost, as after a building). No Harmony patch: the manager's onEnter / onExit events (EnterParking and
+        // ExitParking themselves are tiny methods, TINY-DETOUR-1).
+        private const string ParkingStreet = "ba:street_parking";
+        private static bool _parkingHooked;
+
+        private static void HookParking()
+        {
+            if (_parkingHooked) return;
+            _parkingHooked = true;
+            Parking.UndergroundParking.UndergroundParkingManager.onEnter += OnParkingEntered;
+            Parking.UndergroundParking.UndergroundParkingManager.onExit += OnParkingLeft;
+        }
+
+        /// <summary>This machine drove (or walked) into a car park: as the driver of a car with riders, take them along.</summary>
+        private static void OnParkingEntered()
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+                string vehicleId = VehicleManager.CurrentDrivenVehicleId();
+                var entrance = Parking.UndergroundParking.UndergroundParkingManager.currentParkingEntrance;
+                if (string.IsNullOrEmpty(vehicleId) || entrance == null) return;   // on foot, or a rider's own EnterParking
+                string key = GameStateReader.AddressKey(entrance.Address);
+                if (MPServer.IsRunning) MPServer.RouteFollowEnterToRiders(vehicleId, key, MPConfig.PlayerId);
+                else MPClient.SendPassengerFollowRelayEnter(vehicleId, key);
+                Plugin.Logger.LogInfo($"[PassFollow] drove into car park '{key}' aboard '{vehicleId}' - the riders follow (PASS-PARKING-1).");
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[PassFollow] car park enter: {ex.Message}"); }
+        }
+
+        /// <summary>This machine left a car park: as the driver, the riders leave with it.</summary>
+        private static void OnParkingLeft()
+        {
+            try
+            {
+                if (!MPServer.IsRunning && !MPClient.IsConnected) return;
+                string vehicleId = VehicleManager.CurrentDrivenVehicleId();
+                if (string.IsNullOrEmpty(vehicleId)) return;
+                if (MPServer.IsRunning) MPServer.RouteFollowExitToRiders(vehicleId, 0, MPConfig.PlayerId);
+                else MPClient.SendPassengerFollowRelayExit(vehicleId, 0);
+                Plugin.Logger.LogInfo($"[PassFollow] drove out of the car park aboard '{vehicleId}' - the riders follow (PASS-PARKING-1).");
+            }
+            catch (System.Exception ex) { Plugin.Logger.LogWarning($"[PassFollow] car park exit: {ex.Message}"); }
+        }
+
+        private static bool IsParkingKey(string addressKey, out int number)
+        {
+            number = 0;
+            if (string.IsNullOrEmpty(addressKey) || !addressKey.EndsWith(" " + ParkingStreet)) return false;
+            return int.TryParse(addressKey.Substring(0, addressKey.Length - ParkingStreet.Length - 1), out number);
+        }
+
+        /// <summary>One step toward car park <paramref name="number"/>: out of a building or another car park first, then in.</summary>
+        private static void TickFollowParking(int number)
+        {
+            var current = Parking.UndergroundParking.UndergroundParkingManager.currentParkingEntrance;
+            if (Parking.UndergroundParking.UndergroundParkingManager.IsInsideParking)
+            {
+                if (current != null && current.parkingNumber == number) { _goal = FollowGoal.None; return; }   // there
+                SoftUnpin();
+                Parking.UndergroundParking.UndergroundParkingManager.ExitParking();
+                return;
+            }
+            if (current != null) return;   // the game's own enter is still running
+            if (BuildingManager.IsInsideBuilding) { SoftUnpin(); InstanceBehavior<BuildingManager>.Instance?.ExitFromBuilding(0); return; }
+            SoftUnpin();
+            if (!Parking.UndergroundParking.UndergroundParkingManager.EnterParking(number))
+            {
+                Plugin.Logger.LogWarning($"[PassFollow] goal car park {number}: the game knows no such car park - dropping.");
+                _goal = FollowGoal.None;
+                return;
+            }
+            Plugin.Logger.LogInfo($"[PassFollow] following the driver into car park {number} (PASS-PARKING-1).");
+        }
+
+        // ── remote riders rendering ──────────────────────────────────────────
+        private static void TickRemoteRiders()
+        {
+            var want = new Dictionary<string, string>();   // pid → vid (remote riders this frame)
+            foreach (var vid in PassengerSync.OccupiedVehicleIds())
+            {
+                // Resolve the vehicle's transform on THIS machine: another player's car is a ghost,
+                // but the OWNER's own car is the REAL native vehicle (not a ghost) — riders of it
+                // must be pinned to it too, else the passenger never sits on the owner's screen
+                // (and, pre-trigger-fix, kept shoving the car).
+                Transform? veh = VehicleManager.GhostTransform(vid) ?? VehicleManager.LocalVehicleTransform(vid);
+                if (veh == null) continue;
+                var riders = PassengerSync.RidersOf(vid);
+                if (riders == null) continue;
+                foreach (var kv in riders)
+                {
+                    string pid = kv.Value;
+                    if (string.IsNullOrEmpty(pid) || pid == MPConfig.PlayerId) continue;   // local ride handles us
+                    want[pid] = vid;
+                    try
+                    {
+                        RemotePlayerManager.SetDriving(pid, true);                // hide their walk model
+                        RemotePlayerManager.SetRide(pid, veh, SeatLocal(kv.Key)); // pin (nametag) to the seat
+                    }
+                    catch { }
+                }
+            }
+            // Release anyone who stopped riding since last frame.
+            if (_remotePinned.Count > 0)
+            {
+                List<string>? stale = null;
+                foreach (var kv in _remotePinned)
+                    if (!want.ContainsKey(kv.Key)) (stale ??= new List<string>()).Add(kv.Key);
+                if (stale != null)
+                    foreach (var pid in stale)
+                    {
+                        try { RemotePlayerManager.SetRide(pid, null, Vector3.zero); RemotePlayerManager.SetDriving(pid, false); } catch { }
+                        _remotePinned.Remove(pid);
+                    }
+            }
+            foreach (var kv in want) _remotePinned[kv.Key] = kv.Value;
+        }
+
+        private static void ClearRemotePins()
+        {
+            foreach (var kv in _remotePinned)
+                try { RemotePlayerManager.SetRide(kv.Key, null, Vector3.zero); RemotePlayerManager.SetDriving(kv.Key, false); } catch { }
+            _remotePinned.Clear();
+        }
+
+        // ── seat / door geometry (generic local-space; refine per car later) ─
+        // Car frame: +x right, +z forward. Seat 1 = front passenger (shotgun, right-front);
+        // 2 = rear-left, 3 = rear-right. Doors sit just outside the body on the matching side.
+        private static Vector3 SeatLocal(int seat) => seat switch
+        {
+            2 => new Vector3(-0.45f, 0.7f, -0.85f),
+            3 => new Vector3( 0.45f, 0.7f, -0.85f),
+            _ => new Vector3( 0.45f, 0.7f,  0.15f),   // 1 / default = shotgun
+        };
+        private static Vector3 DoorLocal(int seat) => seat switch
+        {
+            2 => new Vector3(-1.15f, 0f, -0.85f),
+            3 => new Vector3( 1.15f, 0f, -0.85f),
+            _ => new Vector3( 1.15f, 0f,  0.15f),
+        };
+    }
+}

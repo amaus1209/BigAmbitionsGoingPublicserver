@@ -1,0 +1,59 @@
+[h1]Going Public Server – always-on server for Big Ambitions[/h1]
+Play Big Ambitions together on a dedicated server that keeps running: the world stays when you log off, pauses while nobody is online, and you join with the server's address and server key. [b]Server and players need the same version (1.0.17).[/b]
+
+[h2]Important[/h2]
+[list]
+[*][b]Do not use other mods[/b] – neither in the game nor on the server. The built-in modules replace Immersion, BAScheduler, SmartSuite, VoogleRoute, Big Ambitions Radio, Aluna's Phone Pages, IT Business Expansion with Skill Kit, and Spotless.
+[*][b]The server comes in several variants[/b] on [url=https://github.com/amaus1209/BigAmbitionsGoingPublicServer/releases]GitHub[/url]: for AMP (Linux), as a program with a web interface for Windows and Linux, and as a Docker container.
+[*][b]Please report bugs here[/b] (comments) – with the version (bottom left in the game), what happened and, if you can, the Player.log.
+[*][b]Error reports:[/b] on servers that collect them, the game asks once whether it may send error messages to the server you play on - without the Windows user name, IP addresses, Steam IDs and keys; change it under Options, tab Mods. Nothing goes to anybody else.
+[*][b]Linux / Steam Deck:[/b] play with GE-Proton (tested: GE-Proton11-11).
+[/list]
+
+[h2]Joining[/h2]
+Subscribe and enable the mod in the mod list, then [b]Multiplayer → Join Game[/b]: host address and server key from the admin – or "Join Game" on a Steam friend. [b]Escape → Leave server[/b] saves your progress on the server.
+
+[h2]In the game[/h2]
+[list]
+[*][b]One shared world[/b]: a player's cars stay where they are when they leave; after a dropped connection the game joins again by itself.
+[*][b]Steam names and friends[/b]: names above the players, friends in green and on the map, friend requests on the phone, joining and inviting through Steam.
+[*][b]Mergers[/b]: several players' companies become one.
+[*][b]Going Online[/b] (Shift+F12): a cable provider of your own with offices, hubs and customer centers in every neighbourhood – connect buildings, sell internet, TV and phone lines, staff in six roles, DOCSIS up to fiber, against the competitor Skyline Cable; a real business in BizMan, the equipment as furniture with models of its own and blinking LEDs, service vans with your logo and number plates in the city traffic, walk-in customers at the customer center, street cabinets with your business logo and road works in the city (seen by everybody), events with a decision. Players rent each other lines on their networks. The ranking shows the players' cable providers.
+[*][b]New businesses[/b]: IT firm (IT support, software development, cloud services with servers), cleaning company (it cleans your own businesses too) and laundromat - founded in BizMan, with staff from the recruitment agencies.
+[*][b]Phone pages[/b]: the apps in pages of eight, on page 2 Chat, Business, Radio, Navigation, Planner, Insights, Camera and Signs; drag apps to rearrange them.
+[*][b]Internet radio[/b]: the game's stations, the server's and your own, favourites and search; radio on foot, shop loudspeakers; passengers hear the driver's station.
+[*][b]Navigation[/b] (Shift+F11): search a destination or click it on the map – then walk there, drive there or route only; a sat-nav on the phone with the next turn, streets, arrival and the right lane.
+[*][b]Self-driving[/b]: drives to the destination indicating and stopping at red lights, parks there (can be switched off) and can follow a friend. On foot your character walks there by itself.
+[*][b]Fast-forward time[/b]: vote together – once all agree, time runs faster.
+[*][b]F6 RPG camera[/b] (settings F8) and [b]F7 shop signs[/b] with your own pictures.
+[*][b]Livery[/b]: every vehicle you own gets its own livery – left, right, back and front each with a design, colour and logo place, plus your business's logo and name, a slogan, a contact line and a new paint colour; everybody sees it.
+[*][b]Shift+F9 Planner[/b] for schedules and opening hours, [b]Shift+F10 Insights[/b] with profit, sales, staff and real estate.
+[*][b]Chat translation[/b]: on servers that translate, you read the others' German or English lines in the language of your game, the original small below – translated on the server itself, no service on the internet; can be switched off under Options, tab Mods.
+[*][b]Crosswalks[/b]: pedestrians cross at traffic lights only when the red lasts long enough, and cars stop for them; new pedestrian lights at all crossings of the city show green.
+[*]Chat and taxes by phone, riding along with the driver's engine and radio, your own keys under Options → Controls, 23 languages.
+[/list]
+
+[h2]On the server[/h2]
+[list]
+[*]Runs around the clock without graphics, saves by itself and pauses without players; frame rate and network rate can be set.
+[*]Joining with the server key; if wanted, only players who own the game (Steam checks it), joining through Steam friends.
+[*]Choose a world or create one (difficulty, custom values), load a save once.
+[*]Every module on or off on its own; game rules for rent, building prices, loans and business sale; mergers end after a set number of days away; a radio station list per language.
+[*]Administration: an admin page in the browser (players, kick, ban with a reason, chat, ban list, announcements, restart), in AMP the chat in the console and Kick/Ban, a warning to the players before a stop.
+[*]Chat translation German–English on the server itself; the players' error reports (after they agreed) in bigambitions/player-reports, kept 14 days.
+[*]A ranking page with the players' buildings (who bought or rents which) and the server's numbers (network, FPS, ping); save backups.
+[/list]
+
+[h2]Credits[/h2]
+Unofficial fork of [url=https://github.com/Melaus123/BigAmbitionMulti]Going Public[/url] by Melaus (MIT license). The modules are our own implementations modelled on these mods (rebuilt, no code of theirs) – thanks to their authors:
+[list]
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3791985529]Immersion - RPG Camera[/url] by Chamiks
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3795741870]BAScheduler[/url] by Shanpapa
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3793254452]SmartSuite Empire Management[/url] by ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3740623471]Voogle Route[/url] with LIB BA Player Location and LIB BA Unified UI by - Capitaine -
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3792403626]Big Ambitions Radio[/url] by Antegarr
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3739104140]Aluna's Phone Pages[/url] by aluna
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3741969623]IT Business Expansion[/url] and [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3795855100]Skill Kit[/url] by Cow a Bunga
+[*][url=https://steamcommunity.com/sharedfiles/filedetails/?id=3833316897]Spotless: Cleaning Company & Laundromat[/url] by We1tall
+[/list]
+Big Ambitions belongs to Hovgaard Games; every player and the server need their own copy of the game.
