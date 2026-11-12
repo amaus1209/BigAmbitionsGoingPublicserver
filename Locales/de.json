@@ -1774,5 +1774,9 @@
     "go_spot_service": "Störung? Wir kommen",
     "go_spot_service_line": "unsere Technik ist in {0} im Einsatz",
     "go_spot_tariff_line": "{0} – {1} am Tag",
-    "go_spot_term": "Mindestlaufzeit {0} Tage"
+    "go_spot_term": "Mindestlaufzeit {0} Tage",
+    "gps_update_notice": "Server-Update auf Version {0} (Build {1}).",
+    "gps_update_new": "Neu: {0}",
+    "gps_update_workshop": "Spieler: Die Mod braucht auch die neue Version – Steam aktualisiert sie beim nächsten Spielstart (Steam Workshop).",
+    "gps_update_reason": "Update auf Version: {0} (Build {1})."
 }

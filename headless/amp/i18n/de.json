@@ -391,5 +391,13 @@
     "ChatTranslate": [
         "Chat-Übersetzung",
         "Übersetzt den Chat der Spieler zwischen Deutsch und Englisch, direkt auf diesem Server: kein Konto, kein Dienst im Internet – der Chat verlässt den Server nicht. Jede Person liest fremdsprachige Zeilen in der Sprache ihres Spiels, darunter klein das Original; abschaltbar für jede Person unter Optionen, Reiter Mods. Der erste Start richtet den Übersetzer einmalig in bigambitions/bamp-translate ein (etwa 550 MB Download, außerhalb des Spielordners, daher nicht in den Sicherungen) – das Spiel startet sofort, die Übersetzung folgt nach wenigen Minuten. Etwa 400 MB Arbeitsspeicher, solange der Server läuft. Konsolenbefehl translate <Text> zum Testen. Aus = Chat wie geschrieben, nichts wird eingerichtet oder gestartet."
+    ],
+    "AutoUpdate": [
+        "Automatische Updates",
+        "Jede Stunde schaut der Server auf GitHub nach einem neuen Build von Going Public Server (das neueste Release). Einen neuen lädt er herunter und prüft ihn, dann bekommen alle Spieler eine Meldung mit den Neuerungen, und der Server startet neu – mit der Vorwarnung unten, solange jemand spielt, sonst sofort. Bei einer neuen Versionsnummer sagt die Meldung auch, dass die Spieler die Mod aktualisieren müssen (Steam macht das beim nächsten Spielstart). Dateien des Spielordners selbst kommen weiter mit AMPs Update. Konsolenbefehl update schaut sofort nach. Aus = neue Builds nur über AMPs Update."
+    ],
+    "AutoUpdateWarnMinutes": [
+        "Automatische Updates: Vorwarnung (Minuten)",
+        "Solange Spieler auf dem Server sind, wird ein automatisches Update so viele Minuten vor dem Neustart angekündigt (Warnungen auf jedem Bildschirm, vorher wird gespeichert). 1 bis 60."
     ]
 }

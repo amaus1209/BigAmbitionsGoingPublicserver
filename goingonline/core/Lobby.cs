@@ -31,6 +31,9 @@ namespace GoingOnline
             public SeatController? Seat;
             public Transform? SeatPos;
             public ItemController? Desk;
+            public float SatAt;
+            public SeatController? DeskSeat;   // GO-LOBBY-2: the customers' seat at the desk
+            public Transform? DeskSeatPos;
         }
 
         static string _in = "";
@@ -154,18 +157,19 @@ namespace GoingOnline
                 case 1:   // looking at the devices
                     if (now >= v.Until) v.Step = 2;
                     return false;
-                case 2:   // to a seat - or straight to a desk that is free
+                case 2:   // GO-LOBBY-2: first to a waiting seat; only without a free one straight to a free desk, else they stand
                 {
-                    var desk = FreeDesk(bm);
-                    if (desk != null && Random.value < 0.35f) { GoToDesk(v, desk); return false; }
                     var (seat, pos) = FreeSeat(bm);
                     if (seat != null && pos != null)
                     {
                         v.Seat = seat; v.SeatPos = pos;
                         Walk(v, pos.position + pos.forward, NearNav(pos.position + pos.forward * 0.55f));
                         v.Step = 3;
+                        return false;
                     }
-                    else { v.Step = 5; v.Until = now + Random.Range(15f, 30f); }   // no seat: they stand and wait
+                    var desk = FreeDesk(bm);
+                    if (desk != null) { GoToDesk(v, desk); return false; }
+                    v.Step = 5; v.SatAt = now; v.Until = now + Random.Range(90f, 150f);   // they stand and wait
                     return false;
                 }
                 case 3:   // walking to the seat
@@ -173,24 +177,42 @@ namespace GoingOnline
                     {
                         v.C.StopAllCoroutines();
                         v.C.tpc.SitOnChair(v.SeatPos);
-                        v.Step = 4; v.Until = now + Random.Range(20f, 45f);
+                        v.Step = 4; v.SatAt = now; v.Until = now + Random.Range(90f, 150f);
                     }
-                    else if (v.Arrived || now > v.Until) { v.Seat = null; v.SeatPos = null; v.Step = 5; v.Until = now + Random.Range(10f, 20f); }
+                    else if (v.Arrived || now > v.Until) { v.Seat = null; v.SeatPos = null; v.Step = 5; v.SatAt = now; v.Until = now + Random.Range(90f, 150f); }
                     return false;
-                case 4:   // sitting, until a desk is free (or they have waited long enough)
+                case 4:   // GO-LOBBY-2: sitting until someone at a desk is free (a few seconds at least), then straight there
                 case 5:   // standing, the same
                 {
-                    var desk = FreeDesk(bm);
-                    if (desk != null && now >= v.Until - 15f) { StandUp(v); GoToDesk(v, desk); return false; }
-                    if (now >= v.Until + 25f) { StandUp(v); Leave(bm, v); }   // nobody came: they go
+                    var desk = now >= v.SatAt + 3f ? FreeDesk(bm) : null;
+                    if (desk != null) { StandUp(v); GoToDesk(v, desk); return false; }
+                    if (now >= v.Until) { StandUp(v); Leave(bm, v); }   // nobody was free for long: they go
                     return false;
                 }
-                case 6:   // walking to the desk
-                    if (v.Arrived) { v.Step = 7; v.Until = now + Random.Range(15f, 32f); }
-                    else if (now > v.Until) { v.Desk = null; Leave(bm, v); }
+                case 6:   // walking to the desk - GO-LOBBY-2: they sit down on the customers' seat there
+                    if (v.Arrived)
+                    {
+                        if (v.DeskSeat != null && v.DeskSeatPos != null && v.DeskSeat.IsSittingPositionAvailable(v.DeskSeatPos))
+                        {
+                            v.C.StopAllCoroutines();
+                            v.C.tpc.SitOnChair(v.DeskSeatPos);
+                        }
+                        v.Step = 7; v.Until = now + Random.Range(20f, 40f);
+                    }
+                    else if (now > v.Until) { v.Desk = null; v.DeskSeat = null; v.DeskSeatPos = null; Leave(bm, v); }
                     return false;
                 case 7:   // at the desk
-                    if (now >= v.Until) { v.Desk = null; Leave(bm, v); }
+                    if (now >= v.Until)
+                    {
+                        if (v.C.tpc.isSittingOn != null && v.DeskSeatPos != null)
+                        {
+                            var front = NearNav(v.DeskSeatPos.position + v.DeskSeatPos.forward * 0.55f);
+                            v.C.tpc.Reset();
+                            v.C.tpc.WarpSafely(front);
+                        }
+                        v.Desk = null; v.DeskSeat = null; v.DeskSeatPos = null;
+                        Leave(bm, v);
+                    }
                     return false;
                 case 8:   // walking out
                     return v.Arrived || now > v.Until;
@@ -210,8 +232,41 @@ namespace GoingOnline
         static void GoToDesk(Visitor v, ItemController desk)
         {
             v.Desk = desk;
-            Walk(v, desk.transform.position, CustomerSpot(desk));
+            var (seat, pos) = CustomerSeat(desk);
+            v.DeskSeat = seat; v.DeskSeatPos = pos;
+            if (pos != null) Walk(v, pos.position + pos.forward, NearNav(pos.position + pos.forward * 0.55f));
+            else Walk(v, desk.transform.position, CustomerSpot(desk));
             v.Step = 6;
+        }
+
+        /// <summary>GO-LOBBY-2: the customers' seat at a desk - a free seat on the same counter that is not the staff's (the
+        /// staff take the one on the screen's side, GO-COUNTER-SEAT-1, so the customers' is the one furthest the other way).</summary>
+        static (SeatController?, Transform?) CustomerSeat(ItemController desk)
+        {
+            try
+            {
+                ItemController root = desk;
+                while (root.parentItemController != null) root = root.parentItemController;
+                if (root == desk) return (null, null);
+                Vector3 at = desk.transform.position, fwd = desk.transform.forward;
+                SeatController? best = null;
+                float bestSide = 0.05f;
+                var stack = new Stack<ItemController>();
+                stack.Push(root);
+                while (stack.Count > 0)
+                {
+                    var ic = stack.Pop();
+                    if (ic == null) continue;
+                    if (ic is SeatController seat && !seat.Occupied && seat.SittingPosition != null && seat.IsSittingPositionAvailable(seat.SittingPosition))
+                    {
+                        float side = Vector3.Dot(ic.transform.position - at, fwd);
+                        if (side > bestSide) { bestSide = side; best = seat; }
+                    }
+                    foreach (var c in ic.childItemControllers) stack.Push(c);
+                }
+                return best != null ? (best, best.SittingPosition) : (null, null);
+            }
+            catch { return (null, null); }
         }
 
         static void Leave(BuildingManager bm, Visitor v)
@@ -279,7 +334,10 @@ namespace GoingOnline
                 if (!(ic is SeatController seat) || seat.Occupied && seat.SittingPosition == null) continue;
                 var pos = seat.SittingPosition;
                 if (pos == null || taken.Contains(pos) || !seat.IsSittingPositionAvailable(pos)) continue;
-                // not the employees' chairs at the desks
+                // not the seats at the desks (the staff's and the customers' there, GO-LOBBY-2: also a counter's own seats)
+                ItemController top = seat;
+                while (top.parentItemController != null) top = top.parentItemController;
+                if (top != seat && top.itemName != null && top.itemName.StartsWith("ba:itemname_specialemployeedesk")) continue;
                 bool atDesk = false;
                 foreach (var d in Desks(bm, false)) if ((d.transform.position - seat.transform.position).sqrMagnitude < 1.6f * 1.6f) { atDesk = true; break; }
                 if (!atDesk) options.Add((seat, pos));
@@ -313,6 +371,8 @@ namespace GoingOnline
                     foreach (var ws in day.workShifts)
                         if (ws != null && ws.itemInstanceId == id && ws.startingHour <= hour && ws.endingHour > hour) { on = true; break; }
                 }
+                // GO-LOBBY-2: and the person is really there (the game seated them at the workplace)
+                if (on && ic is EmployeeStationController st && st.employee == null) on = false;
                 if (on) r.Add(ic);
             }
             return r;

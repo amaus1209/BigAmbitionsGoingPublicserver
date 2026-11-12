@@ -638,13 +638,62 @@ namespace GoingOnline
                     if (itemInstance.itemName == null || !itemInstance.itemName.StartsWith("goingonline:", StringComparison.Ordinal)) return;
                     var reg = itemInstance.GetBuildingRegistration();
                     if (reg?.itemInstances == null || !reg.itemInstances.TryGetValue(itemInstance.parentId, out var parent) || parent == null) return;
-                    if (parent.itemName == "ba:itemname_specialemployeedesk" || parent.itemName == "ba:itemname_specialemployeedesksmall")
+                    if (IsCounter(parent.itemName))
                     {
                         __result = true;
                         Once("desk-counter", "desks: workplaces on a service counter count as on a desk (GO-DESK-LINK-2).");
                     }
                 }
                 catch { }
+            }
+        }
+
+        static bool IsCounter(string? name) => name == "ba:itemname_specialemployeedesk" || name == "ba:itemname_specialemployeedesksmall";
+
+        /// <summary>GO-COUNTER-SEAT-1 (user 2026-11-12, screenshot of 19 9th Avenue: "mitarbeiter hocken auf falscher seite"): a
+        /// service counter of our customer-center templates holds two seats - the staff's chair in front of the screen and the
+        /// customers' armchair behind it. The game's WorkstationController.FindChair takes the first free seat under the
+        /// counter, and the templates attached the armchair first, so the staff sat on the customers' side. For one of our
+        /// workplaces on such a counter the staff now get the free seat on the screen's side (the workplace model's screen
+        /// faces its -forward, as the templates place the staff chair); everything else keeps the game's choice. A person
+        /// already seated keeps the seat until the next shift.</summary>
+        [HarmonyPatch(typeof(Controllers.WorkstationController), nameof(Controllers.WorkstationController.FindChair))]
+        public static class Patch_WorkstationFindChair_CounterStaffSide
+        {
+            static bool Prefix(Controllers.WorkstationController __instance, bool forceCheck, ref ItemController ____chairItemController, ref ItemController __result)
+            {
+                try
+                {
+                    var name = __instance.ItemInstance?.itemName;
+                    if (name == null || !name.StartsWith("goingonline:", StringComparison.Ordinal)) return true;
+                    ItemController root = __instance;
+                    while (root.parentItemController != null) root = root.parentItemController;
+                    if (root == __instance || !IsCounter(root.ItemInstance?.itemName)) return true;
+                    if (forceCheck) { ____chairItemController = null!; __instance.employeeChair = null!; }
+                    if (____chairItemController != null && ____chairItemController.Occupied) { __result = ____chairItemController; return false; }
+                    Vector3 at = __instance.transform.position, fwd = __instance.transform.forward;
+                    ItemController? best = null;
+                    float bestSide = float.MaxValue;
+                    var stack = new Stack<ItemController>();
+                    stack.Push(root);
+                    while (stack.Count > 0)
+                    {
+                        var ic = stack.Pop();
+                        if (ic == null) continue;
+                        if (ic.Item != null && (ic.Item.type & ItemType.Seat) != 0 && !ic.Occupied)
+                        {
+                            float side = Vector3.Dot(ic.transform.position - at, fwd);   // most negative = the screen's side
+                            if (side < bestSide) { bestSide = side; best = ic; }
+                        }
+                        foreach (var c in ic.childItemControllers) stack.Push(c);
+                    }
+                    ____chairItemController = best!;
+                    __instance.employeeChair = best != null ? best.SittingPosition : null!;
+                    __result = best!;
+                    if (best != null) Once("counter-seat", "desks: staff at a service counter take the seat on the screen's side (GO-COUNTER-SEAT-1).");
+                    return false;
+                }
+                catch { return true; }
             }
         }
     }

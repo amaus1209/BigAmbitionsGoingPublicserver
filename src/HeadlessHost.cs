@@ -66,6 +66,7 @@ namespace BigAmbitionsMP
         private static DateTime _restartAt = DateTime.MinValue;
         private static int _restartWarned = int.MaxValue;
         private static int _countdownCode = ExitRestart;   // what the countdown ends in: a restart, or (AMP's "stop warn") a stop
+        private static string _countdownWhy = "";   // AUTO-UPDATE-1: "update to version ..." in every warning of the countdown
         private static readonly int[] RestartWarnings = { 300, 60, 30, 10 };
 
         private static float  _nextTickAt;
@@ -83,6 +84,25 @@ namespace BigAmbitionsMP
         /// <summary>The headless folder (status.json, command.txt, ...); "" when not headless.</summary>
         internal static string DirPath => _dir;
         public static bool Stopping => _stopping;
+        /// <summary>AUTO-UPDATE-1: an announced restart (or AMP's announced stop) is counting down.</summary>
+        internal static bool RestartPending => _restartAt != DateTime.MinValue;
+        /// <summary>AUTO-UPDATE-1: players on the server now.</summary>
+        internal static int PlayerCount => _players.Count;
+        /// <summary>AUTO-UPDATE-1: a console answer from another thread or class ("OUT ...").</summary>
+        internal static void Out(string text) => Reply(text);
+
+        /// <summary>AUTO-UPDATE-1: the notice on every screen, then the restart - after a countdown of secs (its warnings
+        /// as for "restart &lt;minutes&gt;"), or at once (secs 0, the world is saved first). false when one already runs.</summary>
+        internal static bool AnnounceRestart(int secs, string notice, string why = "")
+        {
+            if (_restartAt != DateTime.MinValue || _stopping) return false;
+            _countdownWhy = why;
+            try { if (MPServer.IsRunning && notice.Length > 0) MPServer.BroadcastNotice(notice); } catch { }
+            Emit("OUT", notice);
+            if (secs > 0) Countdown(secs, ExitRestart);
+            else RequestQuit("automatic update", ExitRestart);
+            return true;
+        }
 
         // ── detection (called from MPConfig.Init, before anything else of this class) ─────────────────────────────
 
@@ -169,6 +189,7 @@ namespace BigAmbitionsMP
 
                 PollCommandFile();
                 TickRestart();
+                try { AutoUpdate.Tick(now, _state == "idle" || _state == "running"); } catch (Exception ex) { Plugin.Logger.LogWarning("[Update] " + ex.Message); }   // AUTO-UPDATE-1
 
                 string state = ComputeState();
                 if (state != _state)
@@ -274,7 +295,7 @@ namespace BigAmbitionsMP
                 switch (cmd.ToLowerInvariant())
                 {
                     case "help":
-                        Reply("commands: status | players | save | autosave | saves | load <#N|name> | say <text> | notice <text> | msg <player> <text> | kick <player> [reason] | ban <player> [reason] | unban <player|key|all> | banlist | chat [N] | reports | playerlog <player> | translate <text> | stop [warn] | restart [minutes|cancel]");
+                        Reply("commands: status | players | save | autosave | saves | load <#N|name> | say <text> | notice <text> | msg <player> <text> | kick <player> [reason] | ban <player> [reason] | unban <player|key|all> | banlist | chat [N] | reports | playerlog <player> | translate <text> | stop [warn] | restart [minutes|cancel] | update");
                         Reply("a name with spaces in quotes: kick \"Max Muster\" too loud");
                         break;
                     case "status":
@@ -406,6 +427,7 @@ namespace BigAmbitionsMP
                         {
                             min = Math.Min(min, 24 * 60);
                             int secs = (int)Math.Round(min * 60);
+                            _countdownWhy = "";
                             Countdown(secs, ExitRestart);
                             Reply($"OK restart in {Left(secs)}");
                             break;
@@ -413,6 +435,9 @@ namespace BigAmbitionsMP
                         RequestQuit("restart requested", ExitRestart);
                         break;
                     }
+                    case "update":   // AUTO-UPDATE-1: look for a new build on GitHub now
+                        Reply(AutoUpdate.Command());
+                        break;
                     case "notice":   // ADMIN-1: an announcement on every player's screen
                         if (arg.Length == 0) { Reply("ERR usage: notice <text>"); break; }
                         if (!MPServer.IsRunning) { Reply("ERR not hosting"); break; }
@@ -464,6 +489,7 @@ namespace BigAmbitionsMP
         private static void Countdown(int secs, int code)
         {
             _countdownCode = code;
+            if (code == ExitStop) _countdownWhy = "";
             _restartAt = DateTime.UtcNow.AddSeconds(secs);
             _restartWarned = int.MaxValue;
             MPServer.BroadcastNotice(CountdownText(secs));
@@ -473,7 +499,7 @@ namespace BigAmbitionsMP
 
         private static string CountdownText(int secs) => _countdownCode == ExitStop
             ? Loc.Server("gps_admin_stop_in", "The server goes down in {0} (restart or maintenance).", Left(secs))
-            : Loc.Server("gps_admin_restart_in", "The server restarts in {0}.", Left(secs));
+            : Loc.Server("gps_admin_restart_in", "The server restarts in {0}.", Left(secs)) + (_countdownWhy.Length > 0 ? " " + _countdownWhy : "");
 
         /// <summary>ADMIN-1: the countdown's warnings, then the restart or stop itself (main thread, once a second).</summary>
         private static void TickRestart()

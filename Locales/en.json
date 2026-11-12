@@ -1769,5 +1769,9 @@
     "go_spot_service": "A fault? We come",
     "go_spot_service_line": "our technicians are on duty in {0}",
     "go_spot_tariff_line": "{0} - {1} a day",
-    "go_spot_term": "{0} days minimum"
+    "go_spot_term": "{0} days minimum",
+    "gps_update_notice": "Server update to version {0} (build {1}).",
+    "gps_update_new": "New: {0}",
+    "gps_update_workshop": "Players: the mod needs the new version too - Steam updates it at the next game start (Steam Workshop).",
+    "gps_update_reason": "Update to version {0} (build {1})."
 }

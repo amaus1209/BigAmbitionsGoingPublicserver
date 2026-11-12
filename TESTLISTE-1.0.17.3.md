@@ -411,3 +411,27 @@ Im Servicewagen von Going Online fahren (gekauft oder geleast), am besten einmal
       Im Player.log einmal „desks: workplaces on a service counter count as on a desk (GO-DESK-LINK-2)“.
 - [ ] In der Schicht arbeitet das Kundendienst-Personal dort (Going Online → Personal: im Dienst, nicht „Arbeitsplatz unvollständig“).
 - [ ] Ein normaler Computer auf einem Tresen (kein Going-Online-Arbeitsplatz) meldet weiter „Schreibtisch“ – nur unsere zählen.
+
+## Personal am Tresen auf der richtigen Seite (GO-COUNTER-SEAT-1)
+
+- [ ] Kundencenter aus einer GO-Vorlage (z. B. 19 9th Avenue), neue Schicht (oder Gebäude verlassen und wieder betreten): das
+      Personal sitzt auf dem Stuhl VOR dem Bildschirm, der Sessel auf der anderen Seite bleibt für die Kundschaft frei.
+      Im Player.log einmal „staff at a service counter take the seat on the screen's side (GO-COUNTER-SEAT-1)“.
+
+## Automatische Updates mit Ankündigung (AUTO-UPDATE-1)
+
+- [ ] AMP-Einstellungen (nach dem Update der Instanz und einem Neustart): „Automatische Updates“ (an) und „Vorwarnung (Minuten)“ (5).
+- [ ] Konsole `update`: „up to date: build … is the newest on GitHub“, solange der Server den Build des neuesten Releases hat.
+- [ ] Neuer Build im Release (mit GoingPublicServer-Update.json): spätestens nach einer Stunde (oder `update`) lädt der Server
+      ihn, prüft ihn („is in place“), alle Spieler sehen „Server-Update auf … (Build …). Neu: …“ und die Countdown-Warnungen,
+      nach 5 Minuten speichert der Server und startet neu; danach zeigt die Statuszeile den neuen Build.
+- [ ] Ohne Spieler: Neustart sofort nach der Meldung. Mit „Automatische Updates“ aus: nichts passiert.
+- [ ] Ein Release ohne GoingPublicServer-Update.json: eine Zeile „has no GoingPublicServer-Update.json“, kein Update.
+
+## Kundschaft wartet, bis das Personal frei ist (GO-LOBBY-2)
+
+- [ ] Kundencenter geöffnet, Personal in der Schicht: Kundschaft kommt herein, schaut evtl. am Gerätetisch, setzt sich auf einen
+      Wartestuhl (nicht an den Tresen) und geht erst zum Tresen, wenn dort eine Person frei am Platz sitzt – dann setzt sie
+      sich in den Sessel gegenüber, bleibt 20-40 s und geht.
+- [ ] Ohne Personal am Platz bleibt die Kundschaft sitzen und geht nach 1,5-2,5 Minuten wieder.
+- [ ] Neustart-Warnungen bei einem automatischen Update: „Der Server startet in … neu. Update auf Version: 1.0.17.3 (Build …).“

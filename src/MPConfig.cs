@@ -234,6 +234,16 @@ namespace BigAmbitionsMP
         {
             get { try { return int.TryParse(Get("StopWarnSeconds", "60").Trim(), out int s) ? Math.Max(0, Math.Min(90, s)) : 60; } catch { return 60; } }
         }
+        /// <summary>AUTO-UPDATE-1: a dedicated server under AMP looks for a new build on GitHub and puts it in (default on).</summary>
+        public static bool AutoUpdate
+        {
+            get { try { return !string.Equals(Get("AutoUpdate", "true").Trim(), "false", StringComparison.OrdinalIgnoreCase); } catch { return true; } }
+        }
+        /// <summary>AUTO-UPDATE-1: minutes between the update notice and the restart while players are on (1..60, default 5).</summary>
+        public static int AutoUpdateWarnMinutes
+        {
+            get { try { return int.TryParse(Get("AutoUpdateWarnMinutes", "5").Trim(), out int m) ? Math.Max(1, Math.Min(60, m)) : 5; } catch { return 5; } }
+        }
         /// <summary>MERGER-AUTO-DISSOLVE-1: a company member away this many real days leaves it by itself (0 = never, at most 365).</summary>
         public static int MergerAutoDissolveDays
         {
@@ -349,6 +359,7 @@ namespace BigAmbitionsMP
             "RadioList",   // RADIO-STREAMS-2
             "PlayerReports",   // PLAYER-REPORTS-1
             "ChatTranslate",   // CHAT-TRANSLATE-1
+            "AutoUpdate", "AutoUpdateWarnMinutes",   // AUTO-UPDATE-1
         };
 
         private static void LoadServerOverrides()
