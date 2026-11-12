@@ -83,6 +83,9 @@ Docker; the game runs headless with the **Going Public Server** mod
 - **F6 RPG camera** (settings F8 or the Camera app): a third-person camera on foot and in the car.
 - **F7 Shop signs** (the Signs app): your own pictures on signs, storefront signs and billboards; the other players see
   them.
+- **Livery** (in your vehicle, next to "Park Vehicle"): left, right, back and front of every vehicle you own each get
+  their own design, colour and logo place, with your business's logo and name, a slogan, a contact line and a new paint
+  colour; the other players see it.
 - **Shift+F9 Planner**: checks schedules, fills them with the game's own auto-fill and suggests opening hours from
   customer demand.
 - **Shift+F10 Insights**: profit per business, history, sales, staff, real estate and alerts.
@@ -131,15 +134,29 @@ Docker; the game runs headless with the **Going Public Server** mod
 <!-- Going Public Server 1.0.13+ shows every heading of this section as a card in the game's News panel on the
      main menu, newest first. German: the section "Neuigkeiten" in the German part. -->
 
+### 1.0.17.3: Events, the network in the street, lines between players
+- **Events** for Going Online: storms, a big match, an excavator, the press, a test win and a fibre subsidy - each with a decision in the app's overview.
+- **The network in the street**: street cabinets by your connected buildings, road works while you connect them, cones where your technicians work.
+- **Lines between players**: offer your network to other players or rent lines on theirs; more templates (customer centers A1 and C1, cable offices A3, C1 and D2).
+
+### 1.0.17.2: Service vans with number plates
+- **Number plates** "GO1-name", "GO2-name" on every service van you buy; the leased vans park at the headend and at the customers and drive through the city, with points on the city map.
+- **Sliders** for the livery's text and logo size; the beacon flashes left and right, Q and E together switch it.
+- **Templates** for the interior installation firm (customer center A2, cable office J1); newly hired staff count again.
+
+### 1.0.17.1: Livery for every vehicle
+- **Livery**: in your vehicle, "Livery" next to "Park Vehicle" - left, right, back and front each get their own design, colour and logo place, with your business's logo and name, a slogan, a contact line and a new paint colour. The stickers sit on the car's free surfaces; the other players see them.
+- **Going Online's service van** is a real vehicle now: the dealers with vans sell it, you can drive it yourself, and its livery is set in the app's new tab "Service van". Its lights, blinkers and paint work like the game's cars.
+
 ### Going Public Server 1.0.17.1
 - **Chat translation**: the server translates the chat between German and English - you read the others' lines in the language of your game, the original small below. It runs on the server itself; the chat never leaves it.
 - **Going Online in an office**: headend and customer center under one roof; the agencies offer the jobs whose workplaces stand there. Own models for the seven racks and the devices, and up to three service vans with your logo in the traffic.
-- **Crosswalks**: pedestrians cross only when the red lasts, cars stop for them - and new pedestrian lights show green.
+- **Crosswalks**: pedestrians cross only when the red lasts, cars stop for them - and new pedestrian lights at all crossings of the city show green.
 - **Error reports to the server**: on servers that collect them (AMP switch "Player error reports"), each player is asked once; then the game sends its errors and the mod's check lines while playing, cleaned of personal data.
 - **Going Online in BizMan**: the cable provider in the list of businesses, with the tabs Deliveries (contracts with wholesalers), Fleet and Inventory; the city map's filter "Cable provider"; a real logo; the requirements of every office business (course "Office Businesses", computers, toilets, sinks).
 - **Self-driving** up to 60 km/h on long straights and 90 km/h on bridges (in multiplayer without the game's "Skip bridge", which jumped the clock), gently back to 40 before lights, junctions and curves; it no longer parks on a slope or off the parking lane.
 - **Fast-forward window** in the game's style; after a fast-forward it closes by itself.
-- **Fixes**: a server crash right after a player came into the world; getting out at the pier where no parking spot was free; the version line and the fast-forward button no longer cover "Driving shortcuts", and the fast-forward window opens above the vehicle panel; the recruitment agencies offer the cable jobs again after a reconnect; Going Online's devices no longer flood the server console.
+- **Fixes**: a server crash right after a player came into the world; getting out at the pier where no parking spot was free; the version line and the fast-forward button no longer cover "Driving shortcuts", and the fast-forward window opens above the vehicle panel; the recruitment agencies offer the cable jobs again after a reconnect; Going Online's devices no longer flood the server console; prices and names can be typed into Going Online's fields again.
 - **Dissolve the company**: a cable provider without an office left can be ended in the app (Overview, "Dissolve the company"); then the app starts anew.
 
 ### Going Public Server 1.0.17
@@ -233,6 +250,8 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
    **Going Public Server** release from this repository.
 4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server password** (the server key players join with), and the server version (gone after reloading the page? AMP's page misses them with Websockets on: switch off "Enable Websockets" in the instance's configuration). Network traffic, server FPS and each player's connection are on the ranking page (see below).
 5. Open the game port (UDP, 7777 by default) in your firewall.
+6. AMP without Docker: the host needs `xvfb`, `xauth` and `python3` (`sudo apt install xvfb xauth python3`) - the game
+   runs under Proton with a virtual display. AMP's Docker containers bring them along.
 
 ### Updating
 
@@ -413,6 +432,9 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 - **F6 RPG-Kamera** (Einstellungen F8 oder App „Kamera“): Kamera hinter der Figur, zu Fuß und im Auto.
 - **F7 Ladenschilder** (App „Schilder“): eigene Bilder auf Schildern, Ladenschildern und Werbetafeln; die anderen
   Spieler sehen sie.
+- **Beklebung** (im Fahrzeug neben „Fahrzeug parken“): links, rechts, hinten und vorne jedes eigenen Fahrzeugs je eine
+  eigene Gestaltung, Farbe und ein Logo-Platz, dazu Logo und Name deiner Firma, ein Spruch, eine Kontaktzeile und eine
+  neue Lackfarbe; die anderen sehen sie.
 - **Umschalt+F9 Planer**: prüft Schichtpläne, füllt sie mit der Funktion des Spiels und schlägt Öffnungszeiten nach
   Kundenandrang vor.
 - **Umschalt+F10 Auswertung**: Gewinn je Geschäft, Verlauf, Verkäufe, Personal, Immobilien und Warnungen.
@@ -460,15 +482,29 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
 
 ### Neuigkeiten
 
+#### 1.0.17.3: Ereignisse, Netz in der Stadt, Leitungen an Mitspieler
+- **Ereignisse** für Going Online: Unwetter, ein großes Fußballspiel, ein Bagger, die Zeitung, ein Testsieg und eine Glasfaser-Förderung – jeweils mit einer Entscheidung in der Übersicht der App.
+- **Netz in der Stadt**: Verteilerkästen an deinen angeschlossenen Häusern, Baustellen beim Anschließen, Kegel, wo deine Technik arbeitet.
+- **Leitungen an Mitspieler**: dein Netz anderen Spielern anbieten oder Leitungen in ihrem mieten; mehr Vorlagen (Kundencenter A1 und C1, Kabel-Büros A3, C1 und D2).
+
+#### 1.0.17.2: Servicewagen mit Kennzeichen
+- **Kennzeichen** „GO1-Name“, „GO2-Name“ an jedem gekauften Servicewagen; geleaste Wagen parken an der Kopfstelle und bei der Kundschaft und fahren durch die Stadt, mit Punkten auf der Stadtkarte.
+- **Schieberegler** für Schrift- und Logogröße der Beklebung; die Rundumleuchte blitzt links und rechts, Q und E zusammen schalten sie.
+- **Vorlagen** für die Inneneinrichtungsfirma (Kundencenter A2, Kabel-Büro J1); neu eingestellte Leute zählen wieder.
+
+#### 1.0.17.1: Beklebung für jedes Fahrzeug
+- **Beklebung**: im Fahrzeug „Beklebung“ neben „Fahrzeug parken“ – links, rechts, hinten und vorne je eine eigene Gestaltung, Farbe und ein Logo-Platz, dazu Logo und Name deiner Firma, ein Spruch, eine Kontaktzeile und eine neue Lackfarbe. Die Aufkleber sitzen auf den freien Flächen des Autos; die anderen sehen sie.
+- **Der Servicewagen von Going Online** ist jetzt ein echtes Fahrzeug: Die Autohäuser mit Transportern verkaufen ihn, du kannst ihn selbst fahren, und seine Beklebung stellst du im neuen Reiter „Servicewagen“ der App ein. Licht, Blinker und Lack wie bei den Spielautos.
+
 #### Going Public Server 1.0.17.1
 - **Chat-Übersetzung**: Der Server übersetzt den Chat zwischen Deutsch und Englisch – du liest die Zeilen der anderen in der Sprache deines Spiels, darunter klein das Original. Das läuft auf dem Server selbst.
 - **Going Online im Büro**: Kopfstelle und Kundencenter unter einem Dach; die Agenturen bieten die Berufe an, deren Arbeitsplätze dort stehen. Eigene Modelle für die Schränke und Geräte, bis zu drei Servicewagen mit deinem Logo im Verkehr.
-- **Zebrastreifen**: Die Leute gehen nur los, wenn das Rot reicht, Autos halten für sie – und neue Fußgängerampeln zeigen Grün.
+- **Zebrastreifen**: Die Leute gehen nur los, wenn das Rot reicht, Autos halten für sie – und neue Fußgängerampeln an allen Übergängen der Stadt zeigen Grün.
 - **Fehlerberichte an den Server**: Auf Servern, die sie sammeln (AMP-Schalter „Fehlerberichte der Spieler“), wird jede Person einmal gefragt; danach schickt das Spiel beim Spielen seine Fehler und die Prüfzeilen des Mods, ohne persönliche Daten.
 - **Going Online in BizMan**: der Kabelanbieter in der Liste der Unternehmen, mit den Reitern Lieferungen (Verträge mit Großhändlern), Fuhrpark und Inventar; der Kartenfilter „Kabelanbieter“; ein echtes Logo; die Anforderungen wie bei jedem Bürounternehmen (Kurs „Bürounternehmen“, Computer, Toiletten, Waschbecken).
 - **Autofahrt** auf langen Geraden bis 60 km/h und auf Brücken bis 90 km/h (im Mehrspieler-Spiel ohne „Brücke überspringen“ des Spiels, das die Uhr springen ließ), vor Ampeln, Kreuzungen und Kurven sanft zurück auf 40; sie parkt nicht mehr am Hang oder neben der Parkspur.
 - **Vorspul-Fenster** im Stil des Spiels; nach dem Vorspulen schließt es sich von selbst.
-- **Korrekturen**: ein Absturz des Servers kurz nachdem jemand in die Welt kam; Aussteigen am Pier, wo kein Parkplatz frei war; Versionszeile und Vorspul-Knopf verdecken „Tastenkürzel fürs Fahren“ nicht mehr, das Vorspul-Fenster öffnet sich über der Fahrzeuganzeige; die Personalagenturen bieten die Kabel-Berufe auch nach einem Neuverbinden an; die Geräte von Going Online fluten die Server-Konsole nicht mehr.
+- **Korrekturen**: ein Absturz des Servers kurz nachdem jemand in die Welt kam; Aussteigen am Pier, wo kein Parkplatz frei war; Versionszeile und Vorspul-Knopf verdecken „Tastenkürzel fürs Fahren“ nicht mehr, das Vorspul-Fenster öffnet sich über der Fahrzeuganzeige; die Personalagenturen bieten die Kabel-Berufe auch nach einem Neuverbinden an; die Geräte von Going Online fluten die Server-Konsole nicht mehr; Preise und Namen lassen sich in Going Online wieder eintippen.
 - **Firma auflösen**: Ein Kabelanbieter ohne Büro lässt sich in der App beenden (Übersicht, „Firma auflösen“); danach beginnt die App von vorn.
 
 #### Going Public Server 1.0.17
@@ -558,7 +594,9 @@ Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
 **Big Ambitions (Going Public server)** anlegen, **Update** (lädt das Spiel per SteamCMD mit einem Steam-Konto,
 das Big Ambitions besitzt – bei Steam Guard fragt AMP nach dem Code –, Proton GE und das neueste Release von
 hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Passwort (den Server-Schlüssel) und Server-Version (nach dem Neuladen der Seite weg? Mit Websockets verpasst AMPs Seite sie: in der Konfiguration der Instanz „Websockets aktivieren“ ausschalten). Netzverkehr, Server-FPS und die Verbindung jedes Spielers stehen auf der Ranglisten-Seite (siehe unten).
-Den Spiel-Port freigeben (UDP, standardmäßig 7777).
+Den Spiel-Port freigeben (UDP, standardmäßig 7777). AMP ohne Docker: Auf dem Rechner müssen `xvfb`, `xauth` und `python3` installiert sein
+(`sudo apt install xvfb xauth python3`) – das Spiel läuft unter Proton mit einem virtuellen Bildschirm. Die
+Docker-Container von AMP bringen sie mit.
 
 **Aktualisieren:** **Update** lädt das neueste Release, danach die Instanz neu starten. Die Spieler bekommen die passende
 Version aus dem Steam Workshop. Nach einem Update den Server einmal starten: Neue Einstellungen bekommen dann ihren
