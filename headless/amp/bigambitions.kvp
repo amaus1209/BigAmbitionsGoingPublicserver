@@ -1,6 +1,6 @@
 Meta.DisplayName=Big Ambitions (Going Public server)
-Meta.Description=Always-on Big Ambitions multiplayer host: the Going Public mod in headless server mode under Proton
-Meta.OS=Linux
+Meta.Description=Always-on Big Ambitions multiplayer host: the Going Public mod in headless server mode (Windows natively, Linux under Proton)
+Meta.OS=Windows, Linux
 Meta.AarchSupport=Unknown
 Meta.Arch=x86_64
 Meta.Author=community (unofficial)
@@ -37,7 +37,7 @@ App.ExecutableWin=1331550\Big Ambitions.exe
 App.ExecutableLinux=/usr/bin/xvfb-run
 App.WorkingDir=1331550
 App.LinuxCommandLineArgs=-a "{{$FullRootDir}}.proton/proton" runinprefix "{{$FullBaseDir}}Big Ambitions.exe" -batchmode -nographics -bamp-config "Z:{{$FullBaseDir}}bamp-server.json" -bamp-headless-dir "Z:{{$FullRootDir}}headless"
-App.WindowsCommandLineArgs=
+App.WindowsCommandLineArgs=-batchmode -nographics -disable-force-steam -bamp-nosteam -bamp-mods-dir "{{$FullRootDir}}mods" -bamp-config "{{$FullBaseDir}}bamp-server.json" -bamp-headless-dir "{{$FullRootDir}}headless" -logFile -
 App.CommandLineArgs={{$PlatformArgs}}
 App.UseLinuxIOREDIR=False
 App.AppSettings={}

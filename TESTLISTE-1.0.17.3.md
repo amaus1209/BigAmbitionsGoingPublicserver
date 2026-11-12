@@ -403,3 +403,11 @@ Im Servicewagen von Going Online fahren (gekauft oder geleast), am besten einmal
 - [ ] **Name ändern**: Going Online → Personal: Bei eingestellten Leuten steht der Name in einem Feld. Anklicken, neuen
       Namen tippen, Enter – der Name bleibt, auch in BizMan (Mitarbeitende) und nach Speichern und Neuladen. Esc bricht ab,
       ein leeres Feld lässt den alten Namen. Im Player.log „staff: '…' is now called '…' (GO-RENAME-1)“.
+
+## Kundencenter: Arbeitsplätze auf dem Service-Tresen (GO-DESK-LINK-2)
+
+- [ ] Kundencenter aus einer GO-Vorlage (A1, A2, C1 – z. B. 19 9th Avenue) betreten: über den Going-Online-Arbeitsplätzen
+      auf den Tresen verschwindet das rote „!“, der Hinweis zeigt keine „Fehlende Anforderungen: Schreibtisch“ mehr.
+      Im Player.log einmal „desks: workplaces on a service counter count as on a desk (GO-DESK-LINK-2)“.
+- [ ] In der Schicht arbeitet das Kundendienst-Personal dort (Going Online → Personal: im Dienst, nicht „Arbeitsplatz unvollständig“).
+- [ ] Ein normaler Computer auf einem Tresen (kein Going-Online-Arbeitsplatz) meldet weiter „Schreibtisch“ – nur unsere zählen.

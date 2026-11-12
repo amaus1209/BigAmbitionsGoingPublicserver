@@ -616,5 +616,36 @@ namespace GoingOnline
                 catch { }
             }
         }
+
+        // ── GO-DESK-LINK-2: the customer centers' counters count as desks ─────────────────────────────────────────────
+
+        /// <summary>GO-DESK-LINK-2 (user 2026-11-12, screenshot of the customer center at 19 9th Avenue after GO-DESK-LINK-1:
+        /// "der schreibtisch hat sich nicht verbunden" - still "Fehlende Anforderungen: Schreibtisch"): our customer-center
+        /// templates put the workplaces on the game's service counter (ba:itemname_specialemployeedesk / ...small). The link
+        /// is there (parentId), but the workplace's requirement "Has desk attached" (HasItemTypeAttached, ItemType.Desk) looks
+        /// at the parent's item type, and that counter is an EmployeeWorkstation (0x10), not a Desk (0x20000) - so it could
+        /// never be met, and nobody worked there. One of our workplaces standing on such a counter now counts as on a desk;
+        /// every other item keeps the game's check.</summary>
+        [HarmonyPatch(typeof(Furniture.Requirements.HasItemTypeAttached), nameof(Furniture.Requirements.HasItemTypeAttached.IsRequirementMet))]
+        public static class Patch_HasItemTypeAttached_CounterIsDesk
+        {
+            static void Postfix(Furniture.Requirements.HasItemTypeAttached __instance, ItemInstance itemInstance, ref bool __result)
+            {
+                if (__result) return;
+                try
+                {
+                    if ((__instance.itemType & ItemType.Desk) == 0 || itemInstance == null || string.IsNullOrEmpty(itemInstance.parentId)) return;
+                    if (itemInstance.itemName == null || !itemInstance.itemName.StartsWith("goingonline:", StringComparison.Ordinal)) return;
+                    var reg = itemInstance.GetBuildingRegistration();
+                    if (reg?.itemInstances == null || !reg.itemInstances.TryGetValue(itemInstance.parentId, out var parent) || parent == null) return;
+                    if (parent.itemName == "ba:itemname_specialemployeedesk" || parent.itemName == "ba:itemname_specialemployeedesksmall")
+                    {
+                        __result = true;
+                        Once("desk-counter", "desks: workplaces on a service counter count as on a desk (GO-DESK-LINK-2).");
+                    }
+                }
+                catch { }
+            }
+        }
     }
 }

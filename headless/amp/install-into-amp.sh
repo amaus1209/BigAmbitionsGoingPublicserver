@@ -38,7 +38,7 @@ echo "Start-Wrapper installiert: $DEST/bamp-start.sh"
 mkdir -p "$DEST/bamp-tools/i18n"
 install -m 755 "$REPO/headless/amp/localize-template.py" "$REPO/headless/amp/bamp-web-sync.sh" "$REPO/headless/amp/backup-saves.sh" \
     "$REPO/headless/amp/modtr-scan.py" "$REPO/headless/amp/seed-settings.py" "$REPO/headless/amp/bamp-translate.py" \
-    "$REPO/headless/amp/bamp-prestart.sh" "$DEST/bamp-tools/"   # PRESTART-1: the template's pre-start stages
+    "$REPO/headless/amp/bamp-prestart.sh" "$REPO/headless/amp/bamp-prestart.ps1" "$DEST/bamp-tools/"   # PRESTART-1 (+ PRESTART-WIN-1): the template's pre-start stages
 install -m 644 "$REPO/headless/amp/bigambitionsconfig.json" "$REPO/headless/amp/bigambitionsports.json" "$DEST/bamp-tools/"
 install -m 644 "$REPO/headless/amp/i18n/"*.json "$DEST/bamp-tools/i18n/"
 # AMP's own interface in German (bamp-web-sync.sh copies it into the ADS WebRoot/Locale; open AMP once with ?lang=de)
