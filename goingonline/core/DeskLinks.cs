@@ -43,6 +43,8 @@ namespace GoingOnline
             {
                 int n = Link(bm.allItemControllers);
                 if (n > 0) Go.Log($"desks: {n} computer(s) and chair(s) at {_in} linked to the desk they stand on (GO-DESK-LINK-1).");
+                int t = Orient(bm.allItemControllers);
+                if (t > 0) Go.Log($"desks: {t} workplace(s) at {_in} turned so their screen faces the staff's chair (GO-DESK-LINK-3).");
             }
             catch (System.Exception ex) { Go.Warn("desks: " + ex.Message + " (GO-DESK-LINK-1)."); _nextScan = Time.unscaledTime + 60f; }
         }
@@ -95,6 +97,29 @@ namespace GoingOnline
                 linked++;
             }
             return linked;
+        }
+
+        /// <summary>GO-DESK-LINK-3 (user 2026-11-12: "mitarbeiter setzen sich auf dem sessel"): customer centers from our
+        /// templates before GO-BLUEPRINT-7 had the workplace's screen facing the armchair. The staff now take the office chair
+        /// (GO-COUNTER-SEAT-1), so a workplace on a service counter whose staff seat stands behind it (-forward) is turned
+        /// half round, saved with the building like a turn in the placement mode.</summary>
+        static int Orient(List<ItemController> items)
+        {
+            int turned = 0;
+            foreach (var ic in items)
+            {
+                if (ic == null || ic.ItemInstance == null) continue;
+                var root = GamePatches.CounterOf(ic);
+                if (root == null) continue;
+                var seat = GamePatches.StaffSeat(ic, root, false);
+                if (seat == null || GamePatches.IsArmchair(seat)) continue;   // no office chair there: leave it as it is
+                var d = seat.transform.position - ic.transform.position; d.y = 0f;
+                if (d.sqrMagnitude < 0.01f || Vector3.Dot(d, ic.transform.forward) >= 0f) continue;
+                ic.transform.rotation = Quaternion.AngleAxis(180f, Vector3.up) * ic.transform.rotation;
+                ic.ItemInstance.yRotation = ic.transform.eulerAngles.y;
+                turned++;
+            }
+            return turned;
         }
 
         static bool Taken(ItemController desk, AttachmentPoint ap)

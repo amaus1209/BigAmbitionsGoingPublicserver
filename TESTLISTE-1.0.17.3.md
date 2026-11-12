@@ -414,9 +414,12 @@ Im Servicewagen von Going Online fahren (gekauft oder geleast), am besten einmal
 
 ## Personal am Tresen auf der richtigen Seite (GO-COUNTER-SEAT-1)
 
-- [ ] Kundencenter aus einer GO-Vorlage (z. B. 19 9th Avenue), neue Schicht (oder Gebäude verlassen und wieder betreten): das
-      Personal sitzt auf dem Stuhl VOR dem Bildschirm, der Sessel auf der anderen Seite bleibt für die Kundschaft frei.
-      Im Player.log einmal „staff at a service counter take the seat on the screen's side (GO-COUNTER-SEAT-1)“.
+- [ ] Kundencenter aus einer GO-Vorlage (z. B. 19 9th Avenue) betreten: Going Online dreht die Arbeitsplätze, deren Bildschirm
+      zum Sessel zeigt („desks: N workplace(s) … turned so their screen faces the staff's chair (GO-DESK-LINK-3)“).
+- [ ] Neue Schicht (oder Gebäude verlassen und wieder betreten): das Personal sitzt auf dem Bürostuhl, der Bildschirm zeigt zu
+      ihm; die Kundschaft setzt sich in den Sessel gegenüber. Im Player.log einmal „staff at a service counter take the office
+      chair, the armchair is the customers' (GO-COUNTER-SEAT-1)“.
+- [ ] Neu eingebaute Kundencenter-Vorlage (GO-BLUEPRINT-7): Bürostuhl hinter dem Tresen auf der Bildschirmseite, Sessel davor.
 
 ## Automatische Updates mit Ankündigung (AUTO-UPDATE-1)
 

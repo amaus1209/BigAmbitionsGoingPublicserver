@@ -650,13 +650,14 @@ namespace GoingOnline
 
         static bool IsCounter(string? name) => name == "ba:itemname_specialemployeedesk" || name == "ba:itemname_specialemployeedesksmall";
 
-        /// <summary>GO-COUNTER-SEAT-1 (user 2026-11-12, screenshot of 19 9th Avenue: "mitarbeiter hocken auf falscher seite"): a
-        /// service counter of our customer-center templates holds two seats - the staff's chair in front of the screen and the
-        /// customers' armchair behind it. The game's WorkstationController.FindChair takes the first free seat under the
-        /// counter, and the templates attached the armchair first, so the staff sat on the customers' side. For one of our
-        /// workplaces on such a counter the staff now get the free seat on the screen's side (the workplace model's screen
-        /// faces its -forward, as the templates place the staff chair); everything else keeps the game's choice. A person
-        /// already seated keeps the seat until the next shift.</summary>
+        /// <summary>GO-COUNTER-SEAT-1 (user 2026-11-12, two screenshots of 19 9th Avenue: "mitarbeiter hocken auf falscher
+        /// seite", then "mitarbeiter setzen sich auf dem sessel"): a service counter of our customer-center templates holds two
+        /// seats, an office chair and an armchair. The game's WorkstationController.FindChair takes the first free seat under
+        /// the counter. For one of our workplaces on such a counter the staff now take the office chair (any seat but an
+        /// armchair; the one in front of the screen when both are alike - the game's chairs stand at the workplace's
+        /// +forward); the armchair is the customers' (GO-LOBBY-2), and DeskLinks turns the workplace's screen to the staff
+        /// (GO-DESK-LINK-3). Everything else keeps the game's choice. A person already seated keeps the seat until the
+        /// next shift.</summary>
         [HarmonyPatch(typeof(Controllers.WorkstationController), nameof(Controllers.WorkstationController.FindChair))]
         public static class Patch_WorkstationFindChair_CounterStaffSide
         {
@@ -664,37 +665,54 @@ namespace GoingOnline
             {
                 try
                 {
-                    var name = __instance.ItemInstance?.itemName;
-                    if (name == null || !name.StartsWith("goingonline:", StringComparison.Ordinal)) return true;
-                    ItemController root = __instance;
-                    while (root.parentItemController != null) root = root.parentItemController;
-                    if (root == __instance || !IsCounter(root.ItemInstance?.itemName)) return true;
+                    var root = CounterOf(__instance);
+                    if (root == null) return true;
                     if (forceCheck) { ____chairItemController = null!; __instance.employeeChair = null!; }
                     if (____chairItemController != null && ____chairItemController.Occupied) { __result = ____chairItemController; return false; }
-                    Vector3 at = __instance.transform.position, fwd = __instance.transform.forward;
-                    ItemController? best = null;
-                    float bestSide = float.MaxValue;
-                    var stack = new Stack<ItemController>();
-                    stack.Push(root);
-                    while (stack.Count > 0)
-                    {
-                        var ic = stack.Pop();
-                        if (ic == null) continue;
-                        if (ic.Item != null && (ic.Item.type & ItemType.Seat) != 0 && !ic.Occupied)
-                        {
-                            float side = Vector3.Dot(ic.transform.position - at, fwd);   // most negative = the screen's side
-                            if (side < bestSide) { bestSide = side; best = ic; }
-                        }
-                        foreach (var c in ic.childItemControllers) stack.Push(c);
-                    }
+                    var best = StaffSeat(__instance, root, true);
                     ____chairItemController = best!;
                     __instance.employeeChair = best != null ? best.SittingPosition : null!;
                     __result = best!;
-                    if (best != null) Once("counter-seat", "desks: staff at a service counter take the seat on the screen's side (GO-COUNTER-SEAT-1).");
+                    if (best != null) Once("counter-seat", "desks: staff at a service counter take the office chair, the armchair is the customers' (GO-COUNTER-SEAT-1).");
                     return false;
                 }
                 catch { return true; }
             }
+        }
+
+        /// <summary>The service counter one of our workplaces stands on, else null.</summary>
+        internal static ItemController? CounterOf(ItemController station)
+        {
+            var name = station.ItemInstance?.itemName;
+            if (name == null || !name.StartsWith("goingonline:", StringComparison.Ordinal)) return null;
+            ItemController root = station;
+            while (root.parentItemController != null) root = root.parentItemController;
+            return root != station && IsCounter(root.ItemInstance?.itemName) ? root : null;
+        }
+
+        internal static bool IsArmchair(ItemController ic) => (ic.itemName ?? "").IndexOf("armchair", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        /// <summary>GO-COUNTER-SEAT-1: the staff's seat at a counter - not an armchair if there is another, then the one most
+        /// in front of the workplace (+forward). freeOnly: only a seat nobody sits on.</summary>
+        internal static ItemController? StaffSeat(ItemController station, ItemController root, bool freeOnly)
+        {
+            Vector3 at = station.transform.position, fwd = station.transform.forward;
+            ItemController? best = null;
+            float bestScore = float.MinValue;
+            var stack = new Stack<ItemController>();
+            stack.Push(root);
+            while (stack.Count > 0)
+            {
+                var ic = stack.Pop();
+                if (ic == null) continue;
+                if (ic.Item != null && (ic.Item.type & ItemType.Seat) != 0 && !(freeOnly && ic.Occupied))
+                {
+                    float score = Vector3.Dot(ic.transform.position - at, fwd) - (IsArmchair(ic) ? 100f : 0f);
+                    if (score > bestScore) { bestScore = score; best = ic; }
+                }
+                foreach (var c in ic.childItemControllers) stack.Push(c);
+            }
+            return best;
         }
     }
 }

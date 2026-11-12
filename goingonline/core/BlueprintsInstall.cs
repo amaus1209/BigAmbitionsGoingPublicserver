@@ -15,7 +15,7 @@ namespace GoingOnline
         /// <summary>GO-BLUEPRINT-4: the templates' revision. New or changed templates alone (assets/blueprints) leave both
         /// DLLs - and so the build ids in the package names - as they were; bumping this with each new set changes them, and
         /// the log line shows it (as Models.VanModelRev does for the van).</summary>
-        internal const string Rev = "GO-BLUEPRINT-6 (11 templates: centers A1 A2 C1, offices A3 C1 D2 J1; D2 with 18 workplaces; desks linked to their computers and chairs)";
+        internal const string Rev = "GO-BLUEPRINT-7 (11 templates: centers A1 A2 C1, offices A3 C1 D2 J1; D2 with 18 workplaces; desks linked to their computers and chairs; at the counters the staff on the office chair, the customers in the armchair)";
 
         static bool _done;
 

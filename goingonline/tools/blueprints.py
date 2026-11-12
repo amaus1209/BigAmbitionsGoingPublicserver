@@ -74,7 +74,8 @@ def link(desk, *children):
     Schreibtisch"): the game knows a computer stands on a desk and a chair belongs to it only through the desk's
     stackedItems (childId, childItemName, attachmentIndex) - placed side by side without them the workplace misses both.
     The desks' points, from the game's own layouts: specialemployeedesksmall 1 computer (0, 0.74, 0), 2 the staff's
-    chair (z +0.75, turned 180), 3 the customer's chair (z -1.0); officedesk1 0 monitor, 1 computer, 2 chair (z +0.75).
+    chair (z +0.75, turned 180), 3 the customer's chair (z -1.0) - GO-BLUEPRINT-7 (user 2026-11-12: "mitarbeiter setzen
+    sich auf dem sessel"): the staff get the office chair, the customers the armchair; officedesk1 0 monitor, 1 computer, 2 chair (z +0.75).
     children: (item, attachment index)."""
     desk["stackedItems"] = [{"childId": c["id"], "childItemName": c["itemName"], "attachmentIndex": i} for c, i in children]
 
@@ -99,11 +100,11 @@ def center_a2():
     # one at the right wall - the person working sits behind the desk, the customer's chair in front
     for x in (997.7, 1001.3):   # 997.7: 12 cm from the left wall
         d = add(ba("specialemployeedesksmall"), x, 0.0, 49.6, 0)
-        link(d, (add("goingonline:itemname_godesk", x, 0.74, 49.6, 0), 1), (add(ba("armchair1"), x, 0.0, 50.35, 180), 2),
-             (add(ba("multipurposechair"), x, 0.0, 48.6, 0), 3))
+        link(d, (add("goingonline:itemname_godesk", x, 0.74, 49.6, 0), 1), (add(ba("multipurposechair"), x, 0.0, 50.35, 180), 2),
+             (add(ba("armchair1"), x, 0.0, 48.6, 0), 3))
     d = add(ba("specialemployeedesksmall"), 1003.3, 0.0, 48.3, 90)
-    link(d, (add("goingonline:itemname_godesk", 1003.3, 0.74, 48.3, 90), 1), (add(ba("armchair1"), 1004.05, 0.0, 48.3, 270), 2),
-         (add(ba("multipurposechair"), 1002.3, 0.0, 48.3, 90), 3))
+    link(d, (add("goingonline:itemname_godesk", 1003.3, 0.74, 48.3, 90), 1), (add(ba("multipurposechair"), 1004.05, 0.0, 48.3, 270), 2),
+         (add(ba("armchair1"), 1002.3, 0.0, 48.3, 90), 3))
     # the promo spot on three TVs: both side walls and the partition, a clock, water, plants
     add(ba("wallmountedtv"), 996.58, 2.6, 45.35, 90)
     add(ba("wallmountedtv"), 1004.42, 2.6, 44.3, 270)
@@ -249,8 +250,8 @@ def center_a1():
     add = lambda n, x, y, z, yaw: (out.append(item(t, n, x, y, z, yaw)), out[-1])[1]
     # the second desk where the counter stood, at the right wall: staff at the wall, the customer in front
     d = add(ba("specialemployeedesksmall"), 1000.25, 0.0, -0.9, 90)
-    link(d, (add("goingonline:itemname_godesk", 1000.25, 0.74, -0.9, 90), 1), (add(ba("armchair1"), 1001.0, 0.0, -0.9, 270), 2),
-         (add(ba("multipurposechair"), 999.25, 0.0, -0.9, 90), 3))
+    link(d, (add("goingonline:itemname_godesk", 1000.25, 0.74, -0.9, 90), 1), (add(ba("multipurposechair"), 1001.0, 0.0, -0.9, 270), 2),
+         (add(ba("armchair1"), 999.25, 0.0, -0.9, 90), 3))
     # the devices on show right of the entrance (it is at x 998 - 1000 in front)
     add("goingonline:itemname_godevicetable", 1001.13, 0.0, -3.0, 270)
     # the back room: two storage shelves for the devices (along the toilet's wall and the left wall), the cleaning
@@ -281,8 +282,8 @@ def center_c1():
             add(ba("waitingroomchairs"), x, 0.0, z, 0)
     for x in (943.9, 946.4, 948.8, 951.2, 953.6):     # the desks: staff behind, the customer in front
         d = add(ba("specialemployeedesksmall"), x, 0.0, 1.4, 0)
-        link(d, (add("goingonline:itemname_godesk", x, 0.74, 1.4, 0), 1), (add(ba("armchair1"), x, 0.0, 2.15, 180), 2),
-             (add(ba("multipurposechair"), x, 0.0, 0.4, 0), 3))
+        link(d, (add("goingonline:itemname_godesk", x, 0.74, 1.4, 0), 1), (add(ba("multipurposechair"), x, 0.0, 2.15, 180), 2),
+             (add(ba("armchair1"), x, 0.0, 0.4, 0), 3))
     add(ba("largewallclock"), 942.58, 2.5, 1.0, 90)
     add(ba("watercooler"), 943.0, 0.0, -0.6, 90)
     add(ba("exitsign"), 950.0, 4.25, -7.28, 0)

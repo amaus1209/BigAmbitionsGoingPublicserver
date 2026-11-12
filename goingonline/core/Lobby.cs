@@ -239,28 +239,27 @@ namespace GoingOnline
             v.Step = 6;
         }
 
-        /// <summary>GO-LOBBY-2: the customers' seat at a desk - a free seat on the same counter that is not the staff's (the
-        /// staff take the one on the screen's side, GO-COUNTER-SEAT-1, so the customers' is the one furthest the other way).</summary>
+        /// <summary>GO-LOBBY-2: the customers' seat at a desk - a free seat on the same counter that is not the staff's
+        /// (GO-COUNTER-SEAT-1): the armchair, else the one furthest from the staff's seat.</summary>
         static (SeatController?, Transform?) CustomerSeat(ItemController desk)
         {
             try
             {
-                ItemController root = desk;
-                while (root.parentItemController != null) root = root.parentItemController;
-                if (root == desk) return (null, null);
-                Vector3 at = desk.transform.position, fwd = desk.transform.forward;
+                var root = GamePatches.CounterOf(desk);
+                if (root == null) return (null, null);
+                var staff = GamePatches.StaffSeat(desk, root, false);
                 SeatController? best = null;
-                float bestSide = 0.05f;
+                float bestScore = float.MinValue;
                 var stack = new Stack<ItemController>();
                 stack.Push(root);
                 while (stack.Count > 0)
                 {
                     var ic = stack.Pop();
                     if (ic == null) continue;
-                    if (ic is SeatController seat && !seat.Occupied && seat.SittingPosition != null && seat.IsSittingPositionAvailable(seat.SittingPosition))
+                    if (ic != staff && ic is SeatController seat && !seat.Occupied && seat.SittingPosition != null && seat.IsSittingPositionAvailable(seat.SittingPosition))
                     {
-                        float side = Vector3.Dot(ic.transform.position - at, fwd);
-                        if (side > bestSide) { bestSide = side; best = seat; }
+                        float score = (staff != null ? (ic.transform.position - staff.transform.position).sqrMagnitude : 0f) + (GamePatches.IsArmchair(ic) ? 100f : 0f);
+                        if (score > bestScore) { bestScore = score; best = seat; }
                     }
                     foreach (var c in ic.childItemControllers) stack.Push(c);
                 }
