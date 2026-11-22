@@ -91,8 +91,9 @@ namespace GoingOnline
                 SelfSetup();
                 if (_mr == null) { enabled = false; return; }
             }
-            if (_mf == null || _mf.sharedMesh != _mesh)
-            {   // the car no longer wears the van (a traffic car given back): our glow goes, and so do we
+            if (_mf == null || !Van.WearsVan(_mf.sharedMesh, _mesh))
+            {   // the car no longer wears the van (a traffic car given back): our glow goes, and so do we (a dented van still
+                // wears it - GO-VAN-21)
                 Clear();
                 Destroy(this);
                 return;

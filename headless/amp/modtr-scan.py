@@ -15,6 +15,14 @@ One console line per mod ("[ModTr] ..."), a summary in <out>/report.json. Change
 """
 import json, os, re, struct, sys
 
+# LANG-1: console lines and the read-me follow "Server language" (BAMP_LANG from bamp-prestart.sh): German for "de"
+DE = os.environ.get("BAMP_LANG", "en") == "de"
+
+
+def t(en, de):
+    return de if DE else en
+
+
 GAME_LANGS = ["en", "de", "fr", "es", "it", "pt", "nl", "da", "fi", "pl", "cs", "hu", "ro", "lt", "el", "tr", "ru",
               "uk", "ja", "ko", "zh-cn", "zh-tw"]
 
@@ -129,6 +137,28 @@ def editable(out, roots, kind, mod, english, langs):
         write(os.path.join(base, kind, mod, lang + ".json"), {k: cur.get(k, v) for k, v in english.items()})
 
 
+README_EN = """Editing translations yourself (Going Public Server)
+==================================================
+
+ModTranslations/ has exactly the layout of the folder ModTranslations/ in the GitHub repository:
+  Locales/<mod>/<language>.json  - mods with their own translation files (key: text)
+  Texts/<mod>/<language>.json    - mods with fixed English text (English text: translation)
+  _english/...                   - the English original to compare with (do not change)
+
+Every file already holds all lines: translated where a translation exists, the English text otherwise.
+
+How to:
+ 1. Download the file of the language you want (de = German, fr = French, ... zh-tw = Chinese traditional).
+ 2. Translate ONLY the text right of the colon. The left side (the key or the English text) stays exactly as it is.
+    Keep placeholders like {0}, {name} or {businessName} and marks like <b> ... </b> and \\n unchanged.
+ 3. In Texts/: translate only lines that really show in the game. Leave internal names alone - a line that stays the
+    same changes nothing.
+ 4. Upload to the same folder of the repository on GitHub (Add file -> Upload files), e.g.
+    ModTranslations/Locales/SmartSuite/de.json, and commit. Upload the folder _english/ too the first time.
+ 5. GitHub checks the placeholders and renews index.json by itself (tab "Actions", green tick). At the next game start
+    every player has the translation. A red X names the line with the error.
+"""
+
 README = """Übersetzungen selbst bearbeiten (Going Public Server)
 =====================================================
 
@@ -178,10 +208,14 @@ def main(mods, gps_tr, out):
                 english = json.load(open(os.path.join(loc, "en.json"), encoding="utf-8-sig"))
                 editable(out, roots, "Locales", mod, english, [l for l in GAME_LANGS if l not in own and l not in regional])
             except Exception as ex:
-                print(f"[ModTr] {mod}: en.json nicht lesbar ({ex})")
-            print(f"[ModTr] {mod} ({name}): eigene Sprachen {len(own)}, von Going Public Server {len(ours)}"
-                  + (f" (+ {', '.join(sorted(regional))} aus der regionalen Datei)" if regional else "")
-                  + (f", fehlen: {', '.join(missing)}" if missing else ", alle Spielsprachen vorhanden"))
+                print(f"[ModTr] {mod}: " + t(f"en.json unreadable ({ex})", f"en.json nicht lesbar ({ex})"))
+            print(f"[ModTr] {mod} ({name}): "
+                  + t(f"own languages {len(own)}, from Going Public Server {len(ours)}",
+                      f"eigene Sprachen {len(own)}, von Going Public Server {len(ours)}")
+                  + (t(f" (+ {', '.join(sorted(regional))} from the regional file)",
+                       f" (+ {', '.join(sorted(regional))} aus der regionalen Datei)") if regional else "")
+                  + (t(f", missing: {', '.join(missing)}", f", fehlen: {', '.join(missing)}") if missing
+                     else t(", all game languages there", ", alle Spielsprachen vorhanden")))
         else:
             ours = tables(roots, "Texts", mod)
             if ours:
@@ -192,22 +226,27 @@ def main(mods, gps_tr, out):
                     for k in table(roots, "Texts", mod, lang):
                         keys.setdefault(k, k)
                 editable(out, roots, "Texts", mod, keys, [l for l in GAME_LANGS if l != "en"])
-                print(f"[ModTr] {mod} ({name}): feste Texte, übersetzt in {len(ours)} Sprache(n)"
-                      + (f", fehlen: {', '.join(missing)}" if missing else ", alle Spielsprachen vorhanden"))
+                print(f"[ModTr] {mod} ({name}): "
+                      + t(f"fixed texts, translated into {len(ours)} language(s)",
+                          f"feste Texte, übersetzt in {len(ours)} Sprache(n)")
+                      + (t(f", missing: {', '.join(missing)}", f", fehlen: {', '.join(missing)}") if missing
+                         else t(", all game languages there", ", alle Spielsprachen vorhanden")))
             else:
                 try:
                     cands = sorted({s for s in user_strings(os.path.join(d, dll)) if looks_visible(s)})
                 except Exception as ex:
                     cands = []
-                    print(f"[ModTr] {mod} ({name}): DLL nicht lesbar ({ex})")
+                    print(f"[ModTr] {mod} ({name}): " + t(f"DLL unreadable ({ex})", f"DLL nicht lesbar ({ex})"))
                 entry.update(kind="untranslated", candidates=len(cands))
                 if cands:
                     editable(out, roots, "Texts", mod, {c: c for c in cands}, [l for l in GAME_LANGS if l != "en"])
-                print(f"[ModTr] {mod} ({name}): keine Übersetzungen - {len(cands)} mögliche Anzeigetexte"
+                print(f"[ModTr] {mod} ({name}): "
+                      + t(f"no translations - {len(cands)} possible display texts",
+                          f"keine Übersetzungen - {len(cands)} mögliche Anzeigetexte")
                       + (f" in modtr-templates/ModTranslations/Texts/{mod}/" if cands else ""))
         report.append(entry)
     json.dump(report, open(os.path.join(out, "report.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-    open(os.path.join(out, "LIESMICH.txt"), "w", encoding="utf-8").write(README)
+    open(os.path.join(out, t("README.txt", "LIESMICH.txt")), "w", encoding="utf-8").write(t(README_EN, README))
 
 
 if __name__ == "__main__":

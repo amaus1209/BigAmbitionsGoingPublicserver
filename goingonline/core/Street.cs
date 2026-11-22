@@ -296,7 +296,37 @@ namespace GoingOnline
             go.transform.SetPositionAndRotation(pos, rot);
             go.AddComponent<MeshFilter>().sharedMesh = model.Mesh;
             go.AddComponent<MeshRenderer>().sharedMaterials = Models.MaterialsFor(model, id, tint, null);
+            Obstacle(go, model.Mesh.bounds, id == "gostreetcab");
             return go;
+        }
+
+        static bool _obstacleWarned;
+
+        /// <summary>GO-STREET-NAV-1 (user 2026-11-20 chose "Hindernis an Mod-Objekten": passers-by and staff walk around our
+        /// models): the pieces in the street had no collider and no NavMesh obstacle, so pedestrians walked through them.
+        /// Now each gets a box obstacle of its model's size, as the game's furniture and cars have one. The cabinet carves the
+        /// NavMesh (stationary, like the game's own pieces): it stands 0.5 - 1.4 m off the facade, pedestrians path around it.
+        /// Barriers and cones only take part in the agents' avoidance (no carving): the road works reach up to ~2.8 m into the
+        /// pavement and could otherwise cut a narrow pavement off - with avoidance a pedestrian steers around them and still
+        /// gets through. Still no collider: nothing can get stuck on them (GO-STREET-1). Measured 2026-11-20: the racks and
+        /// the device table keep the obstacle of their template (BigCabinet 0.70 x 0.99 m, ConsoleTableRattan 2.0 x 0.5 m),
+        /// which covers our models within 5 cm; the van keeps the Honza's (1.99 x 4.58 m), the van's body fits it, only the
+        /// mirrors stand out.</summary>
+        static void Obstacle(GameObject go, Bounds b, bool carve)
+        {
+            try
+            {
+                var ob = go.AddComponent<UnityEngine.AI.NavMeshObstacle>();
+                ob.shape = UnityEngine.AI.NavMeshObstacleShape.Box;
+                ob.center = b.center;
+                ob.size = b.size;
+                ob.carveOnlyStationary = true;
+                ob.carving = carve;
+            }
+            catch (System.Exception ex)
+            {
+                if (!_obstacleWarned) { _obstacleWarned = true; Go.Warn("street: no NavMesh obstacle on " + go.name + ": " + ex.Message + " (GO-STREET-NAV-1)."); }
+            }
         }
 
         static void Kill(ref GameObject? go)

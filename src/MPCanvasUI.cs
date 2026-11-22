@@ -438,7 +438,7 @@ namespace BigAmbitionsMP
             try
             {
                 UI.Notification.Notifications.Show(UI.Notification.NotificationType.Error,
-                    $"{MyPluginInfo.SHORT_NAME} is installed twice (Steam Workshop + local mods). The extra copy was disabled — please remove one install.");
+                    Loc.T("gps_dup_install", "{0} is installed twice (Steam Workshop and local mods, or the normal and the beta version). The extra copy was turned off - keep only one.", MyPluginInfo.SHORT_NAME));   // BETA-CHANNEL-1: the beta item is a second subscription
             }
             catch { }
         }
@@ -4068,7 +4068,7 @@ namespace BigAmbitionsMP
                     vrt.sizeDelta = new Vector2(620f, 24f);
                     vrt.anchoredPosition = new Vector2(14f, 50f);   // +8px (half the font size) — 42 partially overlapped the native version line (user, 2026-07-26)
                     var vt = _mpVersionTag.AddComponent<TextMeshProUGUI>();
-                    vt.text = $"GPS-MM v. {MyPluginInfo.PLUGIN_VERSION}" + (MyPluginInfo.BuildId.Length > 0 ? $" ({MyPluginInfo.BuildId})" : "");   // user 2026-11-01: short (GPS-MM = Going Public Server multiplayer mod); BUILD-ID-1
+                    vt.text = $"GPS-MM v. {MyPluginInfo.PLUGIN_VERSION}" + (MyPluginInfo.IsBeta ? " Beta" : "") + (MyPluginInfo.BuildId.Length > 0 ? $" ({MyPluginInfo.BuildId})" : "");   // user 2026-11-01: short (GPS-MM = Going Public Server multiplayer mod); BUILD-ID-1
                     vt.fontSize = 15;
                     vt.color = new Color(0.75f, 0.78f, 0.90f, 0.95f);
                     vt.alignment = TextAlignmentOptions.BottomLeft;

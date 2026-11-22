@@ -4,7 +4,22 @@ namespace BigAmbitionsMP
     {
         public const string PLUGIN_GUID = "com.bigambitions.multiplayer";
         public const string PLUGIN_NAME = "BigAmbitionsMP";
-        public const string PLUGIN_VERSION = "1.0.17.3";   // Going Public Server (fork of Going Public 0.3.3)
+#if !BAMP_BETA
+        public const string PLUGIN_VERSION = "1.0.17.4";   // Going Public Server (fork of Going Public 0.3.3)
+#else
+        public const string PLUGIN_VERSION = "1.0.17.5";   // beta channel (BETA-CHANNEL-1): the next version - keep it above the stable one
+#endif
+
+        /// <summary>BETA-CHANNEL-1 (user 2026-11-13): "stable" (the normal Workshop item and GitHub releases) or "beta" (the
+        /// Workshop item "Going Public Server (Beta)", GitHub pre-releases; a build with -p:BampChannel=beta). Its own version
+        /// number keeps beta players on beta servers - the join check compares PLUGIN_VERSION.</summary>
+        public const string CHANNEL =
+#if BAMP_BETA
+            "beta";
+#else
+            "stable";
+#endif
+        public const bool IsBeta = CHANNEL == "beta";
 
         /// <summary>Official public name (Steam Workshop title, UI, bug reports,
         /// release notes).  NAMING POLICY (2026-07-09): only DISPLAY text uses
@@ -14,9 +29,15 @@ namespace BigAmbitionsMP
         /// save folders, BAMP_DUTY_ employee ids (repair sweeps key on the
         /// prefix), config paths, the "BAMP:version:" wire tag, and the
         /// X-BAMP-Key relay header.</summary>
+#if BAMP_BETA
+        public const string DISPLAY_NAME = "Going Public Server (Beta): Multiplayer for Big Ambitions with a dedicated server";
+        /// <summary>Short form for tight UI spots.</summary>
+        public const string SHORT_NAME = "Going Public Server (Beta)";
+#else
         public const string DISPLAY_NAME = "Going Public Server: Multiplayer for Big Ambitions with a dedicated server";
         /// <summary>Short form for tight UI spots.</summary>
         public const string SHORT_NAME = "Going Public Server";
+#endif
 
         /// <summary>True only in a `-c Dev` build (BAMP_DEV defined) — the
         /// test/diagnostic scaffolding is compiled in.  Shipped builds are false.</summary>

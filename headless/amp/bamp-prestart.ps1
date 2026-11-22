@@ -10,11 +10,28 @@
 #     key           the key players type into "Server key" (SERVER-KEY-1)
 #     mods          Going Public Server and the extra mods into <root>\mods, the list of extra mods for the players
 #     all           leftovers, settings, key, mods
+#     steam <name>  update stage: the game through SteamCMD with its remembered login (STEAM-LOGIN-1), not part of "all"
 param([string]$Step = "all", [string]$Root = "", [string]$Conf = "", [string]$Lang = "")
 $ErrorActionPreference = "Continue"
-try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+# PRESTART-WIN-2 (first run on Windows 10, 2026-11-13): AMP reads a stage's output in the console's code page (OEM, 850
+# on a German Windows) - UTF-8 made "Schl├╝ssel" of "Schlüssel". The output stays in the console's own code page.
 
 function Say([string]$t) { Write-Output "[BAMP-Start] $t" }
+
+# PRESTART-WIN-2: Windows PowerShell 5.1's ConvertFrom-Json refuses an empty key - the template has one ("" in the
+# EnumValues of "DedicatedSession": the world played last) and the step "settings" stopped there. JavaScriptSerializer
+# (.NET Framework) reads it: objects come back as dictionaries, lists as arrays.
+function Read-JsonFile([string]$path) {
+    Add-Type -AssemblyName System.Web.Extensions
+    $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $js.MaxJsonLength = 67108864
+    return $js.DeserializeObject([IO.File]::ReadAllText($path))
+}
+
+function Field($d, [string]$k) {
+    if ($d -is [Collections.IDictionary] -and $d.ContainsKey($k)) { return $d[$k] }
+    return $null
+}
 
 if ($Root.Length -eq 0) { Say "bamp-prestart.ps1: kein Server-Ordner angegeben - nichts zu tun."; exit 0 }
 $Root = [IO.Path]::GetFullPath($Root.TrimEnd('\', '/', '.').TrimEnd('\', '/'))
@@ -65,7 +82,7 @@ function Step-Settings {
         $first = '{"ServerLanguage": "en", "Headless": true, "DedicatedHost": true, "DedicatedSession": "", "DedicatedNewGame": "", ' +
                  '"DedicatedLoadSave": "", "PlayerId": "Server", "HostPort": 7777, "DedicatedIdleGraceSeconds": 0, "DedicatedAfkMinutes": 5, ' +
                  '"DedicatedPauseInMenu": true, "DedicatedRequireKey": true, "DedicatedAutoAccept": true, "AutosaveMinutes": 5, ' +
-                 '"AutosaveSlots": "3", "MaxPlayers": "8", "PlayerWebUrl": "", "HeadlessFps": 30, "HeadlessIdleFps": 5, "TelemetryKey": ""}'
+                 '"AutosaveSlots": "3", "MaxPlayers": "8", "PlayerWebUrl": "", "HeadlessFps": 200, "HeadlessIdleFps": 5, "TelemetryKey": ""}'
         [IO.File]::WriteAllText($Conf, $first + "`n", $Utf8)
         Say "bamp-server.json angelegt."
     }
@@ -76,14 +93,17 @@ function Step-Settings {
     $have = @{}
     foreach ($p in $c.PSObject.Properties) { $have[$p.Name] = $true }
     $added = @()
-    foreach ($s in ([IO.File]::ReadAllText($manifest) | ConvertFrom-Json)) {
-        $field = [string]$s.ParamFieldName
+    $settings = @()
+    try { $settings = @(Read-JsonFile $manifest) } catch { Say "bigambitionsconfig.json ist nicht lesbar: $($_.Exception.Message)"; return }
+    foreach ($s in $settings) {
+        $field = [string](Field $s "ParamFieldName")
         if (-not $field.StartsWith('$.')) { continue }
         $key = $field.Substring(2)
         if ($have.ContainsKey($key)) { continue }
-        $v = $s.DefaultValue
-        if ($s.InputType -eq "checkbox") { $v = ([string]$v).ToLower() -eq "true" }
-        elseif ($s.InputType -eq "number") {
+        $v = Field $s "DefaultValue"
+        $type = [string](Field $s "InputType")
+        if ($type -eq "checkbox") { $v = ([string]$v).ToLower() -eq "true" }
+        elseif ($type -eq "number") {
             $i = 0; $f = 0.0
             if ([int]::TryParse([string]$v, [ref]$i)) { $v = $i }
             elseif ([double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$f)) { $v = $f }
@@ -216,7 +236,55 @@ function Step-Mods {
     if ($entries.Count -gt 0) { Say ("$($entries.Count) Server-Mod(s) in der Liste für Spieler: " + (($entries | ForEach-Object { $_.folder }) -join ", ")) }
 }
 
+# STEAM-LOGIN-1 (user 2026-11-13: "möchte die zugangsdaten in der instanz unter einstellungen bigambitions eintragen", then
+# "Nur Kontoname"): the update stage "SteamCMD Download (remembered login)" when the AMP setting SteamUpdateLogin is
+# "remembered" - the game through SteamCMD with the login it remembered on this server after one login through AMP's
+# window (Steam Guard is asked only then). Only the account name (4th argument, AMP setting SteamUpdateUser), no password;
+# SteamCMD's token lies in <root>\config, where AMP's own SteamCMD stage keeps it. +@NoPromptForPassword and a closed
+# stdin: a login SteamCMD no longer remembers fails at once with a message instead of waiting for a password at night;
+# a run that hangs ends after two hours. The account name never reaches AMP's console or log (shown as <Konto>).
+function Step-Steam([string]$user) {
+    $user = ([string]$user).Trim()
+    if ($user.Length -eq 0) { Say "Steam-Anmeldung 'Gemerkte Anmeldung' ist gewählt, aber kein Steam-Kontoname eingetragen (Einstellungen > Big Ambitions > Steam-Updates)."; exit 1 }
+    if ($user -notmatch '^[A-Za-z0-9_.@-]{1,64}$') { Say "Der Steam-Kontoname enthält Zeichen, die hier nicht gehen (erlaubt: Buchstaben, Ziffern, _ . @ -)."; exit 1 }
+    $exe = Join-Path $Root "steamcmd.exe"
+    if (-not (Test-Path -LiteralPath $exe)) { Say "SteamCMD fehlt in dieser Instanz - einmal mit 'Steam-Anmeldung: Login-Fenster' aktualisieren."; exit 1 }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = '+@ShutdownOnFailedCommand 1 +@NoPromptForPassword 1 +@sSteamCmdForcePlatformType windows +force_install_dir "' +
+                     (Join-Path $Root "1331550") + '" +login ' + $user + ' +app_update 1331550 +quit'
+    $psi.WorkingDirectory = $Root
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    Say "Spiel-Update über SteamCMD mit der gemerkten Anmeldung ..."
+    $p = [Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Close()   # no password prompt can wait for an answer
+    $null = $p.StandardError.ReadToEndAsync()
+    $ok = $false; $why = ""
+    $deadline = (Get-Date).AddHours(2)
+    while ($true) {
+        $t = $p.StandardOutput.ReadLineAsync()
+        while (-not $t.Wait(1000)) { if ((Get-Date) -gt $deadline) { break } }
+        if (-not $t.IsCompleted) { try { $p.Kill() } catch { }; $why = "nach zwei Stunden abgebrochen"; break }
+        $line = $t.Result
+        if ($null -eq $line) { break }
+        if ($line -match "Success! App '1331550' (fully installed|already up to date)") { $ok = $true }
+        if ($line -match '(?i)Cached credentials not found|password|Login Failure|Steam Guard|two-factor|Rate Limit|Expired|FAILED') { $why = $line.Trim() }
+        if ($line.Trim().Length -gt 0) { Write-Output ("[SteamCMD] " + $line.Replace($user, '<Konto>')) }
+    }
+    $null = $p.WaitForExit(30000)
+    if ($ok) { Say "Spiel-Update mit der gemerkten Steam-Anmeldung fertig."; return }
+    $why = $why.Replace($user, '<Konto>')
+    Say ("Spiel-Update mit der gemerkten Steam-Anmeldung ging nicht" + $(if ($why.Length -gt 0) { " ($why)" } else { "" }) +
+         ". Steam-Anmeldung einmal auf 'Login-Fenster' stellen, Update drücken und anmelden, danach wieder 'Gemerkte Anmeldung'.")
+    exit 1
+}
+
 switch ($Step) {
+    "steam" { Step-Steam $Lang }   # STEAM-LOGIN-1: the 4th argument is the Steam account name here
     "leftovers" { Step-Leftovers }
     "settings" { Step-Settings }
     "localize" { Step-Localize }

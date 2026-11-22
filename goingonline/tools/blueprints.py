@@ -368,6 +368,107 @@ def office_d2(full):
     return t, "ba:buildingsize_d", 2, out, {"desks": 18, "racks": len(racks)}
 
 
+def center_m1():
+    """GO-BLUEPRINT-8 (user 2026-11-13: "Vorlage Kundencenter M1 mit 75 Mitarbeiter"): a big customer center in a retail
+    building M1, planned on the room's shape read from all the game's M1 layouts: the hall x 1030.6 - 1059.4, z -173.4
+    (the wall to the stock room, its doors at both ends: the staff-only signs at x 1033.4 and 1056.9) to -139.6 (the
+    front: two entrances, where the shops put their security panels and exit signs, x 1034 - 1038 and 1052 - 1056); the
+    toilet room in front between them (x 1041.4 - 1048.6, z -143.6 - -139.6, its doors at x 1043.5 and 1046.5).
+    75 customer desks (customer service is the center's only job): one row of 9 in front of the stock room wall (its doors
+    free) and three double rows of 2 x 11 - the staff back to back in the middle (1.5 m between the chairs), the
+    customers' armchairs outside, 1.5 m aisles between the armchairs of the rows. 24 waiting seats in front of the toilet
+    room (a 1.5 m passage to its doors kept), four device tables by the entrances along the side walls, the promo spot on
+    five TVs; the stock room behind: four storage shelves for the devices, the cleaning station, the game's delivery spot."""
+    t = "GO Kundencenter M1"
+    out = from_game(t, "Empty/M1/default")   # the game's lamps, delivery spot and hand truck
+    out += from_game(t, "Supermarket/M1/SupermarketRivals",
+                     keep=lambda n, x, z: 1040.5 <= x <= 1049.5 and z >= -144.0 and n in (
+                         "toiletstall", "sink", "mirrorwallmounted", "handdryer", "bathroomsignwallmounted"))
+    add = lambda n, x, y, z, yaw: (out.append(item(t, n, x, y, z, yaw)), out[-1])[1]
+
+    def counter(x, z, yaw):
+        """A customer desk: the person working behind it (0.75 m), the customer's armchair in front (1.0 m)."""
+        a = math.radians(yaw)
+        sx, sz = math.sin(a), math.cos(a)
+        d = add(ba("specialemployeedesksmall"), x, 0.0, z, yaw)
+        link(d, (add("goingonline:itemname_godesk", x, 0.74, z, yaw), 1),
+             (add(ba("multipurposechair"), x + 0.75 * sx, 0.0, z + 0.75 * sz, (yaw + 180) % 360), 2),
+             (add(ba("armchair1"), x - 1.0 * sx, 0.0, z - 1.0 * sz, yaw), 3))
+
+    n = 0
+    for i in range(9):                                  # the back row: staff to the wall, the customers in front
+        counter(1045.0 + 2.2 * (i - 4), -171.85, 180); n += 1
+    # the double rows: row A (yaw 0) has its customers behind it (-z), row B (yaw 180) in front (+z); the armchairs of
+    # neighbouring rows 1.5 m apart (0.74 m deep each), the desks of a double row 3.0 m apart
+    za = -167.61
+    for _ in range(3):
+        for i in range(11):
+            x = 1033.0 + 2.4 * i
+            counter(x, za, 0); counter(x, za + 3.0, 180); n += 2
+        za += 3.0 + 1.0 + 0.37 + 1.5 + 0.37 + 1.0       # B's armchair, the aisle, the next A's armchair
+    # the waiting room: two rows of four benches facing the desks, the toilet doors' passage (z -143.6 .. -145.1) free
+    for z in (-145.45, -146.85):
+        for x in (1041.85, 1043.95, 1046.05, 1048.15):
+            add(ba("waitingroomchairs"), x, 0.0, z, 180)
+    # the devices on show by the entrances, along the side walls
+    for z in (-141.4, -143.7):
+        add("goingonline:itemname_godevicetable", 1030.88, 0.0, z, 90)
+        add("goingonline:itemname_godevicetable", 1059.12, 0.0, z, 270)
+    # the promo spot, clock, water, plants, signs
+    for z in (-151.0, -163.0):
+        add(ba("wallmountedtv"), 1030.58, 2.6, z, 90)
+        add(ba("wallmountedtv"), 1059.42, 2.6, z, 270)
+    add(ba("wallmountedtv"), 1045.0, 2.7, -143.62, 180)
+    add(ba("largewallclock"), 1030.58, 2.5, -157.0, 90)
+    add(ba("watercooler"), 1040.6, 0.0, -145.6, 180)
+    add(ba("watercooler"), 1049.4, 0.0, -145.6, 180)
+    for x in (1031.2, 1058.8):
+        add(ba("groundplant02"), x, 0.0, -147.8, 0)
+    for x in (1036.0, 1054.0):
+        add(ba("exitsign"), x, 4.0, -139.6, 180)
+    for x in (1033.4, 1056.9):
+        add(ba("signstaffonly"), x, 3.1, -173.4, 0)
+    # the stock room: the devices on four storage shelves along its back wall (the delivery spot at the right stays free)
+    for x in (1035.3, 1038.5, 1041.7, 1044.9):
+        add(ba("storageshelf"), x, 0.0, -178.1, 0)
+    add(ba("cleaningstation"), 1031.2, 0.0, -177.6, 90)
+    for x, z in ((1040.0, -150.0), (1050.0, -150.0), (1040.0, -164.0), (1050.0, -164.0), (1045.0, -176.0)):
+        add(ba("securitycameraroof"), x, 4.5, z, 0)
+    return t, "ba:buildingsize_m", 1, out, {"seats": 24, "desks": n, "tables": 4, "tvs": 5}
+
+
+def office_k1(full):
+    """GO-BLUEPRINT-8 (user 2026-11-13: "design für Büro K1 50 Arbeitsplätze"): the K1 web development agency (21.4 x 29.6 m)
+    as a big cable office - its 50 computer workplaces stay where the game puts them and become Going Online's: the back
+    block next to the headend (z -46 and -44.5, 12) the control room (switching staff, network masters), the rest of the
+    back block (z -42.5 .. -39, 20) technical workplaces, the front block (18) office workplaces (customer service,
+    technical support, field sales). The lounge behind the glass walls at the back left becomes the headend: the racks
+    along its back wall, UPS and generator facing them, two storage shelves for the devices; its sofas, armchairs, the
+    table with the coffee machine, plants and the water cooler go. Toilets (4), sinks (4), reception, kitchen and the
+    seating corners stay as the game has them - 4 toilet stalls and 4 sinks are the office's maximum requirement."""
+    t = "GO Kabel-Büro K1 (" + ("Voll" if full else "Start") + ")"
+    gone = ["cornersofa01", "cornersofa02right", "armchair1", "groundplant02",
+            ("cheapcoffeemachine", 1040.1, -56.0), ("deskplant02", 1038.9, -56.0), ("table1", 1039.5, -56.0),
+            ("watercooler", 1032.75, -55.0)]
+    def kind(n, x, z):
+        if n != "computer":
+            return None
+        k = "gocontroldesk" if z <= -44.4 else "gotechdesk" if z <= -38.9 else "godesk"
+        return "goingonline:itemname_" + k
+    out = from_game(t, "WebDevelopmentAgency/K1/WebDevelopmentAgency", drop=gone, rename=kind)   # GO-BLUEPRINT-6: keeps the desks' links
+    add = lambda n, x, y, z, yaw: (out.append(item(t, n, x, y, z, yaw)), out[-1])[1]
+    racks = RACKS_FULL if full else RACKS_START
+    row1 = [r for r in racks if r not in ("goups", "gogenerator")]
+    for i, r in enumerate(row1):                       # along the back wall (z -56.45), facing into the room
+        add("goingonline:itemname_" + r, 1033.1 + 0.7 * i, 0.0, -55.9, 0)
+    for i, r in enumerate([r for r in racks if r in ("goups", "gogenerator")]):
+        add("goingonline:itemname_" + r, 1033.1 + 0.7 * i, 0.0, -53.4, 180)   # 1.5 m aisle in front of the racks
+    for x in (1040.3, 1043.4):                         # the devices' stock, right of the racks
+        add(ba("storageshelf"), x, 0.0, -56.15, 0)
+    desks = sum(1 for i in out if i["itemName"] in ("goingonline:itemname_gotechdesk", "goingonline:itemname_gocontroldesk", "goingonline:itemname_godesk"))
+    return t, "ba:buildingsize_k", 1, out, {"desks": desks, "racks": len(racks)}
+
+
 def png(path, w, h, rgb_rows):
     """A tiny PNG writer (no Pillow needed)."""
     raw = b"".join(b"\x00" + bytes(row) for row in rgb_rows)
@@ -441,10 +542,10 @@ def write(tpl, size, version, items, info, business):
     print(f"{tpl}: {len(items)} pieces, ${price:,.0f} - {info}")
 
 
-for make in (center_a2, center_a1, center_c1):
+for make in (center_a2, center_a1, center_c1, center_m1):
     tpl, size, version, items, info = make()
     write(tpl, size, version, items, info, "goingonline:businesstype_cablecenter")
-for make in (office_j1, office_a3, office_c1, office_d2):
+for make in (office_j1, office_a3, office_c1, office_d2, office_k1):
     for full in (False, True):
         tpl, size, version, items, info = make(full)
         write(tpl, size, version, items, info, "goingonline:businesstype_cableprovider")

@@ -12,6 +12,7 @@ value set on AMP's settings page. Run at three moments, the same code each time:
     seed-settings.py <bamp-server.json> <bigambitionsconfig.json>
 """
 import json
+import os
 import sys
 
 
@@ -34,15 +35,18 @@ def seed(conf_path, manifest_path):
         added.append(key[2:])
     if added:
         json.dump(c, open(conf_path, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    return added
+    return added, str(c.get("ServerLanguage", "") or os.environ.get("BAMP_LANG", "en")).strip().lower()
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     try:
-        added = seed(sys.argv[1], sys.argv[2])
+        added, lang = seed(sys.argv[1], sys.argv[2])
     except (OSError, ValueError) as e:
         sys.exit("[BAMP] seed-settings: " + str(e))
-    if added:
+    # LANG-1: the message follows "Server language" - German for "de", English otherwise
+    if added and lang == "de":
         print("[BAMP] bamp-server.json ergänzt um: " + ", ".join(added) + " (AMP trägt seine Werte beim nächsten Start ein).")
+    elif added:
+        print("[BAMP] bamp-server.json gained: " + ", ".join(added) + " (AMP writes its values there at the next start).")

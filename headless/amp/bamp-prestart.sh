@@ -14,16 +14,24 @@
 #     translations  which mods lack which game languages (MOD-TRANSLATIONS-3)
 #     translate     the chat translator, in the background (CHAT-TRANSLATE-1)
 #     all           all of them, in this order
+#     steam <name>  update stage: the game through SteamCMD with its remembered login (STEAM-LOGIN-1), not part of "all"
 set -u
 STEP="${1:-all}"
 ROOT="${2:-}"
 ROOT="${ROOT%/}"
 CONF="${3:-}"
 if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
-    echo "[BAMP-Start] bamp-prestart.sh: kein Server-Ordner angegeben - nichts zu tun."
+    echo "[BAMP-Start] bamp-prestart.sh: no server folder given - nothing to do."
     exit 0
 fi
 [ -n "$CONF" ] || CONF="$ROOT/1331550/bamp-server.json"
+# LANG-1 (PR #2053 review 2026-11-22): the messages follow the setting "Server language" - German for "de", English for
+# every other language. BAMP_LANG tells the Python helpers (seed-settings.py, modtr-scan.py, the mod list below).
+BAMP_LANG=en
+[ -f "$CONF" ] && grep -Eq '"ServerLanguage"[[:space:]]*:[[:space:]]*"[Dd][Ee]"' "$CONF" 2>/dev/null && BAMP_LANG=de
+export BAMP_LANG
+# say "<English>" "<Deutsch>"
+say() { if [ "$BAMP_LANG" = de ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
 TOOLS="$ROOT/bamp-tools"
 PREFIX_MODS="$ROOT/.proton/compatdata/pfx/drive_c/users/steamuser/AppData/LocalLow/Hovgaard Games/Big Ambitions/ModsLocal"
 
@@ -51,7 +59,8 @@ leftovers() {
         pids="$pids $p"
     done
     [ -n "$pids" ] || return 0
-    echo "[BAMP-Start] Ein Spiel vom letzten Lauf läuft noch (Prozess$pids) - es wird beendet."
+    say "[BAMP-Start] A game from the last run is still running (process$pids) - ending it." \
+        "[BAMP-Start] Ein Spiel vom letzten Lauf läuft noch (Prozess$pids) - es wird beendet."
     kill -TERM $pids 2>/dev/null
     sleep 5
     for p in $pids; do kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null; done
@@ -88,7 +97,7 @@ PY
     if [ -z "$key" ]; then
         key="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
         printf '%s\n' "$key" > "$kfile" && chmod 600 "$kfile"
-        echo "[Server] Neuer Server-Schlüssel erstellt."
+        say "[Server] New server key created." "[Server] Neuer Server-Schlüssel erstellt."
     fi
     return 0
 }
@@ -99,9 +108,9 @@ mod() {
     local src="$ROOT/bamp-mod/GoingPublicServer"
     [ -f "$src/BigAmbitionsMP.dll" ] && [ -d "$ROOT/.proton/compatdata/pfx" ] || return 0
     # the folder before the rename to GoingPublicServer: a second copy would be refused as a duplicate install
-    [ -d "$PREFIX_MODS/BigAmbitionsMP" ] && rm -rf "$PREFIX_MODS/BigAmbitionsMP" && echo "[BAMP-Start] alter Mod-Ordner BigAmbitionsMP entfernt."
+    [ -d "$PREFIX_MODS/BigAmbitionsMP" ] && rm -rf "$PREFIX_MODS/BigAmbitionsMP" && say "[BAMP-Start] Old mod folder BigAmbitionsMP removed." "[BAMP-Start] alter Mod-Ordner BigAmbitionsMP entfernt."
     if ! cmp -s "$src/BigAmbitionsMP.dll" "$PREFIX_MODS/GoingPublicServer/BigAmbitionsMP.dll"; then
-        mkdir -p "$PREFIX_MODS" && rm -rf "$PREFIX_MODS/GoingPublicServer" && cp -r "$src" "$PREFIX_MODS/" && echo "[BAMP-Start] Going Public Server aus bamp-mod/ ins Proton-Präfix kopiert."
+        mkdir -p "$PREFIX_MODS" && rm -rf "$PREFIX_MODS/GoingPublicServer" && cp -r "$src" "$PREFIX_MODS/" && say "[BAMP-Start] Going Public Server copied from bamp-mod/ into the Proton prefix." "[BAMP-Start] Going Public Server aus bamp-mod/ ins Proton-Präfix kopiert."
     fi
     return 0
 }
@@ -120,9 +129,9 @@ mods() {
             n="$(basename "$d")"
             [ "$n" = "GoingPublicServer" ] && continue
             # blueprints (Layout.json, no DLL) stay with the players - never installed on or handed out by the server
-            if [ -f "$d/Layout.json" ] && ! ls "$d"/*.dll >/dev/null 2>&1; then echo "[BAMP-Start] '$n' ist ein Blueprint - bleibt beim Spieler, nicht installiert."; continue; fi
+            if [ -f "$d/Layout.json" ] && ! ls "$d"/*.dll >/dev/null 2>&1; then say "[BAMP-Start] '$n' is a blueprint - it stays with the players, not installed." "[BAMP-Start] '$n' ist ein Blueprint - bleibt beim Spieler, nicht installiert."; continue; fi
             if ! diff -rq "$d" "$PREFIX_MODS/$n" >/dev/null 2>&1; then
-                rm -rf "${PREFIX_MODS:?}/$n" && cp -rL "$d" "$PREFIX_MODS/$n" && echo "[BAMP-Start] Mod '$n' aus bamp-mods-extra/ installiert."
+                rm -rf "${PREFIX_MODS:?}/$n" && cp -rL "$d" "$PREFIX_MODS/$n" && say "[BAMP-Start] Mod '$n' installed from bamp-mods-extra/." "[BAMP-Start] Mod '$n' aus bamp-mods-extra/ installiert."
             fi
         done
         # SERVER-MODS-2: AMP links a Workshop item into bamp-mods-extra/ but never removes the link when the item leaves
@@ -141,7 +150,8 @@ else:
                 n="$(basename "$d")"
                 [[ "$n" =~ ^[0-9]+$ ]] || continue
                 [[ " $wanted " == *" $n "* ]] && continue
-                rm -rf "$d" && echo "[BAMP-Start] Workshop-Mod '$n' ist nicht mehr unter \"Steam Workshop Items\" - entfernt ($(basename "$(dirname "$d")")/)."
+                rm -rf "$d" && say "[BAMP-Start] Workshop mod '$n' is no longer under \"Steam Workshop Items\" - removed ($(basename "$(dirname "$d")")/)." \
+                    "[BAMP-Start] Workshop-Mod '$n' ist nicht mehr unter \"Steam Workshop Items\" - entfernt ($(basename "$(dirname "$d")")/)."
             done
         fi
     fi
@@ -173,9 +183,15 @@ for f in os.listdir(out):   # mod zips of earlier versions: the server hands out
 json.dump({"mods": entries}, open(os.path.join(out, "mods.json"), "w", encoding="utf-8"), indent=1)
 ws = [e["folder"] for e in entries if e["workshop"]]
 other = [e["folder"] for e in entries if not e["workshop"]]
-print(f"[BAMP-Start] {len(entries)} Server-Mod(s) in der Liste für Spieler ({len(ws)} aus dem Workshop)" + (": " + ", ".join(ws + other) if entries else "."))
-if other:
-    print(f"[BAMP-Start] nicht im Workshop, Spieler brauchen sie von dir: {', '.join(other)}")
+names = (": " + ", ".join(ws + other) if entries else ".")
+if os.environ.get("BAMP_LANG") == "de":
+    print(f"[BAMP-Start] {len(entries)} Server-Mod(s) in der Liste für Spieler ({len(ws)} aus dem Workshop)" + names)
+    if other:
+        print(f"[BAMP-Start] nicht im Workshop, Spieler brauchen sie von dir: {', '.join(other)}")
+else:
+    print(f"[BAMP-Start] {len(entries)} server mod(s) in the list for players ({len(ws)} from the Workshop)" + names)
+    if other:
+        print(f"[BAMP-Start] not in the Workshop, players need them from you: {', '.join(other)}")
 PY
     return 0
 }
@@ -211,7 +227,7 @@ translate() {
     fi
     rm -f "$state"
     [ -f "$tool" ] || return 0
-    if ! has_python; then echo "[BAMP-Start] Chat-Übersetzung: python3 fehlt auf diesem Server - bleibt aus."; return 0; fi
+    if ! has_python; then say "[BAMP-Start] Chat translation: python3 is missing on this server - it stays off." "[BAMP-Start] Chat-Übersetzung: python3 fehlt auf diesem Server - bleibt aus."; return 0; fi
     if [ -f "$CONF" ]; then
         on="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1], encoding="utf-8-sig")).get("ChatTranslate", "true")).strip().lower())' "$CONF" 2>/dev/null || echo true)"
     fi
@@ -226,13 +242,63 @@ translate() {
         exec 9>&-
         exec nice -n 10 "$1/venv/bin/python" -I "$2" serve "$1" "$3" 0
     ' bamp-translate "$dir" "$tool" "$state" </dev/null >>"$log" 2>&1 &
-    echo "[BAMP-Start] Chat-Übersetzung startet im Hintergrund (Meldungen in headless/translate.log)."
+    say "[BAMP-Start] Chat translation starts in the background (messages in headless/translate.log)." \
+        "[BAMP-Start] Chat-Übersetzung startet im Hintergrund (Meldungen in headless/translate.log)."
     return 0
 }
 
+# STEAM-LOGIN-1 (user 2026-11-13: "möchte die zugangsdaten in der instanz unter einstellungen bigambitions eintragen", then
+# "Nur Kontoname"): the update stage "SteamCMD Download (remembered login)" when the AMP setting SteamUpdateLogin is
+# "remembered" - the game's files through SteamCMD with the login it remembered on this server after one login through
+# AMP's window (Steam Guard is asked only then). Only the account name (4th argument, AMP setting SteamUpdateUser) - no
+# password exists anywhere; SteamCMD's token lies in the instance's .virtualhome/Steam (where AMP's own SteamCMD stage
+# keeps it). +@NoPromptForPassword and a closed stdin: a login SteamCMD no longer remembers fails at once with a message
+# instead of waiting for a password at night. The account name never reaches AMP's console or log (shown as <Konto>).
+steam() {
+    local user="${1:-}" inst exe out ok=0 why=""
+    user="$(printf '%s' "$user" | tr -d '[:space:]')"
+    if [ -z "$user" ]; then
+        say "[BAMP-Start] Steam login 'Remembered login' is chosen, but no Steam account name is set (Settings > Big Ambitions > Steam updates)." \
+            "[BAMP-Start] Steam-Anmeldung 'Gemerkte Anmeldung' ist gewählt, aber kein Steam-Kontoname eingetragen (Einstellungen > Big Ambitions > Steam-Updates)."
+        exit 1
+    fi
+    if ! [[ "$user" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]]; then
+        say "[BAMP-Start] The Steam account name has characters that do not work here (allowed: letters, digits, _ . @ -)." \
+            "[BAMP-Start] Der Steam-Kontoname enthält Zeichen, die hier nicht gehen (erlaubt: Buchstaben, Ziffern, _ . @ -)."
+        exit 1
+    fi
+    exe="$ROOT/steamcmd.sh"
+    if [ ! -x "$exe" ] && [ ! -f "$exe" ]; then
+        say "[BAMP-Start] SteamCMD is missing in this instance - update once with 'Steam login for game updates: Login window'." \
+            "[BAMP-Start] SteamCMD fehlt in dieser Instanz - einmal mit 'Steam-Anmeldung: Login-Fenster' aktualisieren."
+        exit 1
+    fi
+    inst="$(dirname "$ROOT")"
+    [ -d "$inst/.virtualhome" ] && export HOME="$inst/.virtualhome"   # where AMP's SteamCMD keeps the remembered login
+    out="$(mktemp)"
+    say "[BAMP-Start] Game update through SteamCMD with the remembered login ..." "[BAMP-Start] Spiel-Update über SteamCMD mit der gemerkten Anmeldung ..."
+    local acc="<account>"
+    [ "$BAMP_LANG" = de ] && acc="<Konto>"
+    timeout 7200 bash "$exe" +@ShutdownOnFailedCommand 1 +@NoPromptForPassword 1 +@sSteamCmdForcePlatformType windows \
+        +force_install_dir "$ROOT/1331550" +login "$user" +app_update 1331550 +quit </dev/null 2>&1 \
+        | while IFS= read -r line; do
+              printf '%s\n' "$line" >> "$out"
+              [ -n "${line// /}" ] && printf '[SteamCMD] %s\n' "${line//$user/$acc}"
+          done
+    grep -qE "Success! App '1331550' (fully installed|already up to date)" "$out" && ok=1
+    why="$(grep -aiE "Cached credentials not found|password|Login Failure|Invalid Password|Steam Guard|two-factor|Rate Limit|Expired|FAILED" "$out" | tail -n 1)"
+    rm -f "$out"
+    if [ "$ok" = 1 ]; then say "[BAMP-Start] Game update with the remembered Steam login done." "[BAMP-Start] Spiel-Update mit der gemerkten Steam-Anmeldung fertig."; return 0; fi
+    why="${why//$user/$acc}"
+    say "[BAMP-Start] Game update with the remembered Steam login failed${why:+ (${why})}. Set the Steam login to 'Login window' once, press Update and log in, then back to 'Remembered login'." \
+        "[BAMP-Start] Spiel-Update mit der gemerkten Steam-Anmeldung ging nicht${why:+ (${why})}. Steam-Anmeldung einmal auf 'Login-Fenster' stellen, Update drücken und anmelden, danach wieder 'Gemerkte Anmeldung'."
+    exit 1
+}
+
 case "$STEP" in
+    steam) steam "${4:-}" ;;
     leftovers|settings|key|mod|mods|translations|translate) "$STEP" ;;
     all) leftovers; settings; key; mod; mods; translations; translate ;;
-    *) echo "[BAMP-Start] bamp-prestart.sh: unbekannter Schritt '$STEP'."; exit 0 ;;
+    *) say "[BAMP-Start] bamp-prestart.sh: unknown step '$STEP'." "[BAMP-Start] bamp-prestart.sh: unbekannter Schritt '$STEP'."; exit 0 ;;
 esac
 exit 0

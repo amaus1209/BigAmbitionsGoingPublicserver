@@ -150,6 +150,147 @@ namespace GoingOnline
             }
         }
 
+        // ── GO-FURNDELIVERY-2: one broken phone order no longer stops every delivery ───────────────────────────────────
+
+        static readonly HashSet<string> _warnedOnce = new HashSet<string>();
+        static void WarnOnce(string key, string message) { if (_warnedOnce.Add(key)) Go.Warn(message); }
+
+        static string OrderTo(FurnitureDeliveryContract d)
+        {
+            try { return Streets.AddressHelper.ToFormattedString(d.toAddress); } catch { return "an address"; }
+        }
+
+        /// <summary>GO-FURNDELIVERY-2 (Steam Workshop report 2026-11-17, together with IT Business Expansion: "I can't buy
+        /// the CMTS", then "it's a problem buying anything at all; ... they just won't ship it" and "a lot of bugs with things
+        /// that have absolutely nothing to do with this mod"): the stores' phone orders arrive in
+        /// FurnitureDeliveryHelper.DoDeliveriesInDayAndHour - one loop over every due order without any error guard, and the
+        /// due orders leave the list only after the loop. An order with an item the game cannot find at that moment (a mod
+        /// item not registered yet or any more: ItemsGetter.GetByName(..).boxSize) threw, so no store delivered anything
+        /// again, and the same order was charged anew every hour (PayDelivery comes before the delivery). Without Going
+        /// Public Server's tick wall the throw also skipped every later step of the game's hour (vehicle deliveries, pricing
+        /// managers, food delivery, rivals, contacts).
+        /// Now each due order is checked before it is paid: every item known, with a box size (0 would loop for ever). One
+        /// that fails stays in the list unpaid and is tried again every hour (one log line); every other order is delivered
+        /// by the game's own code; an order that still throws is dropped as the game drops its skipped orders, so it is never
+        /// charged twice. If the game renames these members, its own round runs as before (one warning).</summary>
+        [HarmonyPatch]
+        public static class Patch_FurnitureDelivery_Round_Guard
+        {
+            static MethodBase? _target;
+            static MethodInfo? _deliver;
+            static readonly HashSet<FurnitureDeliveryContract> _waiting = new HashSet<FurnitureDeliveryContract>();
+
+            static bool Prepare()
+            {
+                if (_target != null) return true;
+                try
+                {
+                    var t = typeof(Buildings.BuildingTypes.Special.FurnitureStore.FurnitureDeliveryHelper);
+                    _deliver = AccessTools.Method(t, "DeliverFurnitureContract", new[] { typeof(FurnitureDeliveryContract) });
+                    _target = _deliver == null ? null : AccessTools.Method(t, "DoDeliveriesInDayAndHour", new[] { typeof(int), typeof(int) });
+                }
+                catch { _target = null; }
+                if (_target == null) Go.Warn("the furniture stores' delivery round was not found - the game's own round runs unguarded (GO-FURNDELIVERY-2).");
+                return _target != null;
+            }
+
+            static MethodBase TargetMethod() => _target!;
+
+            static bool Prefix(int day, int hour)
+            {
+                List<FurnitureDeliveryContract>? list;
+                try { list = SaveGameManager.Current?.FurnitureDeliveryContracts; } catch { return true; }
+                if (list == null || _deliver == null) return true;
+                var handled = new HashSet<FurnitureDeliveryContract>();
+                foreach (var d in list.ToList())
+                {
+                    // the game's own test for "due" (FurnitureDeliveryHelper: day >= dayOfDelivery && hour >= hourOfDelivery)
+                    if (d == null || !(day >= d.dayOfDelivery && hour >= d.hourOfDelivery)) continue;
+                    string? why = Problem(d);
+                    if (why != null)
+                    {
+                        if (_waiting.Add(d)) Go.Warn($"a phone order to {OrderTo(d)} waits unpaid: {why} - tried again every hour, the other deliveries go on (GO-FURNDELIVERY-2).");
+                        continue;
+                    }
+                    if (_waiting.Remove(d)) Go.Log($"the waiting phone order to {OrderTo(d)} is delivered now (GO-FURNDELIVERY-2).");
+                    try { _deliver.Invoke(null, new object[] { d }); }
+                    catch (Exception ex)
+                    {
+                        var e = ex is TargetInvocationException && ex.InnerException != null ? ex.InnerException : ex;
+                        Go.Warn($"a phone order to {OrderTo(d)} failed ({e.GetType().Name}: {e.Message}) - dropped unpaid or paid once, the other deliveries go on (GO-FURNDELIVERY-2).");
+                    }
+                    handled.Add(d);
+                }
+                try { list.RemoveAll(x => x == null || handled.Contains(x)); } catch { }
+                return false;
+            }
+
+            /// <summary>Why the game's delivery of this order would throw before or after paying; null when it can go. An
+            /// order without target or items the game skips with a warning itself.</summary>
+            internal static string? Problem(FurnitureDeliveryContract d)
+            {
+                if (d.toAddress == null || d.itemsToDeliver == null || d.itemsToDeliver.Count == 0) return null;
+                foreach (var i in d.itemsToDeliver)
+                {
+                    if (i == null) return "an empty line in the order";
+                    var it = ItemsGetter.GetByName(i.itemName, true);
+                    if (it == null) return $"the game does not know the item {i.itemName} (its mod not loaded?)";
+                    if (it.boxSize <= 0 && i.amount > 0) return $"the item {i.itemName} has no box size";
+                }
+                return null;
+            }
+
+            /// <summary>For the developer's check (GO-FURNDELIVERY-2 test): whether an order is waiting.</summary>
+            internal static bool IsWaiting(FurnitureDeliveryContract d) => _waiting.Contains(d);
+        }
+
+        /// <summary>GO-FURNDELIVERY-2: the delivery spot is looked up with x.ItemCached.HasTag(isdeliveryspot) over every item
+        /// of the building - one item the game no longer knows (its mod removed, or not registered yet) threw. The same search,
+        /// skipping such items; the game's own code whenever none is in the way.</summary>
+        [HarmonyPatch(typeof(Buildings.BuildingTypes.Special.FurnitureStore.FurnitureDeliveryHelper),
+            nameof(Buildings.BuildingTypes.Special.FurnitureStore.FurnitureDeliveryHelper.GetDeliverySpotInstance))]
+        public static class Patch_FurnitureDelivery_Spot_NullSafe
+        {
+            static bool Prefix(BuildingRegistration registration, ref ItemInstance __result)
+            {
+                try
+                {
+                    if (registration?.itemInstances == null) return true;
+                    ItemInstance? spot = null;
+                    bool broken = false;
+                    foreach (var x in registration.itemInstances.Values)
+                    {
+                        Item? it = null;
+                        try { it = x?.ItemCached; } catch { }
+                        if (it == null) { broken = true; continue; }
+                        if (it.HasTag(TagRef.Itemtag.isdeliveryspot)) { spot = x; break; }
+                    }
+                    if (!broken) return true;
+                    __result = spot ?? Buildings.BuildingTypes.Special.FurnitureStore.FurnitureDeliveryHelper.CreateDeliverySpotInstance(registration);
+                    string where;
+                    try { where = Streets.AddressHelper.ToFormattedString(registration.Address); } catch { where = "a building"; }
+                    WarnOnce("spot|" + where, $"{where} holds an item the game does not know (a removed mod?) - its deliveries still arrive (GO-FURNDELIVERY-2).");
+                    return false;
+                }
+                catch { return true; }
+            }
+        }
+
+        /// <summary>GO-FURNDELIVERY-2: whatever still throws in the furniture stores' hour stays there, so the game's later
+        /// steps of the hour (vehicle deliveries, pricing managers, food delivery, rivals, contacts) run on. Going Public
+        /// Server's tick wall does the same for every step on its own.</summary>
+        [HarmonyPatch(typeof(Buildings.BuildingTypes.Special.FurnitureStore.FurnitureDeliveryHelper),
+            nameof(Buildings.BuildingTypes.Special.FurnitureStore.FurnitureDeliveryHelper.RunHourly))]
+        public static class Patch_FurnitureDelivery_Hour_Contain
+        {
+            static Exception? Finalizer(Exception? __exception)
+            {
+                if (__exception != null)
+                    WarnOnce("hour|" + __exception.GetType().Name, $"the furniture stores' hour threw {__exception.GetType().Name}: {__exception.Message} - contained, the rest of the game's hour runs (GO-FURNDELIVERY-2).");
+                return null;
+            }
+        }
+
         /// <summary>GO-WORK-1 on the job board (GO-ASSIGN-2): the cable provider's type names all its jobs now, so the hourly job
         /// board candidate (a building with a job board) would come for any of them. For a business of ours it comes only for
         /// the jobs whose workplaces stand there, and not at all without one; the next round of GameTypes.UpdateJobs names

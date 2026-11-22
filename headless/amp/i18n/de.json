@@ -9,7 +9,8 @@
         "Game rules": "Spielregeln",
         "New world": "Neue Welt",
         "RPG camera": "RPG-Kamera",
-        "Custom": "Benutzerdefiniert"
+        "Custom": "Benutzerdefiniert",
+        "Steam updates": "Steam-Updates"
     },
     "_ports": {
         "GamePort": [
@@ -42,7 +43,10 @@
         "Normal (10 / 5 Hz)": "Normal (10 / 5 Hz)",
         "High (20 / 10 Hz)": "Hoch (20 / 10 Hz)",
         "Very high (30 / 15 Hz)": "Sehr hoch (30 / 15 Hz)",
-        "Maximum (60 / 30 Hz)": "Maximal (60 / 30 Hz)"
+        "Maximum (60 / 30 Hz)": "Maximal (60 / 30 Hz)",
+        "Stable": "Stabil",
+        "Login window": "Login-Fenster",
+        "Remembered login (no window)": "Gemerkte Anmeldung (ohne Fenster)"
     },
     "$GamePort": [
         "Spiel-Port",
@@ -399,5 +403,17 @@
     "AutoUpdateWarnMinutes": [
         "Automatische Updates: Vorwarnung (Minuten)",
         "Solange Spieler auf dem Server sind, wird ein automatisches Update so viele Minuten vor dem Neustart angekündigt (Warnungen auf jedem Bildschirm, vorher wird gespeichert). 1 bis 60."
+    ],
+    "UpdateChannel": [
+        "Automatische Updates: Kanal",
+        "Stabil = die normalen Releases. Beta = auch die Beta-Builds (GitHub-Vorabversionen), für Testserver: Die Spieler brauchen dann „Going Public Server (Beta)“ aus dem Steam Workshop statt der normalen Mod, und Spieler mit der normalen Mod kommen nicht auf den Server. Die höhere Version gewinnt – ein Beta-Server kehrt also zu den normalen Releases zurück, sobald die Beta eines geworden ist. AMPs eigenes Update installiert immer das normale Release; auf einem Beta-Server holt die automatische Aktualisierung die Beta wenige Minuten nach dem Start zurück."
+    ],
+    "SteamUpdateLogin": [
+        "Steam-Anmeldung für Spiel-Updates",
+        "Login-Fenster = AMP fragt bei jedem Spiel-Update nach dem Steam-Login (wie bisher). Gemerkte Anmeldung = die Spiel-Updates – auch ein geplantes in der Nacht – melden sich mit dem Kontonamen unten und der Anmeldung an, die SteamCMD sich auf diesem Server gemerkt hat: kein Fenster und kein Passwort. SteamCMD merkt sich eine Anmeldung, nachdem du dich einmal über AMPs Login-Fenster angemeldet hast (nur dann fragt Steam Guard). Beendet Steam diese Anmeldung irgendwann (nach Monaten oder nach einer Passwortänderung), bricht das Update mit einer Meldung ab: auf Login-Fenster stellen, einmal Update drücken und anmelden, dann zurückstellen."
+    ],
+    "SteamUpdateUser": [
+        "Steam-Kontoname",
+        "Nur der Name des Steam-Kontos, das sich einmal über AMPs Login-Fenster angemeldet hat und Big Ambitions besitzt – nie das Passwort, ein Passwort wird nirgends gespeichert. Gilt bei „Gemerkte Anmeldung“. Er landet weder in der Einstellungsdatei des Spiels noch in der Konsole (dort steht <Konto>)."
     ]
 }

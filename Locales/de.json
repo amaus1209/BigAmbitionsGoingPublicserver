@@ -1778,5 +1778,8 @@
     "gps_update_notice": "Server-Update auf Version {0} (Build {1}).",
     "gps_update_new": "Neu: {0}",
     "gps_update_workshop": "Spieler: Die Mod braucht auch die neue Version – Steam aktualisiert sie beim nächsten Spielstart (Steam Workshop).",
-    "gps_update_reason": "Update auf Version: {0} (Build {1})."
+    "gps_update_reason": "Update auf Version: {0} (Build {1}).",
+    "gps_dup_install": "{0} ist doppelt installiert (Steam Workshop und lokale Mods, oder die normale und die Beta-Version). Die zweite Kopie wurde abgeschaltet – behalte nur eine.",
+    "gps_update_beta": "Beta",
+    "gps_update_workshop_beta": "Spieler: Dieser Server läuft mit der Beta – ihr braucht „Going Public Server (Beta)“ aus dem Steam Workshop statt der normalen Mod (Steam aktualisiert sie beim nächsten Spielstart)."
 }

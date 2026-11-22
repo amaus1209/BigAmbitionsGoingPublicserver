@@ -537,8 +537,17 @@ namespace BigAmbitionsMP
             Vector3 point; string name;
             if (Physics.Raycast(ray, out var hit, 20000f, ~0, QueryTriggerInteraction.Ignore))
             {
+                // NAV-MAPCARD-1 (user 2026-11-13, a screenshot "Ziel: 14 2nd Street - Hinlaufen / Nur Navi": "kann das haus
+                // für bizman nicht öffnen und so was mieten ... weil das navi dazwischen kommt"): a click on a building is the
+                // game's - CityBuildingController.OnIoLeftClick opens its building card (BizMan, rent, "Set destination" and
+                // our "walk there automatically", NAV-AUTOWALK-1). The navigation no longer sets a destination and asks on
+                // the same click; only a click on open ground (street, square) or the middle button sets one here.
                 var cbc = hit.collider.GetComponentInParent<CityBuildingController>();
-                if (cbc != null && cbc.building != null && TryBuilding(cbc.building.Address, out point, out name)) { Set(point, name); Notice(Loc.T("gps_nav_set", "Destination set: {0}.", name)); return; }
+                if (cbc != null && cbc.building != null)
+                {
+                    if (!Input.GetMouseButtonDown(2)) return;
+                    if (TryBuilding(cbc.building.Address, out point, out name)) { Set(point, name); Notice(Loc.T("gps_nav_set", "Destination set: {0}.", name)); return; }
+                }
                 point = hit.point;
             }
             else

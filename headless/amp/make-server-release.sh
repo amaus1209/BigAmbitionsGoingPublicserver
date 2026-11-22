@@ -25,7 +25,8 @@ if [ "$BUILD" = 1 ]; then
         done
     fi
     [ -n "$GAME" ] || { echo "Spieldateien nicht gefunden - BAMP_GAME_DIR=<.../1331550> setzen." >&2; exit 1; }
-    dotnet build "$REPO/BigAmbitionsMP.csproj" -c Release -nologo "-p:GameDir=$GAME/" "-p:ModDeployDir=$REPO/bin/amp-deploy/"
+    # BETA-CHANNEL-1: BAMP_CHANNEL=beta builds the beta channel (own version number, "(Beta)" in the names)
+    dotnet build "$REPO/BigAmbitionsMP.csproj" -c Release -nologo "-p:GameDir=$GAME/" "-p:ModDeployDir=$REPO/bin/amp-deploy/" "-p:BampChannel=${BAMP_CHANNEL:-stable}"
     dotnet build "$REPO/headless/preloader/BampSteamless.csproj" -c Release -nologo
 fi
 
@@ -54,7 +55,8 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(full, os.path.relpath(full, root).replace(os.sep, "/"))
 PY
 PLAYER="$(ls "$R/client"/GoingPublicServer-*.zip)"
-VER="$(basename "$PLAYER" | sed -E 's/^GoingPublicServer-([^-]+)-.*/\1/')"
-cp "$PLAYER" "$OUT/GoingPublicServer-$VER.zip"
+VER="$(basename "$PLAYER" | sed -E 's/^GoingPublicServer-(Beta-)?([^-]+)-.*/\2/')"
+PFX="GoingPublicServer"; [ "${BAMP_CHANNEL:-stable}" = beta ] && PFX="GoingPublicServer-Beta"   # BETA-CHANNEL-1
+cp "$PLAYER" "$OUT/$PFX-$VER.zip"
 echo "Release $VER:"
 ls -l "$OUT"/GoingPublicServer-*.zip

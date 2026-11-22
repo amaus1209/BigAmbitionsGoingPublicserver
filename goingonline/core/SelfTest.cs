@@ -21,6 +21,9 @@ namespace GoingOnline
 
         public static void Run(int days, float money = -1f)
         {
+            // GO-FURNDELIVERY-2: the furniture delivery guard's check runs first (it puts made-up orders in front of the
+            // game's round and takes them out again; nothing is delivered or paid)
+            try { DeliveryGuardTest.Run(); } catch (System.Exception ex) { Go.Warn("delivery guard test: " + ex.Message); }
             Sim.Test = true;
             var watch = System.Diagnostics.Stopwatch.StartNew();
             try

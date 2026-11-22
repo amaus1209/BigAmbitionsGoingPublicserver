@@ -37,10 +37,15 @@ with zipfile.ZipFile(src) as z:
         dst.write_bytes(z.read(n))
 PY
 VER="$(sed -n 's/.*PLUGIN_VERSION *= *"\([^"]*\)".*/\1/p' "$REPO/src/MyPluginInfo.cs" | head -n1)"
+PFX="GoingPublicServer"
+if [ "${BAMP_CHANNEL:-stable}" = beta ]; then   # BETA-CHANNEL-1: the beta channel's version line and player zip name
+    VER="$(sed -n 's/.*PLUGIN_VERSION *= *"\([^"]*\)"; *\/\/ *beta channel.*/\1/p' "$REPO/src/MyPluginInfo.cs" | head -n1)"
+    PFX="GoingPublicServer-Beta"
+fi
 HASH="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()[:8])' "$STAGE/payload/bamp-mod/GoingPublicServer/BigAmbitionsMP.dll")"
 printf '%s %s\n' "$VER" "$HASH" > "$STAGE/payload/VERSION"
 [ -f "$STAGE/payload/1331550/winhttp.dll" ] && [ -f "$STAGE/payload/bamp-mod/GoingPublicServer/BigAmbitionsMP.dll" ] || { echo "payload unvollständig" >&2; exit 1; }
-echo "   Version $VER, Build $HASH (Workshop-Datei GoingPublicServer-$VER-$HASH.zip)"
+echo "   Version $VER, Build $HASH (Workshop-Datei $PFX-$VER-$HASH.zip)"
 
 echo "== Verwaltung (dotnet publish) =="
 for rid in linux-x64 win-x64; do
@@ -93,6 +98,6 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
 PY
 )
 cp "$SZIP" "$OUT/GoingPublicServer-Server.zip"
-cp "$STAGE/rel/GoingPublicServer-$VER.zip" "$OUT/GoingPublicServer-$VER-$HASH.zip"   # the player zip (Steam Workshop)
+cp "$STAGE/rel/$PFX-$VER.zip" "$OUT/$PFX-$VER-$HASH.zip"   # the player zip (Steam Workshop; beta: its own item)
 echo "Release $VER (Build $HASH):"
 ls -l "$OUT"/GoingPublicServer-*

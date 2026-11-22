@@ -7,7 +7,7 @@
   "DedicatedIdleGraceSeconds": 10,
   "DedicatedAutoAccept": true,
   "AutosaveMinutes": 5,
-  "HeadlessFps": 30,
+  "HeadlessFps": 200,
   "HeadlessIdleFps": 10,
   "HeadlessLoadTimeoutSeconds": 900,
   "HeadlessStallSeconds": 300,

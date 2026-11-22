@@ -187,25 +187,32 @@ namespace GoingOnline
 
         internal const string RightSpot = "GO_SpotlightRight";
 
+        /// <summary>GO-VAN-19 (2026-11-15): the left headlight's spot in the car's space (the right one mirrors x), 2 cm in front
+        /// of the lamp's projector ring. The third shape's nose is shorter and its headlights end before the grille (user:
+        /// "scheinwerfer front zu lang in den kühler grill ragen"): the ring's middle is at x -0.63, 0.88 m up, its glass at
+        /// z 2.207. GO-VAN-18 had the glass at z 2.409 and the spot at (-0.60, 0.87, 2.43) - there it would now hang 22 cm in
+        /// front of the van. Measured on govan.gom (scratchpad tools gom_probe.py); a new van model needs a new measure.</summary>
+        static readonly Vector3 SpotLeft = new Vector3(-0.63f, 0.88f, 2.23f);
+
         /// <summary>GO-VAN-13 (user 2026-11-10: "die Lichtkegel der Scheinwerfer passen noch nicht"): the template car has one
         /// spot for both headlights ("Spotlights", 1.78 m up over its bonnet, 23 deg down, 4 m, 115 deg) - over our higher
         /// bonnet it lit the van itself and the road from the wrong place. It moves to the van's left headlight and a copy of
-        /// it to the right one (VanLights switches the copy with it), lower (0.87 m), flatter (11 deg), a little longer and
-        /// narrower, each with two thirds of the light.</summary>
+        /// it to the right one (VanLights switches the copy with it), lower (0.88 m), flatter (11 deg), a little longer and
+        /// narrower, each with two thirds of the light. The spots sit 2 cm in front of the lamps' glass (<see cref="SpotLeft"/>).</summary>
         static void Headlights(Transform car)
         {
             var spot = car.Find("Spotlights");
             var light = spot != null ? spot.GetComponent<Light>() : null;
             if (spot == null || light == null) return;
-            bool first = Mathf.Abs(spot.localPosition.y - 0.87f) > 0.01f;
-            spot.localPosition = new Vector3(-0.60f, 0.87f, 2.43f);
+            bool first = Mathf.Abs(spot.localPosition.y - SpotLeft.y) > 0.01f;   // the template's own spot (1.78 m up): not moved yet
+            spot.localPosition = SpotLeft;
             spot.localRotation = Quaternion.Euler(11f, 0f, 0f);
             if (first) { light.range = 9f; light.spotAngle = 100f; light.intensity *= 0.66f; }
             if (car.Find(RightSpot) == null)
             {
                 var copy = UnityEngine.Object.Instantiate(spot.gameObject, spot.parent);
                 copy.name = RightSpot;
-                copy.transform.localPosition = new Vector3(0.60f, 0.87f, 2.43f);
+                copy.transform.localPosition = new Vector3(-SpotLeft.x, SpotLeft.y, SpotLeft.z);
                 copy.transform.localRotation = spot.localRotation;
             }
         }
@@ -476,14 +483,21 @@ namespace GoingOnline
             var mf = body != null ? body.GetComponent<MeshFilter>() : null;
             var mr = body != null ? body.GetComponent<MeshRenderer>() : null;
             var model = Models.Get(Id);
-            if (mf == null || mr == null || model == null || mf.sharedMesh != model.Mesh) return;
+            if (mf == null || mr == null || model == null || !WearsVan(mf.sharedMesh, model.Mesh)) return;
             try { Plates.Apply(k, mr, model); } catch (System.Exception ex) { Once("plate|" + ex.Message, "number plates: " + ex.Message + " (GO-PLATE-1)."); }
+            int stage = k.Showroom ? 0 : DamageStage(k);   // GO-DAMAGE-1
+            try { DamageLook(mr, model, stage); } catch (System.Exception ex) { Once("damage|" + ex.Message, "van damage: " + ex.Message + " (GO-DAMAGE-1)."); }
             int slot = model.PartIndex("van_white");
             var mats = mr.sharedMaterials;
             if (slot < 0 || slot >= mats.Length) return;
             int paint = k.FixedPaint >= 0 ? k.FixedPaint : PaintOf(k);
             if (k.FixedPaint >= 0) Livery.Tint(mr, paint);   // GO-LIVERY-3: the game's paint takes the tint - the traffic's vans stay white
             var spec = Livery.SpecFor(k.gameObject, k.Showroom, out var logo, out var logoKey);
+            if (stage > 0)
+            {   // GO-DAMAGE-1: the scratches go into the paint's picture (a plain van gets one just for them)
+                spec = spec != null ? spec.Clone() : new LiveryPaint.Spec { Motif = 3, Logo = false };
+                spec.Damage = stage;
+            }
             string key = Livery.KeyOf(spec, paint, logoKey);
             if (key == k.Key && mats[slot] != null) { Livery.Touch(key); return; }
             var template = Models.MaterialsFor(model, Id, Teal, null)[slot];
@@ -497,6 +511,114 @@ namespace GoingOnline
             bool signs = own && Livery.Plain(spec);
             foreach (Transform ch in mr.transform) if (ch.name == "GO_VanLogo" && ch.gameObject.activeSelf != signs) ch.gameObject.SetActive(signs);
         }
+
+        // ── GO-DAMAGE-1 (user 2026-11-18: "der Kaddy Go soll ein Schadenmodell bekommen, wenn er immer mehr beschädigt wird") ──
+
+        /// <summary>The damage stage from the game's damage value (vehicleInstance.damage: 0 sound .. 1 wrecked; at 1 the game
+        /// smokes and stops the engine): 0 below 15 %, 1 from 15 % (scratches), 2 from 40 % (more scratches, scrapes, a crack in
+        /// the windscreen), 3 from 65 % (windscreen badly cracked, left headlight broken), 4 from 90 % (left tail lamp broken too).
+        /// The dents come from the game (VehicleDeformationController); repairing sets the value to 0 and all of this goes.</summary>
+        internal static int DamageStage(Component k)
+        {
+            float d = 0f;
+            try
+            {
+                var cc = k.GetComponent<CarController>() ?? k.GetComponentInParent<CarController>();
+                if (cc != null && cc.vehicleInstance != null) d = cc.vehicleInstance.damage;
+            }
+            catch { }
+            return d >= 0.90f ? 4 : d >= 0.65f ? 3 : d >= 0.40f ? 2 : d >= 0.15f ? 1 : 0;
+        }
+
+        /// <summary>Where the broken-glass pictures go (markers of govan.gom, ba-art/goingonline/go_van.py), the part whose colour
+        /// they wear, from which stage, and how wide/high (share of the marker's size).</summary>
+        static readonly (string marker, string part, int from, float w, float h)[] DamageSpots =
+        {
+            ("schaden_scheibe", "glass_dark", 2, 1f, 0.72f),
+            ("schaden_lampe", "screen_headlight", 3, 1f, 0.62f),
+            ("schaden_ruecklicht", "lamp_red", 4, 1f, 1.6f),
+        };
+        static readonly Dictionary<string, Material> _damageMats = new Dictionary<string, Material>();
+
+        static void DamageLook(MeshRenderer mr, Models.Model model, int stage)
+        {
+            foreach (var (marker, part, from, w, h) in DamageSpots)
+            {
+                string name = "GO_VanDamage_" + marker;
+                var have = mr.transform.Find(name);
+                if (stage < from || !model.Markers.TryGetValue(marker, out var mk))
+                {
+                    if (have != null) UnityEngine.Object.Destroy(have.gameObject);
+                    continue;
+                }
+                var mat = DamageMaterial(model, part, stage, marker == "schaden_scheibe" ? 512 : 256);
+                if (mat == null) continue;
+                var r = have != null ? have.GetComponent<MeshRenderer>() : null;
+                if (r != null && r.sharedMaterial == mat) continue;
+                if (have != null) UnityEngine.Object.Destroy(have.gameObject);
+                float grow = marker == "schaden_scheibe" && stage == 2 ? 0.6f : 1f;   // first a small crack, then over the half pane
+                var go = PlaneQuad(mr.transform, mk.pos, mk.normal, mk.size * w * grow, mk.size * h * grow, mat);
+                go.name = name;
+            }
+        }
+
+        static Material? DamageMaterial(Models.Model model, string part, int stage, int size)
+        {
+            string key = part + "|" + stage;
+            if (_damageMats.TryGetValue(key, out var have) && have != null) return have;
+            var sh = Models.LitShader;
+            int pi = model.PartIndex(part);
+            if (sh == null || pi < 0) return null;
+            var p = model.Parts[pi];
+            int bg = (Mathf.Clamp(Mathf.RoundToInt(p.Base.r * 255f), 0, 255) << 16) | (Mathf.Clamp(Mathf.RoundToInt(p.Base.g * 255f), 0, 255) << 8)
+                     | Mathf.Clamp(Mathf.RoundToInt(p.Base.b * 255f), 0, 255);
+            var px = LiveryPaint.ComposeCracks(size, bg, part == "glass_dark" ? 0xD9DEE5 : 0xF4F5F7, stage, part.Length);
+            var tex = new Texture2D(size, size, TextureFormat.RGBA32, true, false)
+            {
+                name = "GO_VanCracks_" + key, wrapMode = TextureWrapMode.Clamp, anisoLevel = 4, hideFlags = HideFlags.HideAndDontSave,
+            };
+            tex.SetPixelData(px, 0);
+            tex.Apply(true, true);
+            var m = new Material(sh) { name = "GO_VanDamage_" + key, hideFlags = HideFlags.HideAndDontSave };
+            if (m.HasProperty("_BaseColor")) m.SetColor("_BaseColor", Color.white);
+            if (m.HasProperty("_BaseColorMap")) m.SetTexture("_BaseColorMap", tex);
+            if (m.HasProperty("_Metallic")) m.SetFloat("_Metallic", p.Metallic);
+            if (m.HasProperty("_Smoothness")) m.SetFloat("_Smoothness", p.Smoothness);   // the same gloss as the pane: no visible edge
+            _damageMats[key] = m;
+            return m;
+        }
+
+        /// <summary>A rectangle lying in the surface at a marker (the windscreen is slanted - ServiceVans.Quad stands upright),
+        /// the picture upright along the surface and not mirrored for someone looking at it.</summary>
+        static GameObject PlaneQuad(Transform parent, Vector3 pos, Vector3 normal, float w, float h, Material mat)
+        {
+            var go = new GameObject("GO_VanDamage");
+            go.transform.SetParent(parent, false);
+            var n = normal.normalized;
+            var right = Vector3.Cross(n, Vector3.up);
+            if (right.sqrMagnitude < 1e-4f) right = Vector3.right;
+            right = right.normalized * (w / 2f);
+            var up = Vector3.Cross(right.normalized, n).normalized * (h / 2f);
+            var mesh = new Mesh { name = "GO_VanDamage" };
+            mesh.vertices = new[] { pos - right - up, pos + right - up, pos + right + up, pos - right + up };
+            mesh.uv = new[] { new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1) };
+            mesh.normals = new[] { n, n, n, n };
+            mesh.triangles = new[] { 0, 3, 2, 0, 2, 1 };
+            mesh.RecalculateBounds();
+            go.AddComponent<MeshFilter>().sharedMesh = mesh;
+            var r = go.AddComponent<MeshRenderer>();
+            r.sharedMaterial = mat;
+            r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            return go;
+        }
+
+        /// <summary>GO-VAN-21 (user 2026-11-18: "das Schadensmodell fehlt noch"): the game's damage model (VehicleDeformationController,
+        /// on the template car) dents the body through MeshFilter.mesh - Unity then gives the filter its own copy of our mesh
+        /// ("GO_govan Instance", same vertex count) and keeps denting that one; repairing (CarController.Repair -> Reset) puts our
+        /// shared mesh back. The copy is still the van: before, the livery stopped updating and VanLights took the van's lights
+        /// away after the first dent, because both compared the filter's mesh with ours by reference.</summary>
+        internal static bool WearsVan(Mesh? m, Mesh? model) =>
+            m != null && model != null && (m == model || (m.vertexCount == model.vertexCount && m.name.StartsWith(model.name, System.StringComparison.Ordinal)));
 
         static string? SafeOwner(GameObject go) { try { return Livery.OwnerOf?.Invoke(go); } catch { return null; } }
 

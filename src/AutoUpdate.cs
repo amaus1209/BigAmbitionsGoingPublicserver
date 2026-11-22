@@ -25,7 +25,11 @@ namespace BigAmbitionsMP
     /// game start). An announced restart or AMP's stop already running is never cut short; the update waits for it.
     ///
     /// Only on an AMP layout (bamp-mod/GoingPublicServer next to headless/) - the stand-alone server updates through its own
-    /// page. AMP setting AutoUpdate, on by default. The previous mod folder stays in bamp-update/previous until the next update.</summary>
+    /// page. AMP setting AutoUpdate, on by default. The previous mod folder stays in bamp-update/previous until the next update.
+    ///
+    /// BETA-CHANNEL-1 (user 2026-11-13): AMP setting UpdateChannel "beta" also looks at the beta channel's GitHub pre-releases
+    /// (tag v&lt;version&gt;-beta, Update.json "channel": "beta") and takes the higher version (NewestOfAll); "stable" (default)
+    /// keeps to the latest normal release. A beta build's notice says so and sends the players to the beta Workshop item.</summary>
     internal static class AutoUpdate
     {
         const string Repo = "amaus1209/BigAmbitionsGoingPublicServer";
@@ -33,7 +37,7 @@ namespace BigAmbitionsMP
         const float FirstCheck = 180f, Every = 3600f;
         static readonly string[] Take = { "bamp-mod/GoingPublicServer/", "bamp-tools/", "telemetry-data/web/" };
 
-        sealed class Found { public string Build = "", Version = "", Notes = ""; }
+        sealed class Found { public string Build = "", Version = "", Notes = "", Channel = "stable"; }
 
         static float _nextCheck = -1f;
         static int _busy;
@@ -85,9 +89,10 @@ namespace BigAmbitionsMP
             _reply = reply;
             string root = Root;
             string running = MyPluginInfo.BuildId;
+            string channel = MPConfig.UpdateChannel;   // BETA-CHANNEL-1
             new Thread(() =>
             {
-                try { Check(root, running); }
+                try { Check(root, running, channel); }
                 catch (Exception ex) { Say($"update: {ex.Message} (AUTO-UPDATE-1)", true); }
                 finally { Interlocked.Exchange(ref _busy, 0); }
             }) { IsBackground = true, Name = "BAMP-AutoUpdate" }.Start();
@@ -109,7 +114,7 @@ namespace BigAmbitionsMP
         }
 
         /// <summary>Background thread: the latest release, its build, and - when it is another - the download.</summary>
-        static void Check(string root, string running)
+        static void Check(string root, string running, string channel)
         {
             if (!AmpLayout(root))
             {
@@ -117,8 +122,10 @@ namespace BigAmbitionsMP
                 _loggedLayout = true;
                 return;
             }
-            JObject rel;
-            using (var wc = Client()) { wc.Headers[HttpRequestHeader.Accept] = "application/vnd.github+json"; rel = JObject.Parse(wc.DownloadString($"https://api.github.com/repos/{Repo}/releases/latest")); }
+            JObject? rel = null;
+            if (channel == "beta") rel = NewestOfAll();   // BETA-CHANNEL-1
+            if (rel == null)
+                using (var wc = Client()) { wc.Headers[HttpRequestHeader.Accept] = "application/vnd.github+json"; rel = JObject.Parse(wc.DownloadString($"https://api.github.com/repos/{Repo}/releases/latest")); }
             string infoUrl = "", zipUrl = "";
             foreach (var a in (JArray?)rel["assets"] ?? new JArray())
             {
@@ -135,11 +142,12 @@ namespace BigAmbitionsMP
                 Build = ((string?)info["build"] ?? "").Trim().ToLowerInvariant(),
                 Version = ((string?)info["version"] ?? "").Trim(),
                 Notes = NotesFor(info["notes"] as JObject),
+                Channel = string.Equals(((string?)info["channel"] ?? "").Trim(), "beta", StringComparison.OrdinalIgnoreCase) ? "beta" : "stable",
             };
             if (f.Build.Length != 8) { Say($"release {tag}: {InfoAsset} names no build (AUTO-UPDATE-1).", true); return; }
             if (f.Build == running || f.Build == _doneBuild) { Say($"up to date: build {running} is the newest on GitHub ({tag}) (AUTO-UPDATE-1)."); return; }
             if (f.Build == _failedBuild && !_reply) return;
-            Say($"build {f.Build} ({f.Version}) is on GitHub, this server runs {running} - downloading (AUTO-UPDATE-1).");
+            Say($"build {f.Build} ({f.Version}{(f.Channel == "beta" ? " beta" : "")}, channel {channel}) is on GitHub, this server runs {running} - downloading (AUTO-UPDATE-1).");
 
             string work = Path.Combine(root, "bamp-update");
             string fresh = Path.Combine(work, "new");
@@ -198,6 +206,37 @@ namespace BigAmbitionsMP
             _ready = f;
         }
 
+        /// <summary>BETA-CHANNEL-1: the release of the higher version among all releases - the stable ones and the beta
+        /// channel's pre-releases (tag "v1.0.17.4-beta"); the same version: the one published last (a beta that became a
+        /// normal release). Drafts and releases without both files are skipped. null = none readable (then "latest").</summary>
+        static JObject? NewestOfAll()
+        {
+            JArray all;
+            using (var wc = Client()) { wc.Headers[HttpRequestHeader.Accept] = "application/vnd.github+json"; all = JArray.Parse(wc.DownloadString($"https://api.github.com/repos/{Repo}/releases?per_page=30")); }
+            JObject? best = null;
+            Version bestV = new Version(0, 0);
+            DateTime bestAt = DateTime.MinValue;
+            foreach (var t in all)
+            {
+                if (!(t is JObject r) || (bool?)r["draft"] == true) continue;
+                bool info = false, zip = false;
+                foreach (var a in (JArray?)r["assets"] ?? new JArray())
+                {
+                    string n = (string?)a["name"] ?? "";
+                    if (n == InfoAsset) info = true;
+                    if (n == ServerAsset) zip = true;
+                }
+                if (!info || !zip) continue;
+                string tag = ((string?)r["tag_name"] ?? "").Trim().TrimStart('v', 'V');
+                int dash = tag.IndexOf('-');
+                if (dash >= 0) tag = tag.Substring(0, dash);
+                if (!Version.TryParse(tag, out var v)) continue;
+                DateTime at = (DateTime?)r["published_at"] ?? DateTime.MinValue;
+                if (best == null || v > bestV || (v == bestV && at > bestAt)) { best = r; bestV = v; bestAt = at; }
+            }
+            return best;
+        }
+
         /// <summary>What is new, in the server's language (else English, else the first there is).</summary>
         static string NotesFor(JObject? notes)
         {
@@ -212,14 +251,18 @@ namespace BigAmbitionsMP
         /// <summary>Main thread: the notice on every screen, then the restart (a countdown while players are on).</summary>
         static void Announce(Found f)
         {
-            string text = Loc.Server("gps_update_notice", "Server update to version {0} (build {1}).", f.Version, f.Build);
+            bool beta = f.Channel == "beta";   // BETA-CHANNEL-1: "1.0.17.4 Beta"; the players need the beta item
+            string ver = beta ? f.Version + " " + Loc.Server("gps_update_beta", "Beta") : f.Version;
+            string text = Loc.Server("gps_update_notice", "Server update to version {0} (build {1}).", ver, f.Build);
             if (f.Notes.Length > 0) text += " " + Loc.Server("gps_update_new", "New: {0}", f.Notes);
-            if (f.Version.Length > 0 && f.Version != MyPluginInfo.PLUGIN_VERSION)
-                text += " " + Loc.Server("gps_update_workshop", "Players: the mod needs the new version too - Steam updates it at the next game start (Steam Workshop).");
+            if (f.Version.Length > 0 && (f.Version != MyPluginInfo.PLUGIN_VERSION || beta != MyPluginInfo.IsBeta))
+                text += " " + (beta
+                    ? Loc.Server("gps_update_workshop_beta", "Players: this server runs the beta - you need \"Going Public Server (Beta)\" from the Steam Workshop instead of the normal mod (Steam updates it at the next game start).")
+                    : Loc.Server("gps_update_workshop", "Players: the mod needs the new version too - Steam updates it at the next game start (Steam Workshop)."));
             int secs = HeadlessHost.PlayerCount > 0 ? MPConfig.AutoUpdateWarnMinutes * 60 : 0;
             Plugin.Logger.LogInfo($"[Update] announced: build {f.Build}, restart in {secs} s (AUTO-UPDATE-1).");
             HeadlessHost.Out($"update to build {f.Build} announced - restart in {(secs > 0 ? secs / 60 + " min" : "a moment")}");
-            string why = Loc.Server("gps_update_reason", "Update to version {0} (build {1}).", f.Version, f.Build);
+            string why = Loc.Server("gps_update_reason", "Update to version {0} (build {1}).", ver, f.Build);
             HeadlessHost.AnnounceRestart(secs, text, why);
         }
     }

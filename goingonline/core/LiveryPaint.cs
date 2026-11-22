@@ -122,7 +122,11 @@ namespace GoingOnline
             public string Key() => string.Join("|", Motif.ToString(CultureInfo.InvariantCulture), Panel.ToString("X6"),
                 Tech ? "1" : "0", Cable ? "1" : "0", Logo ? "1" : "0", Services.ToString(CultureInfo.InvariantCulture), Name, Slogan, Contact)
                 + (Sides == null ? "" : "|S" + string.Join(",", Array.ConvertAll(Sides, l => l == null ? "-" : l.Key())) + "|" + Fallback)
-                + (TextPct != 100 || LogoPct != 100 ? "|z" + TextPct.ToString(CultureInfo.InvariantCulture) + "." + LogoPct.ToString(CultureInfo.InvariantCulture) : "");
+                + (TextPct != 100 || LogoPct != 100 ? "|z" + TextPct.ToString(CultureInfo.InvariantCulture) + "." + LogoPct.ToString(CultureInfo.InvariantCulture) : "")
+                + (Damage > 0 ? "|d" + Damage.ToString(CultureInfo.InvariantCulture) : "");
+
+            /// <summary>GO-DAMAGE-1: the van's damage stage (0 none .. 4 heavy) - scratches on the paint, set by Van.Skin, not saved.</summary>
+            public int Damage;
 
             /// <summary>For the other players (Going Public Server): the key without the paint, "|" in texts as "¦".</summary>
             public string Pack() => "1|" + string.Join("|", Motif.ToString(CultureInfo.InvariantCulture), Panel.ToString("X6"),
@@ -459,6 +463,12 @@ namespace GoingOnline
 
         static void PaintOn(Canvas c, Spec s, Layout L, Font f, Art art, Img? logo)
         {
+            PaintLook(c, s, L, f, art, logo);
+            Scratches(c, L, s.Damage);   // GO-DAMAGE-1: over the livery, as on a real van
+        }
+
+        static void PaintLook(Canvas c, Spec s, Layout L, Font f, Art art, Img? logo)
+        {
             if (s.Sides != null && s.Sides.Length >= 4)
             {   // CAR-LIVERY-1: every side its own look
                 string[] fields = { "L", "R", "B", "H" };
@@ -472,6 +482,145 @@ namespace GoingOnline
                 if (L.R.TryGetValue(side, out var g)) Side(c, g, s, f, art, logo, 2);
             if (L.R.TryGetValue("B", out var back)) Back(c, back, s, f, art, 1);
             if (L.R.TryGetValue("H", out var hood)) Hood(c, hood, s, f, art);
+        }
+
+        // ── GO-DAMAGE-1 (user 2026-11-18: "der Kaddy Go soll ein Schadenmodell bekommen, wenn er immer mehr beschädigt wird") ──
+        // The game itself only dents the body (VehicleDeformationController) and smokes at full damage; the van shows more
+        // with every stage: scratches and scrapes on the paint (here), a cracked windscreen, a broken headlight and tail lamp
+        // (pictures from ComposeCracks on the model's markers, Van.Damage). Stages: Van.DamageStage.
+
+        /// <summary>Small deterministic random numbers: the same scratches on every van at the same stage (shared pictures).</summary>
+        sealed class Rng
+        {
+            uint _s;
+            public Rng(uint seed) { _s = seed * 2654435761u + 0x9E3779B9u; if (_s == 0) _s = 1; }
+            public float F() { _s ^= _s << 13; _s ^= _s >> 17; _s ^= _s << 5; return (_s & 0xFFFFFF) / 16777216f; }
+            public float R(float a, float b) => a + (b - a) * F();
+        }
+
+        /// <summary>A thick line, soft over one pixel (distance to the segment).</summary>
+        static void Line(Canvas c, float x0, float y0, float x1, float y1, float w, int rgb, float alpha = 1f)
+        {
+            float hw = w * 0.5f;
+            int ix0 = Math.Max(0, (int)Math.Floor(Math.Min(x0, x1) - hw - 1)), iy0 = Math.Max(0, (int)Math.Floor(Math.Min(y0, y1) - hw - 1));
+            int ix1 = Math.Min(c.W, (int)Math.Ceiling(Math.Max(x0, x1) + hw + 1)), iy1 = Math.Min(c.H, (int)Math.Ceiling(Math.Max(y0, y1) + hw + 1));
+            float dx = x1 - x0, dy = y1 - y0, ll = dx * dx + dy * dy;
+            int cr = (rgb >> 16) & 255, cg = (rgb >> 8) & 255, cb = rgb & 255;
+            for (int y = iy0; y < iy1; y++)
+                for (int x = ix0; x < ix1; x++)
+                {
+                    float px = x + 0.5f, py = y + 0.5f;
+                    float t = ll > 0f ? Math.Max(0f, Math.Min(1f, ((px - x0) * dx + (py - y0) * dy) / ll)) : 0f;
+                    float qx = x0 + t * dx - px, qy = y0 + t * dy - py;
+                    float d = (float)Math.Sqrt(qx * qx + qy * qy) - hw;
+                    float cov = d <= -0.5f ? 1f : d >= 0.5f ? 0f : 0.5f - d;
+                    if (cov > 0f) c.Blend(x, y, cr, cg, cb, cov * alpha);
+                }
+        }
+
+        /// <summary>A point of a field in pixels (metres of the body's plane; the right side and the back are drawn mirrored).</summary>
+        static (float x, float y) At(Region g, float a, float b)
+        {
+            float sx = g.W / (g.A1 - g.A0), sy = g.H / (g.B1 - g.B0);
+            return (g.Flip ? g.X + (g.A1 - a) * sx : g.X + (a - g.A0) * sx, g.Y + (b - g.B0) * sy);
+        }
+
+        /// <summary>Scratches and scrapes where vans get them - the lower corners, round the wheel arches, the sills, the door
+        /// edges, the back's lower corners - more and longer with every stage (1-4). Bare metal (light) and rubber/dirt marks.</summary>
+        static void Scratches(Canvas c, Layout L, int stage)
+        {
+            if (stage <= 0) return;
+            var sides = new[] { (-2.35f, 0.40f, -1.70f, 0.98f, 3f), (-1.15f, 0.34f, 1.00f, 0.62f, 2f), (1.65f, 0.40f, 2.22f, 1.02f, 3f),
+                                (-0.22f, 0.55f, 0.20f, 1.30f, 1f), (-1.00f, 0.95f, 1.95f, 1.22f, 1f) };
+            var back = new[] { (-0.92f, 0.32f, -0.52f, 1.25f, 3f), (0.52f, 0.32f, 0.92f, 1.25f, 3f), (-0.45f, 0.55f, 0.45f, 0.85f, 1.5f) };
+            int per = stage == 1 ? 8 : stage == 2 ? 18 : stage == 3 ? 30 : 46;
+            foreach (var (name, zones, k) in new[] { ("L", sides, 1f), ("R", sides, 1f), ("B", back, 0.7f) })
+            {
+                if (!L.R.TryGetValue(name, out var g)) continue;
+                var rng = new Rng((uint)(4111 + stage * 7919 + name[0] * 131));
+                float wsum = 0f;
+                foreach (var z in zones) wsum += z.Item5;
+                float ppm = g.W / (g.A1 - g.A0);
+                for (int i = 0, n = (int)(per * k); i < n; i++)
+                {
+                    float pick = rng.F() * wsum;
+                    var zn = zones[0];
+                    foreach (var z in zones) { if (pick < z.Item5) { zn = z; break; } pick -= z.Item5; }
+                    float a = rng.R(zn.Item1, zn.Item3), b = rng.R(zn.Item2, zn.Item4);
+                    float len = rng.R(0.04f, 0.14f + 0.06f * stage), ang = rng.R(-0.5f, 0.5f) + (rng.F() < 0.15f ? 1.2f : 0f);
+                    float bend = rng.R(-0.15f, 0.15f);
+                    float a1 = a + (float)Math.Cos(ang) * len * 0.5f, b1 = b + (float)Math.Sin(ang) * len * 0.5f;
+                    float a2 = a1 + (float)Math.Cos(ang + bend) * len * 0.5f, b2 = b1 + (float)Math.Sin(ang + bend) * len * 0.5f;
+                    var p0 = At(g, a, b); var p1 = At(g, a1, b1); var p2 = At(g, a2, b2);
+                    float kind = rng.F();
+                    bool metal = kind < 0.52f, rust = stage >= 3 && kind > 0.86f;
+                    float w = Math.Max(1f, rng.R(0.0016f, 0.0034f + 0.0008f * stage) * ppm);
+                    int col = rust ? 0x7A4E2E : metal ? 0x9EA3A9 : 0x34363A;   // grey primer/metal shows on white paint too
+                    float al = metal ? rng.R(0.8f, 1f) : rng.R(0.5f, 0.85f);
+                    if (metal)
+                    {   // a darker edge under the bright line: the scratch looks cut into the paint
+                        Line(c, p0.x, p0.y - 1f, p1.x, p1.y - 1f, w, 0x55595E, al * 0.6f);
+                        Line(c, p1.x, p1.y - 1f, p2.x, p2.y - 1f, w, 0x55595E, al * 0.6f);
+                    }
+                    Line(c, p0.x, p0.y, p1.x, p1.y, w, col, al);
+                    Line(c, p1.x, p1.y, p2.x, p2.y, w * 0.8f, col, al * 0.85f);
+                }
+                for (int j = 0; j < stage - 1; j++)
+                {   // scrapes: a soft band of many fine parallel lines at a corner (stage 2 and up)
+                    var zn = zones[j % 2 == 0 ? 0 : 2 % zones.Length];
+                    float a = rng.R(zn.Item1, zn.Item3), b = rng.R(zn.Item2, zn.Item4), len = rng.R(0.12f, 0.30f), ang = rng.R(-0.25f, 0.25f);
+                    for (int q = 0, m = 9 + 3 * stage; q < m; q++)
+                    {
+                        float off = (q - m * 0.5f) * 0.004f, l2 = len * rng.R(0.6f, 1f);
+                        var p0 = At(g, a - (float)Math.Sin(ang) * off, b + (float)Math.Cos(ang) * off);
+                        var p1 = At(g, a + (float)Math.Cos(ang) * l2 - (float)Math.Sin(ang) * off, b + (float)Math.Sin(ang) * l2 + (float)Math.Cos(ang) * off);
+                        Line(c, p0.x, p0.y, p1.x, p1.y, Math.Max(1f, 0.0015f * ppm), rng.F() < 0.5f ? 0xA9ADB2 : 0x6A6E73, rng.R(0.25f, 0.55f));
+                    }
+                }
+            }
+        }
+
+        /// <summary>GO-DAMAGE-1: cracked glass as a picture (RGBA, size x size): the glass colour <paramref name="bg"/> with light
+        /// cracks from an impact point - rays, branches, rings; more and longer with the stage. Opaque: the van's glass is.</summary>
+        public static byte[] ComposeCracks(int size, int bg, int line, int stage, int seed)
+        {
+            var c = new Canvas(size, size, 0, true);
+            Box(c, 0, 0, size, size, 0f, bg);
+            var rng = new Rng((uint)(seed * 977 + stage * 31 + 7));
+            float cx = size * rng.R(0.38f, 0.62f), cy = size * rng.R(0.38f, 0.62f);
+            int rays = 7 + stage * 3;
+            float reach = size * (0.22f + 0.10f * stage), lw = Math.Max(1f, size / 360f);
+            for (int i = 0; i < rays; i++)
+            {
+                float a = (float)(2 * Math.PI * i / rays) + rng.R(-0.22f, 0.22f), len = reach * rng.R(0.45f, 1f);
+                float x = cx, y = cy;
+                int segs = 5 + (int)(rng.F() * 4);
+                for (int k = 0; k < segs; k++)
+                {
+                    a += rng.R(-0.32f, 0.32f);
+                    float l = len / segs * rng.R(0.7f, 1.3f), nx = x + (float)Math.Cos(a) * l, ny = y + (float)Math.Sin(a) * l;
+                    Line(c, x, y, nx, ny, lw * rng.R(0.8f, 1.5f), line, 0.9f);
+                    if (rng.F() < 0.28f)
+                    {   // a branch
+                        float ba = a + rng.R(0.4f, 0.9f) * (rng.F() < 0.5f ? -1f : 1f), bl = l * rng.R(0.6f, 1.6f);
+                        Line(c, nx, ny, nx + (float)Math.Cos(ba) * bl, ny + (float)Math.Sin(ba) * bl, lw * 0.8f, line, 0.75f);
+                    }
+                    x = nx; y = ny;
+                }
+            }
+            for (int r = 1; r <= Math.Min(3, stage); r++)
+            {   // rings round the impact, piece by piece between neighbouring rays
+                float rad = size * (0.035f + 0.055f * r);
+                for (int i = 0; i < rays; i++)
+                {
+                    if (rng.F() < 0.3f) continue;
+                    float a0 = (float)(2 * Math.PI * i / rays) + rng.R(-0.1f, 0.1f), a1 = (float)(2 * Math.PI * (i + 1) / rays) + rng.R(-0.1f, 0.1f);
+                    float r0 = rad * rng.R(0.85f, 1.15f), r1 = rad * rng.R(0.85f, 1.15f);
+                    Line(c, cx + (float)Math.Cos(a0) * r0, cy + (float)Math.Sin(a0) * r0, cx + (float)Math.Cos(a1) * r1, cy + (float)Math.Sin(a1) * r1, lw * 0.9f, line, 0.7f);
+                }
+            }
+            Box(c, cx - lw * 3f, cy - lw * 3f, cx + lw * 3f, cy + lw * 3f, lw * 3f, line, 0.85f);   // the impact
+            return c.Px;
         }
 
         /// <summary>CAR-LIVERY-1: one field of the van in a look of its own. which: 0 left, 1 right, 2 back, 3 hood.</summary>
@@ -505,9 +654,10 @@ namespace GoingOnline
                     zone = area;
                     k = 0.62f;
                     break;
-                default:   // under the front door's window, on the sliding door, on the load space
-                    area = (-1.00f, 0.80f, 2.10f, 1.70f);
-                    zone = place == 0 ? (-1.00f, 0.64f, -0.42f, 1.06f) : place == 1 ? (-0.24f, 0.80f, 0.74f, 1.68f) : (0.82f, 0.80f, 2.08f, 1.68f);
+                default:   // under the front door's window, on the sliding door, on the load space (GO-VAN-20: see Side)
+                    area = (-0.96f, 0.80f, 2.10f, 1.64f);
+                    zone = place == 0 ? (-0.90f, 0.62f, -0.36f, 1.06f) : place == 1 ? (0.06f, 0.62f, 0.74f, 1.46f)
+                        : which == 0 ? (0.82f, 1.00f, 2.08f, 1.62f) : (0.82f, 0.80f, 2.08f, 1.62f);   // left (0): above the fuel flap
                     break;
             }
             var A = Rect(g, area.a0, area.b0, area.a1, area.b1);
@@ -631,25 +781,31 @@ namespace GoingOnline
         static void Side(Canvas c, Region g, Spec s, Font f, Art art, Img? logo, int place)
         {
             int ink = OnPaint(s.Paint & 0xFFFFFF, s.Panel);
-            // where the parts stand (the van's plane, metres)
-            (float a0, float b0, float a1, float b1) panel = (0.82f, 1.255f, 2.06f, 1.675f), lines = (0.82f, 0.945f, 2.06f, 1.145f);
-            (float a0, float b0, float a1, float b1) offersAt = (-0.20f, 1.24f, 0.66f, 1.64f), cableAt = (-0.33f, 0.70f, 0.72f, 1.00f);
+            // where the parts stand (the van's plane, metres). GO-VAN-20 (user 2026-11-18 "ja" to the new shape): the front
+            // door runs to y -0.06 (was -0.36), the sliding door (right side only, the left has a plain flank and the fuel flap
+            // at y 1.30-1.545, z 0.775-0.975) from 0.01 to 0.78 and up to z 1.50 (was -0.29 to 0.78, 1.69), its handle at
+            // y 0.18 / z 1.015, the front door's at -0.22; the silver rail (right) at z 1.196-1.234 from 0.83 to 1.60; the side
+            // ends at z 1.62 at the back (the roof is lower there). The offers and the cable stay inside the sliding door.
+            bool left = !g.Flip;   // field "L" (the driver's side, no sliding door, no rail); "R" is drawn mirrored
+            (float a0, float b0, float a1, float b1) panel = (0.82f, 1.255f, 2.06f, 1.62f),
+                lines = left ? (0.82f, 1.00f, 2.06f, 1.20f) : (0.82f, 0.945f, 2.06f, 1.145f);   // left: above the fuel flap
+            (float a0, float b0, float a1, float b1) offersAt = (0.06f, 1.07f, 0.74f, 1.45f), cableAt = (0.06f, 0.70f, 0.74f, 0.894f);   // the door's full width (labels!); the cable picture keeps its 3.5 : 1
             bool tech = s.Tech, cable = s.Cable, bigName = false;
             if (place == 1)
             {
-                panel = (-0.26f, 1.255f, 0.76f, 1.675f); lines = (-0.26f, 1.03f, 0.76f, 1.20f);
-                offersAt = (0.96f, 1.24f, 1.94f, 1.64f); cableAt = (0.95f, 0.80f, 2.05f, 1.10f);
+                panel = (0.08f, 1.06f, 0.72f, 1.46f); lines = (0.08f, 0.76f, 0.72f, 0.96f);
+                offersAt = (0.96f, 1.24f, 1.94f, 1.60f); cableAt = left ? (1.02f, 0.99f, 1.76f, 1.20f) : (0.95f, 0.80f, 2.05f, 1.10f);   // left: above the fuel flap
             }
             else if (place == 0)
             {
-                panel = (-1.00f, 0.64f, -0.42f, 1.06f); tech = false; bigName = true;
+                panel = (-0.90f, 0.62f, -0.36f, 1.06f); tech = false; bigName = true;   // ends before the door handle (-0.305)
             }
             var p = Rect(g, panel.a0, panel.b0, panel.a1, panel.b1);
             if (s.Motif <= 1) Panel(c, f, art, s, logo, p.x0, p.y0, p.x1, p.y1, p.ppm, false);
             else WordMark(c, f, art, Lettering(s), p.x0 + 0.02f * p.ppm, (p.y0 + p.y1) * 0.5f, Math.Min(0.30f, 0.11f * TK(s)) * p.ppm, p.x1 - p.x0 - 0.04f * p.ppm, ink, false);
             if (bigName && s.Motif <= 1)
             {   // the panel is small on the front door: the name large on the load space
-                var w = Rect(g, 0.82f, 1.255f, 2.06f, 1.675f);
+                var w = Rect(g, 0.82f, 1.255f, 2.06f, 1.62f);
                 WordMark(c, f, art, Lettering(s), w.x0 + 0.02f * w.ppm, (w.y0 + w.y1) * 0.5f, Math.Min(0.30f, 0.11f * TK(s)) * w.ppm, w.x1 - w.x0 - 0.04f * w.ppm, ink, false);
             }
             var lr = Rect(g, lines.a0, lines.b0, lines.a1, lines.b1);
@@ -707,7 +863,7 @@ namespace GoingOnline
             // "Techniker im Einsatz" on the front door, under its window
             if (tech)
             {
-                var q = Rect(g, -1.02f, 0.88f, -0.58f, 1.04f);
+                var q = Rect(g, -0.90f, 0.88f, -0.46f, 1.04f);   // GO-VAN-20: the longer front door, still before its handle
                 float h = q.y1 - q.y0, icon = h * 0.92f;
                 Part(c, art, "techicon", q.x0, q.y0 + (h - icon) * 0.5f, q.x0 + icon, q.y0 + (h + icon) * 0.5f, ink);
                 float tx = q.x0 + icon + h * 0.12f, maxW = q.x1 - tx;

@@ -336,7 +336,7 @@ namespace BigAmbitionsMP
                 Plugin.Logger.LogError(
                     $"{MyPluginInfo.DISPLAY_NAME}: another copy is already loaded from '{priorRoot}' — " +
                     $"this copy ('{context.ModRootPath}') will NOT start. Keep ONE install: either the " +
-                    "Steam Workshop subscription or the local ModsLocal copy, not both.");
+                    "Steam Workshop subscription (the normal or the beta item - BETA-CHANNEL-1) or the local ModsLocal copy, not both.");
                 return;
             }
             AppDomain.CurrentDomain.SetData("BAMP_SINGLETON_ROOT", context.ModRootPath ?? "unknown");
@@ -371,6 +371,7 @@ namespace BigAmbitionsMP
             BootConsole.Line(BootConsole.TagOk, Loc.T("gps_boot_settings", "Settings loaded: player {0}", MPConfig.PlayerId));
             await BootConsole.Frame(now: true);
 
+            SaveDir.Apply();   // SAVE-DIR-1: -bamp-data-dir (Windows AMP) - must precede EnsureVersionCached below
 #if BAMP_DEV
             RigSaveRoot.Apply();   // RIG-SAVEROOT: dev rig only (BAMP_RIG_SAVEROOT) - must precede EnsureVersionCached below
 #endif

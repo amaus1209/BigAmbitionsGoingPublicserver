@@ -1,0 +1,17 @@
+[h1]Going Public Server (Beta) – the next version, for testing[/h1]
+This is the [b]beta channel[/b] of [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182]Going Public Server[/url]: new features and fixes arrive here first, before they go to the normal version. It can contain bugs – please only use it if you want to help test.
+
+[h2]Important[/h2]
+[list]
+[*][b]Subscribe to only ONE of the two:[/b] the normal Going Public Server [i]or[/i] this beta. With both, only one copy loads and the game shows a warning – unsubscribe one of them.
+[*][b]Beta players join beta servers only.[/b] The beta has its own version number; a server with the normal version turns beta players away (and the other way round). Server admins switch a server to the beta in AMP: [i]Automatic updates: channel = Beta[/i].
+[*][b]Your saves and your player identity stay the same[/b] – you can switch back to the normal version at any time (unsubscribe the beta, subscribe the normal one).
+[*][b]Please report bugs in the comments[/b] – with the version from the bottom left corner of the screen (e.g. "GPS-MM v. 1.0.17.4 Beta (build)").
+[/list]
+
+[h2]What is being tested right now[/h2]
+[list]
+[*][b]Windows servers under AMP:[/b] the saves now stay in the server's own folder (included in AMP backups, separate for every instance).
+[/list]
+
+Everything else – the features, the built-in modules and how to set up a server – is described on the page of the [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182]normal version[/url].

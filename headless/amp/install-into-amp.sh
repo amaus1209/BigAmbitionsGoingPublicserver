@@ -120,6 +120,8 @@ if [ -n "$BUILT" ]; then
     if [ -d "$REPO/goingonline/assets/blueprints" ]; then mkdir -p "$M/assets/blueprints" && cp -r "$REPO"/goingonline/assets/blueprints/. "$M/assets/blueprints/"; fi   # Going Online's templates for the interior installation firms (GO-BLUEPRINT-2)
     if ls "$REPO"/assets/logos/gps_*.png >/dev/null 2>&1; then mkdir -p "$M/assets/logos" && cp "$REPO"/assets/logos/gps_*.png "$M/assets/logos/"; fi   # black-and-white logo shapes of our business types (LOGO-SHAPES-1)
     [ -f "$REPO/assets/preview.png" ] && cp "$REPO/assets/preview.png" "$M/"
+    # BETA-CHANNEL-1: the beta Workshop item shows its own picture (the in-game Mod Creator takes preview.png of the folder)
+    if [ "${BAMP_CHANNEL:-stable}" = beta ] && [ -f "$REPO/assets/preview-beta.png" ]; then cp "$REPO/assets/preview-beta.png" "$M/preview.png"; fi
     cp "$REPO/LICENSE" "$REPO/THIRD-PARTY-NOTICES.txt" "$M/" 2>/dev/null || true
     [ -d "$REPO/Locales" ] && cp -r "$REPO/Locales" "$M/"   # translations (the game registers <mod>/Locales)
     [ -d "$REPO/ModTranslations" ] && cp -r "$REPO/ModTranslations" "$M/"   # other mods in the player's language (ModTranslations.cs)
@@ -129,18 +131,21 @@ if [ -n "$BUILT" ]; then
     DL="$DEST/client"
     mkdir -p "$DL"
     ZIP="$(python3 - "$M" "$DL" "$REPO/src/MyPluginInfo.cs" <<'PY'
-import hashlib, pathlib, re, sys, zipfile
+import hashlib, os, pathlib, re, sys, zipfile
 mod, dl, info = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
-ver = (re.search(r'PLUGIN_VERSION\s*=\s*"([^"]+)"', info.read_text(encoding="utf-8")) or [None, "x"])[1]
+beta = os.environ.get("BAMP_CHANNEL", "stable") == "beta"   # BETA-CHANNEL-1: its own version line, zip name and folder
+pat = r'PLUGIN_VERSION\s*=\s*"([^"]+)";\s*//\s*beta channel' if beta else r'PLUGIN_VERSION\s*=\s*"([^"]+)"'
+ver = (re.search(pat, info.read_text(encoding="utf-8")) or [None, "x"])[1]
 h = hashlib.sha256((mod / "BigAmbitionsMP.dll").read_bytes()).hexdigest()[:8]
-name = f"GoingPublicServer-{ver}-{h}.zip"
+name = f"GoingPublicServer-Beta-{ver}-{h}.zip" if beta else f"GoingPublicServer-{ver}-{h}.zip"
+folder = "GoingPublicServerBeta/" if beta else "GoingPublicServer/"
 for old in list(dl.glob("GoingPublicServer-*.zip")) + list(dl.glob("BigAmbitionsMP-*.zip")):
     if old.name != name:
         old.unlink()
 with zipfile.ZipFile(dl / name, "w", zipfile.ZIP_DEFLATED) as z:
     for f in sorted(mod.rglob("*")):
         if f.is_file():
-            z.write(f, "GoingPublicServer/" + f.relative_to(mod).as_posix())
+            z.write(f, folder + f.relative_to(mod).as_posix())
 print(name)
 PY
 )"

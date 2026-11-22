@@ -325,7 +325,7 @@ namespace GoingOnline
 
         /// <summary>The key a van's paint material is cached under.</summary>
         public static string KeyOf(LiveryPaint.Spec? spec, int paint, string logoKey)
-            => (Plain(spec) ? "plain|" + paint.ToString("X6")
+            => (Plain(spec) && (spec == null || spec.Damage <= 0) ? "plain|" + paint.ToString("X6")   // GO-DAMAGE-1: a scratched plain van is painted
              : spec!.Key() + "|" + paint.ToString("X6") + "|" + (spec.Logo ? logoKey : "")) + (_gameMat != null ? "|g" : "");
 
         // ── GO-LIVERY-3: the game cars' paint ───────────────────────────────────────────────────────────────────────
@@ -368,11 +368,48 @@ namespace GoingOnline
             return t;
         }
 
+        // GO-VANTEX-1 (user 2026-11-18 "ja" to the texture set): the van's own maps in the paint's UV map (govan.gom: the livery
+        // fields plus the other painted faces in the atlas's free corner, ba-art/goingonline/go_van.py make_atlas_uv), baked by
+        // ba-art/goingonline/go_van_karten.py: GO_Van_Mask.png (linear: R metal 0, G contact shadow, A smoothness 176) and
+        // GO_Van_Dirt.png (sRGB: road dirt colour, A = where dirt sits). SH_Vehicle mixes the dirt in as
+        // lerp(paint, _DirtDiffuse, _DirtDiffuse.a * _Dirtiness) - the template car's own dirt maps carry the game car's UV map
+        // and put dirt in the wrong places on our van, so they are always replaced (without our file: no dirt at all).
+        static Texture2D? _vanMask, _vanDirt, _noDirtTex, _dirtMatTex;
+        static bool _vanMapsTried;
+
+        static void LoadVanMaps()
+        {
+            if (_vanMapsTried) return;
+            _vanMapsTried = true;
+            string root = Path.Combine(Go.Host?.ModRoot ?? "", "assets");
+            _vanMask = LoadMap(Path.Combine(root, "GO_Van_Mask.png"), true, "GO_VanMask");
+            _vanDirt = LoadMap(Path.Combine(root, "GO_Van_Dirt.png"), false, "GO_VanDirt");
+            Go.Log($"van paint: texture set - contact shadow {(_vanMask != null ? _vanMask.width + "²" : "missing")}, dirt {(_vanDirt != null ? _vanDirt.width + "²" : "missing")} (GO-VANTEX-1).");
+        }
+
+        static Texture2D? LoadMap(string path, bool linear, string name)
+        {
+            if (!File.Exists(path)) return null;
+            var t = new Texture2D(2, 2, TextureFormat.RGBA32, true, linear) { name = name, hideFlags = HideFlags.HideAndDontSave };
+            try
+            {
+                if (!ImageConversion.LoadImage(t, File.ReadAllBytes(path), true)) { UnityEngine.Object.Destroy(t); return null; }
+                t.wrapMode = TextureWrapMode.Clamp;
+                t.anisoLevel = 4;
+                return t;
+            }
+            catch (System.Exception ex) { Go.Warn("van paint: " + Path.GetFileName(path) + ": " + ex.Message + " (GO-VANTEX-1)."); UnityEngine.Object.Destroy(t); return null; }
+        }
+
         static void GameMaps(Material mat, Texture diffuse)
         {
+            LoadVanMaps();
             mat.SetTexture(DiffuseProp, diffuse);
-            mat.SetTexture(MaskProp, Small(ref _maskTex, new Color32(0, 240, 0, 176), true, "GO_VanPaintMask"));
+            mat.SetTexture(MaskProp, _vanMask != null ? _vanMask : Small(ref _maskTex, new Color32(0, 240, 0, 176), true, "GO_VanPaintMask"));
             mat.SetTexture(NormalProp, Small(ref _normalTex, new Color32(128, 128, 255, 255), true, "GO_VanFlatNormal"));
+            if (mat.HasProperty("_DirtDiffuse")) mat.SetTexture("_DirtDiffuse", _vanDirt != null ? _vanDirt : Small(ref _noDirtTex, new Color32(92, 78, 62, 0), false, "GO_VanNoDirt"));
+            if (mat.HasProperty("_Dirt_Met_AO_Smooth")) mat.SetTexture("_Dirt_Met_AO_Smooth", Small(ref _dirtMatTex, new Color32(0, 230, 0, 28), true, "GO_VanDirtMatte"));
+            if (mat.HasProperty("_DirtNormal")) mat.SetTexture("_DirtNormal", Small(ref _normalTex, new Color32(128, 128, 255, 255), true, "GO_VanFlatNormal"));
             var black = Small(ref _blackTex, new Color32(0, 0, 0, 0), true, "GO_VanNoLamps");
             foreach (var t in new[] { "_EmissionMask", "_IndicatorsMask", "_EmissionTexture" }) if (mat.HasProperty(t)) mat.SetTexture(t, black);
         }
@@ -404,7 +441,7 @@ namespace GoingOnline
             var mat = new Material(game ? _gameMat! : template) { name = game ? "GO_van_livery" : "GO_van_white_livery", hideFlags = HideFlags.HideAndDontSave };
             var c = new Color32((byte)(paint >> 16), (byte)(paint >> 8), (byte)paint, 255);
             Texture2D? tex = null;
-            if (spec != null && !Plain(spec) && Load())
+            if (spec != null && (!Plain(spec) || spec.Damage > 0) && Load())
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 Labels();

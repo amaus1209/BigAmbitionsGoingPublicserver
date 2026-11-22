@@ -14,7 +14,10 @@ namespace BigAmbitionsMP
     /// - Only on an AMP instance (GenericModule.kvp beside the root folder), so a server without AMP gets no key on its
     ///   console every 30 s.
     /// - The admin link only where the instance's template reads it (an older regex would not match the longer line); a
-    ///   link that vanishes for a moment (AMP rewriting GenericModule.kvp) is kept for two more lines.</summary>
+    ///   link that vanishes for a moment (AMP rewriting GenericModule.kvp) is kept for two more lines.
+    /// AMP-INFO-3 (CubeCoders PR #2053 review 2026-11-22: English labels on the status page): the template's regex now
+    /// names its groups Game_Port, Server_Key, Admin_Page and takes "Key=" or "Schluessel=". The line says "Key=" where
+    /// the instance's template has Server_Key; older templates (Server_Password, Admin_Seite) need "Schluessel=".</summary>
     internal static class AmpInfoLine
     {
         static float _next;
@@ -34,11 +37,15 @@ namespace BigAmbitionsMP
                 string kvp = Path.Combine(Path.GetDirectoryName(root) ?? "", "GenericModule.kvp");
                 if (!File.Exists(kvp)) return;
 
+                string template = "";
+                try { template = File.ReadAllText(kvp); } catch { }
+                bool english = template.IndexOf("Server_Key", StringComparison.Ordinal) >= 0;   // AMP-INFO-3
+
                 int port = MPConfig.HostPort;
-                string line = $"[Server] Info: Port={port} | Schluessel={Key()} | Version={MyPluginInfo.PLUGIN_VERSION}-{MyPluginInfo.BuildId}";
+                string line = $"[Server] Info: Port={port} | {(english ? "Key" : "Schluessel")}={Key()} | Version={MyPluginInfo.PLUGIN_VERSION}-{MyPluginInfo.BuildId}";
                 string admin = "";
                 string web = WebBase(root);
-                if (web.Length > 0 && ReadsAdmin(kvp)) admin = $" | Admin={web}/monitor/{port}/index.html#admin";
+                if (web.Length > 0 && ReadsAdmin(template)) admin = $" | Admin={web}/monitor/{port}/index.html#admin";
                 if (admin.Length == 0 && _last.StartsWith(line + " | Admin=", StringComparison.Ordinal) && _adminGone < 2)
                 {
                     _adminGone++;
@@ -97,10 +104,9 @@ namespace BigAmbitionsMP
             return "";
         }
 
-        static bool ReadsAdmin(string kvp)
-        {
-            try { return File.ReadAllText(kvp).IndexOf("Admin_Seite", StringComparison.Ordinal) >= 0; }
-            catch { return false; }
-        }
+        /// <summary>The instance's GenericModule.kvp text names the admin group: Admin_Page (AMP-INFO-3) or Admin_Seite.</summary>
+        static bool ReadsAdmin(string template) =>
+            template.IndexOf("Admin_Page", StringComparison.Ordinal) >= 0 ||
+            template.IndexOf("Admin_Seite", StringComparison.Ordinal) >= 0;
     }
 }

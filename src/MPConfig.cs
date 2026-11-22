@@ -244,6 +244,13 @@ namespace BigAmbitionsMP
         {
             get { try { return int.TryParse(Get("AutoUpdateWarnMinutes", "5").Trim(), out int m) ? Math.Max(1, Math.Min(60, m)) : 5; } catch { return 5; } }
         }
+        /// <summary>BETA-CHANNEL-1: the releases the automatic update follows - "stable" (the latest release) or "beta" (the
+        /// pre-releases of the beta channel too; the higher version wins, so a beta server returns to stable once the beta
+        /// became a normal release).</summary>
+        public static string UpdateChannel
+        {
+            get { try { return string.Equals(Get("UpdateChannel", "stable").Trim(), "beta", StringComparison.OrdinalIgnoreCase) ? "beta" : "stable"; } catch { return "stable"; } }
+        }
         /// <summary>MERGER-AUTO-DISSOLVE-1: a company member away this many real days leaves it by itself (0 = never, at most 365).</summary>
         public static int MergerAutoDissolveDays
         {
@@ -360,6 +367,7 @@ namespace BigAmbitionsMP
             "PlayerReports",   // PLAYER-REPORTS-1
             "ChatTranslate",   // CHAT-TRANSLATE-1
             "AutoUpdate", "AutoUpdateWarnMinutes",   // AUTO-UPDATE-1
+            "UpdateChannel",   // BETA-CHANNEL-1
         };
 
         private static void LoadServerOverrides()
@@ -1055,7 +1063,8 @@ namespace BigAmbitionsMP
                 // disambiguate the two local game installs via InstallKey.
                 try
                 {
-                    DataRootPath = Path.Combine(UnityEngine.Application.persistentDataPath, "BigAmbitionsMP");
+                    // SAVE-DIR-1: a server started with -bamp-data-dir keeps this data in its own folder (Windows AMP)
+                    DataRootPath = SaveDir.Root != null ? Path.Combine(SaveDir.Root, "BigAmbitionsMP") : Path.Combine(UnityEngine.Application.persistentDataPath, "BigAmbitionsMP");
                     Directory.CreateDirectory(DataRootPath);
                 }
                 catch (Exception dx)

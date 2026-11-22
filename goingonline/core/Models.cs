@@ -198,8 +198,14 @@ namespace GoingOnline
 
         /// <summary>GO-VAN-18: the service van model's revision. A new model alone (assets/models/govan.gom) leaves both DLLs
         /// - and so the build ids in the package names - as they were; bumping this with each new van model changes them,
-        /// and Report logs it with the file's own short hash (which van a player has).</summary>
-        internal const string VanModelRev = "GO-VAN-18";
+        /// and Report logs it with the file's own short hash (which van a player has). GO-VAN-19 (2026-11-15): the third
+        /// shape - one smooth body lofted from curves (ba-art/goingonline/go_van.py), shorter headlights that end before the
+        /// grille, tail lamps with a black housing and four chambers; names, markers, livery fields and wheels as before.
+        /// GO-VAN-20 (2026-11-18, user "ja" to the new shape after their photos): black front fascia, slim wedge headlamps,
+        /// flatter windscreen, long front door, a sliding door on the right only (rail = new material "silver"), fuel flap
+        /// on the left rear, round rear corners, long tail lamps, 6.6 % bigger wheels; livery fields unchanged, the places of
+        /// the stickers on the sides moved with the doors (LiveryPaint.Side / VanSide).</summary>
+        internal const string VanModelRev = "GO-VAN-22";   // 2026-11-19: Blinker im Scheinwerfer groesser, Scheibenwischer vorne und hinten, dritte Bremsleuchte groesser mittig oben, Tuerfuge um die Hecktueren
 
         /// <summary>Once, after the first pass over all items: how many of the shipped model files are in use.</summary>
         public static void Report()

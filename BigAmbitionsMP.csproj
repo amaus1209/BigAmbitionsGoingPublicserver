@@ -24,6 +24,11 @@
   <PropertyGroup Condition="'$(Configuration)' == 'Dev'">
     <DefineConstants>$(DefineConstants);BAMP_DEV</DefineConstants>
   </PropertyGroup>
+  <!-- BETA-CHANNEL-1 (user 2026-11-13: "unter steam workshop ein beta kanal anlegen"): `-p:BampChannel=beta` builds the beta
+       channel - its own version number (MyPluginInfo), "(Beta)" in the names; the packages go to the beta Workshop item. -->
+  <PropertyGroup Condition="'$(BampChannel)' == 'beta'">
+    <DefineConstants>$(DefineConstants);BAMP_BETA</DefineConstants>
+  </PropertyGroup>
 
   <PropertyGroup Condition="!$([MSBuild]::IsOSPlatform('OSX'))">
     <GameDir>C:\Program Files (x86)\Steam\steamapps\common\Big Ambitions\</GameDir>
