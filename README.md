@@ -248,10 +248,33 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
 3. In the instance: **Update**. AMP downloads the game with SteamCMD (it asks for a Steam login that owns
    Big Ambitions, and the Steam Guard code if the account has one), Proton GE, and the newest
    **Going Public Server** release from this repository.
-4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server password** (the server key players join with), and the server version (gone after reloading the page? AMP's page misses them with Websockets on: switch off "Enable Websockets" in the instance's configuration). Network traffic, server FPS and each player's connection are on the ranking page (see below).
+4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server key** players join with ("Server Key", on older templates "Server Password"), and the server version (gone after reloading the page? AMP's page misses them with Websockets on: switch off "Enable Websockets" in the instance's configuration). Network traffic, server FPS and each player's connection are on the ranking page (see below).
 5. Open the game port (UDP, 7777 by default) in your firewall.
 6. AMP without Docker: the host needs `xvfb`, `xauth` and `python3` (`sudo apt install xvfb xauth python3`) - the game
    runs under Proton with a virtual display. AMP's Docker containers bring them along.
+
+### What the server files change in the game
+
+Big Ambitions has no dedicated server of its own. The server runs a normal copy of the game - downloaded with SteamCMD
+from an account that owns it, its files left as they are - headless under Proton (`-batchmode -nographics`) with this
+mod. Two parts of the release `GoingPublicServer-Server.zip` make that work. Both are only on the server; players never
+install them.
+
+- **Unity Doorstop 4.3.0** (`1331550/winhttp.dll` and `1331550/doorstop_config.ini`; unmodified, LGPL-2.1,
+  [NeighTools/UnityDoorstop](https://github.com/NeighTools/UnityDoorstop)). The template sets
+  `WINEDLLOVERRIDES=winhttp=n,b`, so Wine loads this `winhttp.dll` instead of its own. Doorstop then starts the
+  preloader below before any code of the game runs.
+- **The preloader** `1331550/bamp-preloader/BampSteamless.dll` (source:
+  [`headless/preloader/Entrypoint.cs`](headless/preloader/Entrypoint.cs), with Harmony, MIT). The game's mod loader
+  looks for mods only after Steam reports that it has started (`SteamAPI.OnSteamInit`). A server has no Steam client,
+  so that never happens, and no mod would load, this one included. The preloader patches one method in memory,
+  `HGModLoader.TryInitializeModsForPlaySession`. When Steam is not running, it calls the loader's own
+  `OnSteamInitialized`, as Steam would have; when Steam runs, the original code runs.
+  - It does nothing unless the game was started with `-bamp-config`, which only the server's command line has.
+  - It changes no file of the game and skips no ownership or licence check. "Steamless" here means "without the Steam
+    client"; it has nothing to do with the DRM tool of that name.
+  - Two more switches, `-bamp-nosteam` and `-bamp-mods-dir`, are for the stand-alone Windows server (below). The AMP
+    template does not use them.
 
 ### Updating
 
@@ -263,7 +286,9 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
 
 ### Settings (the instance's Configuration page)
 
-- **Server language**: choose it, then run **Update** once more to see the settings in that language.
+- **Server language**: the language of the server's own console and start messages; players see the mod in their own
+  game language. With this repository's template, run **Update** once more to see the settings in that language too
+  (the template in CubeCoders' list keeps them in English).
 - **Server**: world, load a save once, the server's character name, max players, pausing (empty, idle, everyone in
   the pause menu), server key, autosave, **Frame cap while running** (60, 120 or 200 FPS) and while empty, and
   **Network rate** (Normal 10 / 5 Hz, High 20 / 10 Hz, Very high 30 / 15 Hz, Maximum 60 / 30 Hz - how often
@@ -299,13 +324,13 @@ Instances run in containers and cannot reach AMP's web folder, so small jobs run
 ```
 
 - **Admin page**: `https://<your AMP address>/monitor/<game port>/index.html#admin` - in AMP on the instance's status
-  page as "Admin Seite" under the Connection Link, on the ranking page as *Admin* at the top right and below the table -
+  page as "Admin Page" (on older templates "Admin Seite"), on the ranking page as *Admin* at the top right and below the table -
   sign in with your AMP account; in AMP it needs the right to use that instance's console. Players online
   (message, kick, ban with a reason), the chat (read along, write as the server or to one player), the ban list
   (unban, unban everyone), save and restart. In AMP itself the chat shows in the console, and the player list has Kick
   and Ban.
 - `bamp-web-sync.sh` serves each instance's ranking at `https://<your AMP address>/monitor/<game port>/index.html`
-  (the instance's Connection Link); players open it with their server's key. Merged companies show as "merged with ...". Below the ranking,
+  (with this repository's template also the instance's Connection Link); players open it with their server's key. Merged companies show as "merged with ...". Below the ranking,
   **Players' buildings** lists every building a player bought or rents or runs, with the business (updated every 20 s, sortable
   by each column), and **Server**
   shows the last hour: network traffic in and out, messages, server FPS, the network rate, throttled players and each
@@ -593,10 +618,30 @@ Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
 `amaus1209/BigAmbitionsGoingPublicServer:main` eintragen, **Fetch latest**, eine Instanz aus der Vorlage
 **Big Ambitions (Going Public server)** anlegen, **Update** (lädt das Spiel per SteamCMD mit einem Steam-Konto,
 das Big Ambitions besitzt – bei Steam Guard fragt AMP nach dem Code –, Proton GE und das neueste Release von
-hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Passwort (den Server-Schlüssel) und Server-Version (nach dem Neuladen der Seite weg? Mit Websockets verpasst AMPs Seite sie: in der Konfiguration der Instanz „Websockets aktivieren“ ausschalten). Netzverkehr, Server-FPS und die Verbindung jedes Spielers stehen auf der Ranglisten-Seite (siehe unten).
+hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Schlüssel („Server Key“, bei älteren Vorlagen „Server Password“) und Server-Version (nach dem Neuladen der Seite weg? Mit Websockets verpasst AMPs Seite sie: in der Konfiguration der Instanz „Websockets aktivieren“ ausschalten). Netzverkehr, Server-FPS und die Verbindung jedes Spielers stehen auf der Ranglisten-Seite (siehe unten).
 Den Spiel-Port freigeben (UDP, standardmäßig 7777). AMP ohne Docker: Auf dem Rechner müssen `xvfb`, `xauth` und `python3` installiert sein
 (`sudo apt install xvfb xauth python3`) – das Spiel läuft unter Proton mit einem virtuellen Bildschirm. Die
 Docker-Container von AMP bringen sie mit.
+
+**Was die Server-Dateien am Spiel ändern:** Big Ambitions hat keinen eigenen Server. Der Server startet ein normales
+Spiel – per SteamCMD von einem Konto geladen, das es besitzt, seine Dateien bleiben unverändert – ohne Bild unter Proton
+(`-batchmode -nographics`) mit diesem Mod. Zwei Teile des Release `GoingPublicServer-Server.zip` machen das möglich,
+beide nur auf dem Server, Spieler installieren sie nie:
+- **Unity Doorstop 4.3.0** (`1331550/winhttp.dll` und `1331550/doorstop_config.ini`; unverändert, LGPL-2.1,
+  [NeighTools/UnityDoorstop](https://github.com/NeighTools/UnityDoorstop)). Die Vorlage setzt
+  `WINEDLLOVERRIDES=winhttp=n,b`, damit Wine diese `winhttp.dll` statt der eigenen lädt. Doorstop startet dann den
+  Vorlader, bevor Code des Spiels läuft.
+- **Der Vorlader** `1331550/bamp-preloader/BampSteamless.dll` (Quelle:
+  [`headless/preloader/Entrypoint.cs`](headless/preloader/Entrypoint.cs), mit Harmony, MIT). Der Mod-Lader des Spiels
+  sucht Mods erst, wenn Steam meldet, dass es gestartet ist (`SteamAPI.OnSteamInit`). Auf einem Server gibt es keinen
+  Steam-Client: Das passiert nie, und kein Mod würde geladen, auch dieser nicht. Der Vorlader ändert im Speicher eine
+  Methode, `HGModLoader.TryInitializeModsForPlaySession`: Läuft Steam nicht, ruft er das eigene `OnSteamInitialized`
+  des Laders auf, so wie Steam es getan hätte; läuft Steam, läuft der Originalcode.
+  - Er tut nichts, wenn das Spiel nicht mit `-bamp-config` gestartet wurde – das hat nur die Befehlszeile des Servers.
+  - Er ändert keine Datei des Spiels und umgeht keine Besitz- oder Lizenzprüfung. „Steamless“ heißt hier „ohne
+    Steam-Client“, mit dem gleichnamigen DRM-Werkzeug hat er nichts zu tun.
+  - Die Schalter `-bamp-nosteam` und `-bamp-mods-dir` sind für den eigenständigen Windows-Server (unten); die
+    AMP-Vorlage nutzt sie nicht.
 
 **Aktualisieren:** **Update** lädt das neueste Release, danach die Instanz neu starten. Die Spieler bekommen die passende
 Version aus dem Steam Workshop. Nach einem Update den Server einmal starten: Neue Einstellungen bekommen dann ihren
@@ -604,7 +649,9 @@ Standardwert, in AMP gesetzte Werte gelten ab dem nächsten Start. **Stop** spei
 Server dann (wenige Sekunden).
 
 **Einstellungen** (Konfigurationsseite der Instanz):
-- **Server-Sprache**: wählen, dann noch einmal **Update** – danach erscheinen die Einstellungen in dieser Sprache.
+- **Server-Sprache**: die Sprache der Konsolen- und Startmeldungen des Servers; Spieler sehen den Mod in ihrer eigenen
+  Spielsprache. Mit der Vorlage aus diesem Repository danach noch einmal **Update** – dann erscheinen auch die
+  Einstellungen in dieser Sprache (die Vorlage aus der CubeCoders-Liste zeigt sie auf Englisch).
 - **Server**: Welt, Spielstand einmal laden, Name der Server-Figur, Spieleranzahl, Pausieren (leer, untätig, alle im
   Pausenmenü), Server-Schlüssel, automatisches Speichern, **Bildrate im Betrieb** (60, 120 oder 200 FPS) und ohne
   Spieler sowie **Netzwerk-Takt** (Normal 10 / 5 Hz, Hoch 20 / 10 Hz, Sehr hoch 30 / 15 Hz, Maximal 60 / 30 Hz – wie
@@ -629,13 +676,13 @@ Server dann (wenige Sekunden).
   aus zwei endet (nur solange ein anderes Mitglied da war; 0 = nie).
 
 **Admin-Seite:** `https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html#admin` – in AMP auf der Statusseite der Instanz
-als „Admin-Seite“ unter dem Verbindungslink, auf der Rangliste oben rechts („Admin“) und unter der Tabelle – Anmeldung mit dem AMP-Konto; es braucht in AMP das Recht, die Konsole dieser Instanz zu benutzen. Spieler
+als „Admin Page“ (bei älteren Vorlagen „Admin Seite“), auf der Rangliste oben rechts („Admin“) und unter der Tabelle – Anmeldung mit dem AMP-Konto; es braucht in AMP das Recht, die Konsole dieser Instanz zu benutzen. Spieler
 online (Nachricht, Kicken, Bannen mit Grund), der Chat (mitlesen, als Server oder an einen Spieler schreiben), die
 Bannliste (Entbannen, alle entbannen), Speichern und Neustart. In AMP selbst steht der Chat in der Konsole, und die
 Spielerliste hat die Knöpfe Kick und Ban.
 
 **Auf dem Host (Cron, siehe oben):** `bamp-web-sync.sh` stellt die Rangliste jeder Instanz unter
-`https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html` bereit (der Verbindungslink der Instanz) (fusionierte Firmen stehen als „fusioniert mit …“ dabei) und legt
+`https://<AMP-Adresse>/monitor/<Spiel-Port>/index.html` bereit (mit der Vorlage aus diesem Repository auch der Verbindungslink der Instanz) (fusionierte Firmen stehen als „fusioniert mit …“ dabei) und legt
 die deutsche Übersetzung der AMP-Oberfläche ab: AMP einmal mit `https://<AMP-Adresse>/?lang=de` öffnen (pro Browser).
 Unter der Rangliste stehen die **Gebäude der Spieler**: jedes Gebäude, das ein Spieler gekauft, gemietet oder betrieben hat,
 mit dem Geschäft (alle 20 s neu, nach jeder Spalte sortierbar). Darunter zeigt **Server** die letzte Stunde: Netzverkehr rein und raus, Nachrichten, Server-FPS, Netzwerk-Takt,
