@@ -371,7 +371,8 @@ placeholders (`{0}`, `{name}`) and tags (`<b>`). Upload the file to the same pat
 
 ## Credits
 
-Unofficial fork of [Going Public](https://github.com/Melaus123/BigAmbitionMulti) by Melaus (MIT license).
+Going Public Server builds on the multiplayer network code of [Going Public](https://github.com/Melaus123/BigAmbitionMulti)
+by Melaus (MIT license). The dedicated server, the headless mode, the built-in modules and Going Online are our own work.
 
 The built-in modules are our own implementations, modelled on these Workshop mods. Many thanks to their authors:
 
@@ -716,7 +717,8 @@ Danach in der Weboberfläche: unter *Installation* das Spiel laden, mit einem St
 
 ### Herkunft
 
-Inoffizieller Fork von [Going Public](https://github.com/Melaus123/BigAmbitionMulti) von Melaus (MIT-Lizenz). Die
+Going Public Server baut auf dem Mehrspieler-Netzwerkcode von [Going Public](https://github.com/Melaus123/BigAmbitionMulti)
+von Melaus auf (MIT-Lizenz). Dedicated Server, Headless-Modus, die eingebauten Module und Going Online sind eigene Arbeit. Die
 eingebauten Module sind eigene Umsetzungen nach dem Vorbild dieser Workshop-Mods (Links oben unter *Credits*): Immersion -
 RPG Camera von Chamiks, BAScheduler von Shanpapa, SmartSuite Empire Management (SmartInsights, SmartRent) von
 ᗪEEᒍ Gᗩᑌᗪᗩᖇᗪ, Voogle Route mit LIB BA Player Location und LIB BA Unified UI von - Capitaine -, Big Ambitions Radio
