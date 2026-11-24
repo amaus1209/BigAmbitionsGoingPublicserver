@@ -18,11 +18,22 @@ namespace BigAmbitionsMP
     ///   DedicatedSession:  "-" = (world played last), then every world
     /// AMP reads the manifest when the instance starts - a load choice applies at the next start anyway.
     /// HOST side, main thread (DedicatedHost.Tick); only on a headless server.
+    ///
+    /// AMP-PICK-2 (user 2026-11-24, server 01: "saves kann nicht ausgewählt werden"): AMP 2.8 reads the manifest ONLY when
+    /// the AMP instance starts - a changed file and Core/RefreshSettingsSourceCache change nothing (tested in the Windows
+    /// VM) - and re-applying the template from AMP resets it to the template's entries. On 01 that left "(newest save)"
+    /// alone in the dropdown for two days. So the template carries "#2".."#5" (the N-th newest save of the hosted world,
+    /// DedicatedHost.ResolveSave), always selectable, and this list keeps them in front of the saves by name.
     /// </summary>
     internal static class AmpSavePicker
     {
         private const string Sep = " · ";
         private const int MaxSaves = 40;
+        private const int NthMax = 5;   // AMP-PICK-2: "#2".."#5", as in the template's bigambitionsconfig.json
+
+        /// <summary>AMP-PICK-2: the English label of "#N" (the template has the same words; Locales gps_saves_n2..n5).</summary>
+        private static string NthDefault(int n)
+            => n == 2 ? "(2nd newest save)" : n == 3 ? "(3rd newest save)" : $"({n}th newest save)";
         private static volatile bool _dirty = true;
         private static Dictionary<string, string>? _texts;   // the mod's Locales/<server language>.json
         private static float _nextAt;
@@ -69,14 +80,20 @@ namespace BigAmbitionsMP
                 }
                 saves.Sort((a, b) => b.SavedAtUnix.CompareTo(a.SavedAtUnix));
                 var saveList = new JObject { ["-"] = Text("gps_saves_newest", "(newest save)") };
-                for (int i = 0; i < saves.Count && saveList.Count <= MaxSaves; i++)
+                for (int n = 2; n <= NthMax; n++)   // AMP-PICK-2: the template's fixed entries stay
+                    saveList["#" + n] = Text("gps_saves_n" + n, NthDefault(n));
+                int named = 0;
+                for (int i = 0; i < saves.Count && named < MaxSaves; i++)
                     if (saveList[saves[i].SessionName] == null)
+                    {
                         saveList[saves[i].SessionName] = $"{saves[i].SessionName}{Sep}{Text("gps_saves_day", "day {0}", saves[i].Day)}{Sep}{Stamp(saves[i].SavedAtUnix)}";
+                        named++;
+                    }
                 bool changed = WriteManifest(Path.Combine(Path.GetDirectoryName(root) ?? "", "configmanifest.json"),
                                              new Dictionary<string, JObject> { ["DedicatedLoadSave"] = saveList, ["DedicatedSession"] = worlds });
                 foreach (var old in new[] { "bamp-saves", "bamp-worlds" })   // the 1.0.9 tool-discovery folders
                     try { if (Directory.Exists(Path.Combine(root, old))) Directory.Delete(Path.Combine(root, old), true); } catch { }
-                Plugin.Logger.LogInfo($"[AmpPick] AMP dropdowns: {saveList.Count - 1} save(s), {worlds.Count - 1} world(s){(changed ? " - written, AMP shows them after the next instance restart" : " - unchanged")}.");
+                Plugin.Logger.LogInfo($"[AmpPick] AMP dropdowns: {named} save(s), {worlds.Count - 1} world(s){(changed ? " - written, AMP shows them after the next instance restart" : " - unchanged")}.");
             }
             catch (Exception ex)
             {
