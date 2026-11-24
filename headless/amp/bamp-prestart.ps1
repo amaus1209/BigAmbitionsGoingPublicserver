@@ -16,7 +16,21 @@ $ErrorActionPreference = "Continue"
 # PRESTART-WIN-2 (first run on Windows 10, 2026-11-13): AMP reads a stage's output in the console's code page (OEM, 850
 # on a German Windows) - UTF-8 made "Schl├╝ssel" of "Schlüssel". The output stays in the console's own code page.
 
-function Say([string]$t) { Write-Output "[BAMP-Start] $t" }
+# LANG-2 (PR #2053 review 2026-11-23: with Server language "en" the Windows stages printed German): the messages follow
+# the setting "Server language" as on Linux (bamp-prestart.sh LANG-1) - German for "de", English for every other language.
+# Read from bamp-server.json by pattern (no JSON parser, so a broken file still gets readable messages); a file that is not
+# there yet is made with "en" by the step "settings", so English is right then too.
+$script:De = $false
+function Find-Lang([string]$path) {
+    $script:De = $false
+    try {
+        if ($path.Length -gt 0 -and (Test-Path -LiteralPath $path)) {
+            $script:De = [IO.File]::ReadAllText($path) -match '"ServerLanguage"\s*:\s*"[Dd][Ee]"'
+        }
+    } catch { }
+}
+function T([string]$en, [string]$de) { if ($script:De) { return $de } return $en }
+function Say([string]$en, [string]$de) { Write-Output ("[BAMP-Start] " + (T $en $de)) }
 
 # PRESTART-WIN-2: Windows PowerShell 5.1's ConvertFrom-Json refuses an empty key - the template has one ("" in the
 # EnumValues of "DedicatedSession": the world played last) and the step "settings" stopped there. JavaScriptSerializer
@@ -33,17 +47,19 @@ function Field($d, [string]$k) {
     return $null
 }
 
-if ($Root.Length -eq 0) { Say "bamp-prestart.ps1: kein Server-Ordner angegeben - nichts zu tun."; exit 0 }
+Find-Lang $Conf
+if ($Root.Length -eq 0) { Say "bamp-prestart.ps1: no server folder given - nothing to do." "bamp-prestart.ps1: kein Server-Ordner angegeben - nichts zu tun."; exit 0 }
 $Root = [IO.Path]::GetFullPath($Root.TrimEnd('\', '/', '.').TrimEnd('\', '/'))
-if (-not (Test-Path -LiteralPath $Root -PathType Container)) { Say "bamp-prestart.ps1: '$Root' fehlt - nichts zu tun."; exit 0 }
+if (-not (Test-Path -LiteralPath $Root -PathType Container)) { Say "bamp-prestart.ps1: '$Root' is missing - nothing to do." "bamp-prestart.ps1: '$Root' fehlt - nichts zu tun."; exit 0 }
 if ($Conf.Length -eq 0) { $Conf = Join-Path $Root "1331550\bamp-server.json" }
+Find-Lang $Conf
 $Tools = Join-Path $Root "bamp-tools"
 $Mods = Join-Path $Root "mods"
 $Utf8 = New-Object System.Text.UTF8Encoding $false
 
 function Read-Conf {
     if (-not (Test-Path -LiteralPath $Conf)) { return $null }
-    try { return ([IO.File]::ReadAllText($Conf) | ConvertFrom-Json) } catch { Say "bamp-server.json ist nicht lesbar: $($_.Exception.Message)"; return $null }
+    try { return ([IO.File]::ReadAllText($Conf) | ConvertFrom-Json) } catch { Say "bamp-server.json cannot be read: $($_.Exception.Message)" "bamp-server.json ist nicht lesbar: $($_.Exception.Message)"; return $null }
 }
 
 function Write-Conf($c) {
@@ -68,7 +84,8 @@ function Step-Leftovers {
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='Big Ambitions.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($Root, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
     if ($procs.Count -eq 0) { return }
-    Say ("Ein Spiel vom letzten Lauf läuft noch (Prozess " + (($procs | ForEach-Object { $_.ProcessId }) -join ", ") + ") - es wird beendet.")
+    $ids = ($procs | ForEach-Object { $_.ProcessId }) -join ", "
+    Say "A game from the last run is still running (process $ids) - ending it." "Ein Spiel vom letzten Lauf läuft noch (Prozess $ids) - es wird beendet."
     foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 5
     foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -76,15 +93,21 @@ function Step-Leftovers {
 
 # The same first values as the Linux update stage "Default server settings", then SETTINGS-SEED-1: every setting of the
 # template gets its key with the default (AMP writes its values only into keys that are already in the file).
+#
+# TEMP-DIR-1 (PR #2053 review 2026-11-23): the template points TEMP and TMP to <root>\tmp, so the game's uncompressed save
+# (SaveGamePathHelper.GetTempSavePath = Application.temporaryCachePath\tempUncompressedSave) is no longer shared by every
+# instance of the service account. Unity does not create that folder ("Failed to save a temporary cursor file ... this
+# directory does not exist"), so it is made here, before every start. "tmp" as in the template of CubeCoders' list
+# (amp-template-bot 2026-11-24, commit 0808232: its update stage "Temp folder" makes the same folder).
 function Step-Settings {
-    foreach ($d in @("headless", "bamp-mod", "telemetry-data")) { New-Item -ItemType Directory -Force -Path (Join-Path $Root $d) | Out-Null }
+    foreach ($d in @("headless", "bamp-mod", "telemetry-data", "tmp")) { New-Item -ItemType Directory -Force -Path (Join-Path $Root $d) | Out-Null }
     if (-not (Test-Path -LiteralPath $Conf)) {
         $first = '{"ServerLanguage": "en", "Headless": true, "DedicatedHost": true, "DedicatedSession": "", "DedicatedNewGame": "", ' +
                  '"DedicatedLoadSave": "", "PlayerId": "Server", "HostPort": 7777, "DedicatedIdleGraceSeconds": 0, "DedicatedAfkMinutes": 5, ' +
                  '"DedicatedPauseInMenu": true, "DedicatedRequireKey": true, "DedicatedAutoAccept": true, "AutosaveMinutes": 5, ' +
                  '"AutosaveSlots": "3", "MaxPlayers": "8", "PlayerWebUrl": "", "HeadlessFps": 200, "HeadlessIdleFps": 5, "TelemetryKey": ""}'
         [IO.File]::WriteAllText($Conf, $first + "`n", $Utf8)
-        Say "bamp-server.json angelegt."
+        Say "bamp-server.json created." "bamp-server.json angelegt."
     }
     $manifest = Join-Path $Tools "bigambitionsconfig.json"
     if (-not (Test-Path -LiteralPath $manifest)) { return }
@@ -94,7 +117,7 @@ function Step-Settings {
     foreach ($p in $c.PSObject.Properties) { $have[$p.Name] = $true }
     $added = @()
     $settings = @()
-    try { $settings = @(Read-JsonFile $manifest) } catch { Say "bigambitionsconfig.json ist nicht lesbar: $($_.Exception.Message)"; return }
+    try { $settings = @(Read-JsonFile $manifest) } catch { Say "bigambitionsconfig.json cannot be read: $($_.Exception.Message)" "bigambitionsconfig.json ist nicht lesbar: $($_.Exception.Message)"; return }
     foreach ($s in $settings) {
         $field = [string](Field $s "ParamFieldName")
         if (-not $field.StartsWith('$.')) { continue }
@@ -115,7 +138,8 @@ function Step-Settings {
     }
     if ($added.Count -gt 0) {
         Write-Conf $c
-        Write-Output ("[BAMP] bamp-server.json ergänzt um: " + ($added -join ", ") + " (AMP trägt seine Werte beim nächsten Start ein).")
+        $list = $added -join ", "
+        Write-Output ("[BAMP] " + (T "bamp-server.json gained: $list (AMP writes its values there at the next start)." "bamp-server.json ergänzt um: $list (AMP trägt seine Werte beim nächsten Start ein)."))
     }
 }
 
@@ -132,7 +156,7 @@ function Step-Localize {
     $tool = Join-Path $Tools "localize-template.py"
     if (-not (Test-Path -LiteralPath $tool)) { return }
     $py = Find-Python
-    if ($py.Length -eq 0) { Say "Einstellungen in der Server-Sprache: Python fehlt auf diesem Windows - die Einstellungsseite bleibt englisch."; return }
+    if ($py.Length -eq 0) { Say "Settings in the server language: Python is missing on this Windows - the settings page stays English." "Einstellungen in der Server-Sprache: Python fehlt auf diesem Windows - die Einstellungsseite bleibt englisch."; return }
     $l = $Lang
     if ($l.Length -eq 0) { $c = Read-Conf; if ($c -and $c.ServerLanguage) { $l = [string]$c.ServerLanguage } else { $l = "en" } }
     $manifest = [IO.Path]::GetFullPath((Join-Path $Root "..\configmanifest.json"))
@@ -151,7 +175,7 @@ function Step-Key {
         [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
         $key = -join ($b | ForEach-Object { $_.ToString("x2") })
         [IO.File]::WriteAllText($kfile, $key + "`n", $Utf8)
-        Write-Output "[Server] Neuer Server-Schlüssel erstellt."
+        Write-Output ("[Server] " + (T "New server key created." "Neuer Server-Schlüssel erstellt."))
     }
 }
 
@@ -185,14 +209,14 @@ function Step-Mods {
     New-Item -ItemType Directory -Force -Path $Mods, (Join-Path $Root "bamp-mods-extra") | Out-Null
     $gps = Join-Path $Root "bamp-mod\GoingPublicServer"
     if (Test-Path -LiteralPath (Join-Path $gps "BigAmbitionsMP.dll")) {
-        if (Copy-Mod $gps "GoingPublicServer") { Say "Going Public Server aus bamp-mod\ in mods\ kopiert." }
-    } else { Say "bamp-mod\GoingPublicServer fehlt - in AMP 'Update' ausführen." }
+        if (Copy-Mod $gps "GoingPublicServer") { Say "Going Public Server copied from bamp-mod\ into mods\." "Going Public Server aus bamp-mod\ in mods\ kopiert." }
+    } else { Say "bamp-mod\GoingPublicServer is missing - run 'Update' in AMP." "bamp-mod\GoingPublicServer fehlt - in AMP 'Update' ausführen." }
     foreach ($d in @(Get-ChildItem -LiteralPath (Join-Path $Root "bamp-mods-extra") -Directory -ErrorAction SilentlyContinue)) {
         if ($d.Name -eq "GoingPublicServer") { continue }
         if ((Test-Path -LiteralPath (Join-Path $d.FullName "Layout.json")) -and -not (Get-ChildItem -LiteralPath $d.FullName -Filter *.dll)) {
-            Say "'$($d.Name)' ist ein Blueprint - bleibt beim Spieler, nicht installiert."; continue
+            Say "'$($d.Name)' is a blueprint - it stays with the players, not installed." "'$($d.Name)' ist ein Blueprint - bleibt beim Spieler, nicht installiert."; continue
         }
-        if (Copy-Mod $d.FullName $d.Name) { Say "Mod '$($d.Name)' aus bamp-mods-extra\ installiert." }
+        if (Copy-Mod $d.FullName $d.Name) { Say "Mod '$($d.Name)' installed from bamp-mods-extra\." "Mod '$($d.Name)' aus bamp-mods-extra\ installiert." }
     }
     $kvp = [IO.Path]::GetFullPath((Join-Path $Root "..\steamcmdplugin.kvp"))
     if (Test-Path -LiteralPath $kvp) {
@@ -205,7 +229,8 @@ function Step-Mods {
                     foreach ($d in @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue)) {
                         if ($d.Name -notmatch '^[0-9]+$' -or $wanted -contains $d.Name) { continue }
                         Remove-Item -LiteralPath $d.FullName -Recurse -Force
-                        Say "Workshop-Mod '$($d.Name)' ist nicht mehr unter `"Steam Workshop Items`" - entfernt ($(Split-Path $dir -Leaf)\)."
+                        $leaf = Split-Path $dir -Leaf
+                        Say "Workshop mod '$($d.Name)' is no longer under `"Steam Workshop Items`" - removed ($leaf\)." "Workshop-Mod '$($d.Name)' ist nicht mehr unter `"Steam Workshop Items`" - entfernt ($leaf\)."
                     }
                 }
             }
@@ -233,7 +258,10 @@ function Step-Mods {
     Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Name -ne "mods.json" } | Remove-Item -Force
     $json = '{"mods": [' + (($entries | ForEach-Object { '{"folder": ' + ($_.folder | ConvertTo-Json) + ', "workshop": ' + $_.workshop.ToString().ToLower() + '}' }) -join ', ') + ']}'
     [IO.File]::WriteAllText((Join-Path $out "mods.json"), $json + "`n", $Utf8)
-    if ($entries.Count -gt 0) { Say ("$($entries.Count) Server-Mod(s) in der Liste für Spieler: " + (($entries | ForEach-Object { $_.folder }) -join ", ")) }
+    if ($entries.Count -gt 0) {
+        $names = ($entries | ForEach-Object { $_.folder }) -join ", "
+        Say "$($entries.Count) server mod(s) in the list for players: $names" "$($entries.Count) Server-Mod(s) in der Liste für Spieler: $names"
+    }
 }
 
 # STEAM-LOGIN-1 (user 2026-11-13: "möchte die zugangsdaten in der instanz unter einstellungen bigambitions eintragen", then
@@ -245,10 +273,10 @@ function Step-Mods {
 # a run that hangs ends after two hours. The account name never reaches AMP's console or log (shown as <Konto>).
 function Step-Steam([string]$user) {
     $user = ([string]$user).Trim()
-    if ($user.Length -eq 0) { Say "Steam-Anmeldung 'Gemerkte Anmeldung' ist gewählt, aber kein Steam-Kontoname eingetragen (Einstellungen > Big Ambitions > Steam-Updates)."; exit 1 }
-    if ($user -notmatch '^[A-Za-z0-9_.@-]{1,64}$') { Say "Der Steam-Kontoname enthält Zeichen, die hier nicht gehen (erlaubt: Buchstaben, Ziffern, _ . @ -)."; exit 1 }
+    if ($user.Length -eq 0) { Say "Steam login 'Remembered login' is chosen, but no Steam account name is set (Settings > Big Ambitions > Steam updates)." "Steam-Anmeldung 'Gemerkte Anmeldung' ist gewählt, aber kein Steam-Kontoname eingetragen (Einstellungen > Big Ambitions > Steam-Updates)."; exit 1 }
+    if ($user -notmatch '^[A-Za-z0-9_.@-]{1,64}$') { Say "The Steam account name has characters that do not work here (allowed: letters, digits, _ . @ -)." "Der Steam-Kontoname enthält Zeichen, die hier nicht gehen (erlaubt: Buchstaben, Ziffern, _ . @ -)."; exit 1 }
     $exe = Join-Path $Root "steamcmd.exe"
-    if (-not (Test-Path -LiteralPath $exe)) { Say "SteamCMD fehlt in dieser Instanz - einmal mit 'Steam-Anmeldung: Login-Fenster' aktualisieren."; exit 1 }
+    if (-not (Test-Path -LiteralPath $exe)) { Say "SteamCMD is missing in this instance - update once with 'Steam login for game updates: Login window'." "SteamCMD fehlt in dieser Instanz - einmal mit 'Steam-Anmeldung: Login-Fenster' aktualisieren."; exit 1 }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
     $psi.Arguments = '+@ShutdownOnFailedCommand 1 +@NoPromptForPassword 1 +@sSteamCmdForcePlatformType windows +force_install_dir "' +
@@ -259,7 +287,8 @@ function Step-Steam([string]$user) {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
-    Say "Spiel-Update über SteamCMD mit der gemerkten Anmeldung ..."
+    Say "Game update through SteamCMD with the remembered login ..." "Spiel-Update über SteamCMD mit der gemerkten Anmeldung ..."
+    $acc = T "<account>" "<Konto>"
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()   # no password prompt can wait for an answer
     $null = $p.StandardError.ReadToEndAsync()
@@ -268,18 +297,19 @@ function Step-Steam([string]$user) {
     while ($true) {
         $t = $p.StandardOutput.ReadLineAsync()
         while (-not $t.Wait(1000)) { if ((Get-Date) -gt $deadline) { break } }
-        if (-not $t.IsCompleted) { try { $p.Kill() } catch { }; $why = "nach zwei Stunden abgebrochen"; break }
+        if (-not $t.IsCompleted) { try { $p.Kill() } catch { }; $why = (T "stopped after two hours" "nach zwei Stunden abgebrochen"); break }
         $line = $t.Result
         if ($null -eq $line) { break }
         if ($line -match "Success! App '1331550' (fully installed|already up to date)") { $ok = $true }
         if ($line -match '(?i)Cached credentials not found|password|Login Failure|Steam Guard|two-factor|Rate Limit|Expired|FAILED') { $why = $line.Trim() }
-        if ($line.Trim().Length -gt 0) { Write-Output ("[SteamCMD] " + $line.Replace($user, '<Konto>')) }
+        if ($line.Trim().Length -gt 0) { Write-Output ("[SteamCMD] " + $line.Replace($user, $acc)) }
     }
     $null = $p.WaitForExit(30000)
-    if ($ok) { Say "Spiel-Update mit der gemerkten Steam-Anmeldung fertig."; return }
-    $why = $why.Replace($user, '<Konto>')
-    Say ("Spiel-Update mit der gemerkten Steam-Anmeldung ging nicht" + $(if ($why.Length -gt 0) { " ($why)" } else { "" }) +
-         ". Steam-Anmeldung einmal auf 'Login-Fenster' stellen, Update drücken und anmelden, danach wieder 'Gemerkte Anmeldung'.")
+    if ($ok) { Say "Game update with the remembered Steam login done." "Spiel-Update mit der gemerkten Steam-Anmeldung fertig."; return }
+    $why = $why.Replace($user, $acc)
+    $w = $(if ($why.Length -gt 0) { " ($why)" } else { "" })
+    Say ("Game update with the remembered Steam login failed$w. Set the Steam login to 'Login window' once, press Update and log in, then back to 'Remembered login'.") `
+        ("Spiel-Update mit der gemerkten Steam-Anmeldung ging nicht$w. Steam-Anmeldung einmal auf 'Login-Fenster' stellen, Update drücken und anmelden, danach wieder 'Gemerkte Anmeldung'.")
     exit 1
 }
 
@@ -291,6 +321,6 @@ switch ($Step) {
     "key" { Step-Key }
     "mods" { Step-Mods }
     "all" { Step-Leftovers; Step-Settings; Step-Key; Step-Mods }
-    default { Say "bamp-prestart.ps1: unbekannter Schritt '$Step'." }
+    default { Say "bamp-prestart.ps1: unknown step '$Step'." "bamp-prestart.ps1: unbekannter Schritt '$Step'." }
 }
 exit 0

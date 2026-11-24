@@ -14,8 +14,8 @@ Meta.MinAMPVersion=2.6.2.8
 Meta.SpecificDockerImage=cubecoders/ampbase:debian
 Meta.DockerRequired=False
 Meta.DockerBaseReadOnly=False
-Meta.ContainerPolicy=Supported
-Meta.ContainerPolicyReason=
+Meta.ContainerPolicy=SupportedOnLinux
+Meta.ContainerPolicyReason=On Windows the server runs natively. Containers are offered on Linux only: in a Windows-hosted container the game exits right after Proton starts.
 Meta.ExtraSetupStepsURI=https://github.com/amaus1209/BigAmbitionsGoingPublicServer#server-owners-amp
 Meta.Prerequisites=[]
 Meta.ExtraContainerPackages=["python3","xvfb","xauth"]
@@ -41,7 +41,7 @@ App.WindowsCommandLineArgs=-batchmode -nographics -disable-force-steam -bamp-nos
 App.CommandLineArgs={{$PlatformArgs}}
 App.UseLinuxIOREDIR=False
 App.AppSettings={}
-App.EnvironmentVariables={"SteamAppId": "1331550", "SteamGameId": "1331550", "STEAM_COMPAT_DATA_PATH": "{{$FullRootDir}}.proton/compatdata", "STEAM_COMPAT_CLIENT_INSTALL_PATH": "{{$FullBaseDir}}.steam/steam", "HOME": "{{$FullBaseDir}}", "LD_LIBRARY_PATH": "{{$FullRootDir}}linux64:%LD_LIBRARY_PATH%", "WINEDLLOVERRIDES": "winhttp=n,b"}
+App.EnvironmentVariables={"SteamAppId": "1331550", "SteamGameId": "1331550", "STEAM_COMPAT_DATA_PATH": "{{$FullRootDir}}.proton/compatdata", "STEAM_COMPAT_CLIENT_INSTALL_PATH": "{{$FullBaseDir}}.steam/steam", "HOME": "{{$FullBaseDir}}", "LD_LIBRARY_PATH": "{{$FullRootDir}}linux64:%LD_LIBRARY_PATH%", "WINEDLLOVERRIDES": "winhttp=n,b", "TEMP": "{{$FullRootDir}}tmp", "TMP": "{{$FullRootDir}}tmp"}
 App.CommandLineParameterFormat=-{0}={1}
 App.CommandLineParameterDelimiter=
 App.ExitMethod=String
@@ -89,7 +89,7 @@ App.WakeupMode=Any
 App.ApplicationReadyMode=RegexMatch
 Console.FilterMatchRegex=(\e\[(\d+;)*(\d+)?[ABCDHJKfmsu]|\e\[?[?\>\=\da-z]+)
 Console.FilterMatchReplacement=
-Console.ThrowawayMessageRegex=^(?!.*\[BAMP-HEADLESS\]).*(Shader|wine: |fixme:|AsyncGPUReadback|does not support asynchronous readback|Compressed to C:|Game C:/users/steamuser/AppData/Local/Temp).*$
+Console.ThrowawayMessageRegex=^(?!.*\[BAMP-HEADLESS\]).*(Shader|wine: (?:Read access denied for device|configuration in )|fixme:|AsyncGPUReadback|does not support asynchronous readback|Compressed to C:|Game C:/users/steamuser/AppData/Local/Temp).*$
 Console.AppReadyRegex=^.*\[BAMP-HEADLESS\] READY .*$
 Console.UserJoinRegex=^.*\[BAMP-HEADLESS\] JOIN (?<username>.+)$
 Console.UserLeaveRegex=^.*\[BAMP-HEADLESS\] LEAVE (?<username>.+)$

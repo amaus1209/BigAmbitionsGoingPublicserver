@@ -30,7 +30,7 @@ Docker; the game runs headless with the **Going Public Server** mod
   into `bamp-mods-extra/`). The built-in modules replace Immersion, BAScheduler, SmartSuite (SmartInsights),
   VoogleRoute, Big Ambitions Radio, Aluna's Phone Pages, IT Business Expansion with Skill Kit, and Spotless.
 - **The server comes in several variants** ([Releases](https://github.com/amaus1209/BigAmbitionsGoingPublicServer/releases)): the template for the CubeCoders AMP game server panel
-  (Linux, see *Server owners: AMP*), and a program of its own with a web interface for **Windows** and **Linux** and as
+  (Windows and Linux, see *Server owners: AMP*), and a program of its own with a web interface for **Windows** and **Linux** and as
   a **Docker** container (see *Server owners: Windows, Linux, Docker*). Players can no longer host a game themselves:
   multiplayer means joining a dedicated server.
 - **Please report bugs** under [Issues](https://github.com/amaus1209/BigAmbitionsGoingPublicServer/issues) or in the comments on the [Steam Workshop page](https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182): with the
@@ -242,28 +242,35 @@ page. Taxes by phone: Contacts -> Internal Revenue Service.
 
 ### Installing
 
-1. In AMP (ADS): **Configuration → Instance Deployment → Configuration Repositories**, add
-   `amaus1209/BigAmbitionsGoingPublicServer:main`, then **Fetch latest**.
+There are two templates named **Big Ambitions (Going Public server)**: the one in CubeCoders' template list and this
+repository's own. On Windows both run the game natively. On Linux CubeCoders' template runs it under Wine, this
+repository's under Proton GE.
+
+1. Only for this repository's template: in AMP (ADS) **Configuration → Instance Deployment → Configuration
+   Repositories**, add `amaus1209/BigAmbitionsGoingPublicServer:main`, then **Fetch latest**.
 2. Create an instance from the template **Big Ambitions (Going Public server)**.
 3. In the instance: **Update**. AMP downloads the game with SteamCMD (it asks for a Steam login that owns
-   Big Ambitions, and the Steam Guard code if the account has one), Proton GE, and the newest
-   **Going Public Server** release from this repository.
+   Big Ambitions, and the Steam Guard code if the account has one) and the newest **Going Public Server** release
+   from this repository. On Linux it also sets up Wine (CubeCoders' template) or downloads Proton GE (this
+   repository's).
 4. **Start**. The console shows `[BAMP-HEADLESS] READY`; the status page shows the game port, the **server key** players join with ("Server Key", on older templates "Server Password"), and the server version (gone after reloading the page? AMP's page misses them with Websockets on: switch off "Enable Websockets" in the instance's configuration). Network traffic, server FPS and each player's connection are on the ranking page (see below).
 5. Open the game port (UDP, 7777 by default) in your firewall.
-6. AMP without Docker: the host needs `xvfb`, `xauth` and `python3` (`sudo apt install xvfb xauth python3`) - the game
-   runs under Proton with a virtual display. AMP's Docker containers bring them along.
+6. On Windows the game needs nothing else; run it without a container there. On Linux a container is the easiest
+   way (CubeCoders' template recommends one; it brings everything along). Without one, the host needs `xvfb`, `xauth`
+   and `python3` (`sudo apt install xvfb xauth python3`) - the game runs with a virtual display - and for CubeCoders'
+   template also Wine (ideally the latest stable from winehq.org).
 
 ### What the server files change in the game
 
 Big Ambitions has no dedicated server of its own. The server runs a normal copy of the game - downloaded with SteamCMD
-from an account that owns it, its files left as they are - headless under Proton (`-batchmode -nographics`) with this
-mod. Two parts of the release `GoingPublicServer-Server.zip` make that work. Both are only on the server; players never
-install them.
+from an account that owns it, its files left as they are - headless (`-batchmode -nographics`) with this mod: on
+Windows natively, on Linux under Wine or Proton GE (see *Installing*). Two parts of the release
+`GoingPublicServer-Server.zip` make that work. Both are only on the server; players never install them.
 
 - **Unity Doorstop 4.3.0** (`1331550/winhttp.dll` and `1331550/doorstop_config.ini`; unmodified, LGPL-2.1,
-  [NeighTools/UnityDoorstop](https://github.com/NeighTools/UnityDoorstop)). The template sets
-  `WINEDLLOVERRIDES=winhttp=n,b`, so Wine loads this `winhttp.dll` instead of its own. Doorstop then starts the
-  preloader below before any code of the game runs.
+  [NeighTools/UnityDoorstop](https://github.com/NeighTools/UnityDoorstop)). On Linux both templates set
+  `WINEDLLOVERRIDES=winhttp=n,b`, so Wine loads this `winhttp.dll` instead of its own; Windows loads it from the
+  game's folder by itself. Doorstop then starts the preloader below before any code of the game runs.
 - **The preloader** `1331550/bamp-preloader/BampSteamless.dll` (source:
   [`headless/preloader/Entrypoint.cs`](headless/preloader/Entrypoint.cs), with Harmony, MIT). The game's mod loader
   looks for mods only after Steam reports that it has started (`SteamAPI.OnSteamInit`). A server has no Steam client,
@@ -273,8 +280,30 @@ install them.
   - It does nothing unless the game was started with `-bamp-config`, which only the server's command line has.
   - It changes no file of the game and skips no ownership or licence check. "Steamless" here means "without the Steam
     client"; it has nothing to do with the DRM tool of that name.
-  - Two more switches, `-bamp-nosteam` and `-bamp-mods-dir`, are for the stand-alone Windows server (below). The AMP
-    template does not use them.
+- **Launch options.** CubeCoders' template starts the game with these switches on Windows and on Linux, this
+  repository's template on Windows (on Linux it gives each instance a Proton prefix of its own instead):
+  - `-disable-force-steam`, the game's own switch: without it, a game that Steam did not start asks Steam to start it
+    again (`SteamClient.RestartAppIfNecessary`) and quits.
+  - `-bamp-nosteam` (preloader): the game never connects to a Steam client. The preloader skips the game's Steam start
+    (`SteamAPI.InitSteam`) and starts the mod loader itself. A Steam client running on the same PC stays untouched:
+    no "already running", and no Workshop mods of that account on the server.
+  - `-bamp-mods-dir "<instance>/mods"` (preloader): the game's local mod folder (`ModDiscoveryRegistry.ModsLocalPath`,
+    normally `ModsLocal` in `AppData\LocalLow\Hovgaard Games\Big Ambitions` of the service account or the Wine
+    prefix) is the instance's own `mods` folder, which the pre-start stage fills with Going Public Server and the
+    Workshop mods. Instances never share their mods. On Linux, CubeCoders' template links the `ModsLocal` folder the
+    pre-start script expects to `mods/`.
+  - `-bamp-data-dir "<instance>/gamedata"` (the mod, since 1.0.17.4): the saves (`gamedata/SaveGames`) and the mod's
+    data (server id, bans, logs) stay in the instance's folder instead of the profile, which on Windows every instance
+    of the service account would share. AMP's backups include them. Nothing is moved: worlds saved before stay where
+    they were (under Proton in `.proton/compatdata/pfx/drive_c/users/steamuser/AppData/LocalLow/Hovgaard Games/Big Ambitions/SaveGames`);
+    copy them to `gamedata/SaveGames` to keep them. This repository's own template does not pass it yet: an existing
+    server would otherwise start with an empty world.
+  - `-logFile -`: Unity writes its log to the console, where AMP reads it.
+  - The environment variables `TEMP` and `TMP` point to `<instance>/tmp`: the game writes each save uncompressed to
+    its temp folder before it compresses it into the instance, so two instances saving at the same moment never use
+    the same folder. Wine and Proton do not pass them on; on Linux the game keeps the temp folder of its prefix, which
+    belongs to that instance alone.
+  - On Linux, CubeCoders' template also sets `WINEDEBUG=-all`, so Wine's own messages stay out of the console.
 
 ### Updating
 
@@ -404,7 +433,7 @@ Big Ambitions belongs to Hovgaard Games; every player and the server need their 
   nichts nach `bamp-mods-extra/` legen). Die eingebauten Module ersetzen Immersion, BAScheduler, SmartSuite
   (SmartInsights), VoogleRoute, Big Ambitions Radio, Alunas Phone Pages, IT Business Expansion mit Skill Kit und Spotless.
 - **Den Server gibt es in mehreren Varianten** ([Releases](https://github.com/amaus1209/BigAmbitionsGoingPublicServer/releases)): die Vorlage für das Gameserver-Panel CubeCoders AMP
-  (Linux, siehe *Server-Betreiber: AMP*) und ein eigenes Programm mit Weboberfläche für **Windows** und **Linux** sowie
+  (Windows und Linux, siehe *Server-Betreiber: AMP*) und ein eigenes Programm mit Weboberfläche für **Windows** und **Linux** sowie
   als **Docker**-Container (siehe *Server-Betreiber: Windows, Linux, Docker*). Spieler können selbst kein Spiel mehr
   hosten: Mehrspieler heißt, einem dedizierten Server beizutreten.
 - **Fehler bitte melden** unter [Issues](https://github.com/amaus1209/BigAmbitionsGoingPublicServer/issues) oder in den Kommentaren der [Steam-Workshop-Seite](https://steamcommunity.com/sharedfiles/filedetails/?id=3829681182): mit der
@@ -615,23 +644,30 @@ Handy. Steuern per Telefon: Kontakte -> Internal Revenue Service.
 
 ### Server-Betreiber: AMP
 
-**Installation:** Konfiguration → Instance Deployment → Configuration Repositories:
-`amaus1209/BigAmbitionsGoingPublicServer:main` eintragen, **Fetch latest**, eine Instanz aus der Vorlage
+**Zwei Vorlagen:** **Big Ambitions (Going Public server)** gibt es in der Vorlagenliste von CubeCoders und als eigene
+Vorlage dieses Repositorys. Unter Windows starten beide das Spiel direkt, unter Linux die von CubeCoders mit Wine, die
+eigene mit Proton GE.
+
+**Installation:** Nur für die eigene Vorlage: Konfiguration → Instance Deployment → Configuration Repositories:
+`amaus1209/BigAmbitionsGoingPublicServer:main` eintragen, **Fetch latest**. Dann eine Instanz aus der Vorlage
 **Big Ambitions (Going Public server)** anlegen, **Update** (lädt das Spiel per SteamCMD mit einem Steam-Konto,
-das Big Ambitions besitzt – bei Steam Guard fragt AMP nach dem Code –, Proton GE und das neueste Release von
-hier), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Schlüssel („Server Key“, bei älteren Vorlagen „Server Password“) und Server-Version (nach dem Neuladen der Seite weg? Mit Websockets verpasst AMPs Seite sie: in der Konfiguration der Instanz „Websockets aktivieren“ ausschalten). Netzverkehr, Server-FPS und die Verbindung jedes Spielers stehen auf der Ranglisten-Seite (siehe unten).
-Den Spiel-Port freigeben (UDP, standardmäßig 7777). AMP ohne Docker: Auf dem Rechner müssen `xvfb`, `xauth` und `python3` installiert sein
-(`sudo apt install xvfb xauth python3`) – das Spiel läuft unter Proton mit einem virtuellen Bildschirm. Die
-Docker-Container von AMP bringen sie mit.
+das Big Ambitions besitzt – bei Steam Guard fragt AMP nach dem Code –, und das neueste Release von hier, unter Linux
+außerdem Wine (Vorlage von CubeCoders) oder Proton GE (eigene Vorlage)), dann **Start**. Die Konsole zeigt `[BAMP-HEADLESS] READY`; die Statusseite zeigt Spiel-Port, Server-Schlüssel („Server Key“, bei älteren Vorlagen „Server Password“) und Server-Version (nach dem Neuladen der Seite weg? Mit Websockets verpasst AMPs Seite sie: in der Konfiguration der Instanz „Websockets aktivieren“ ausschalten). Netzverkehr, Server-FPS und die Verbindung jedes Spielers stehen auf der Ranglisten-Seite (siehe unten).
+Den Spiel-Port freigeben (UDP, standardmäßig 7777). Unter Windows braucht das Spiel nichts weiter, dort ohne
+Container. Unter Linux geht es mit einem Container am einfachsten (die Vorlage von CubeCoders empfiehlt ihn, er bringt
+alles mit). Ohne Container müssen auf dem Rechner `xvfb`, `xauth` und `python3` installiert sein
+(`sudo apt install xvfb xauth python3`) – das Spiel läuft mit einem virtuellen Bildschirm –, für die Vorlage von
+CubeCoders außerdem Wine (am besten das neueste stabile von winehq.org).
 
 **Was die Server-Dateien am Spiel ändern:** Big Ambitions hat keinen eigenen Server. Der Server startet ein normales
-Spiel – per SteamCMD von einem Konto geladen, das es besitzt, seine Dateien bleiben unverändert – ohne Bild unter Proton
-(`-batchmode -nographics`) mit diesem Mod. Zwei Teile des Release `GoingPublicServer-Server.zip` machen das möglich,
-beide nur auf dem Server, Spieler installieren sie nie:
+Spiel – per SteamCMD von einem Konto geladen, das es besitzt, seine Dateien bleiben unverändert – ohne Bild
+(`-batchmode -nographics`) mit diesem Mod, unter Windows direkt, unter Linux mit Wine oder Proton GE (siehe oben).
+Zwei Teile des Release `GoingPublicServer-Server.zip` machen das möglich, beide nur auf dem Server, Spieler
+installieren sie nie:
 - **Unity Doorstop 4.3.0** (`1331550/winhttp.dll` und `1331550/doorstop_config.ini`; unverändert, LGPL-2.1,
-  [NeighTools/UnityDoorstop](https://github.com/NeighTools/UnityDoorstop)). Die Vorlage setzt
-  `WINEDLLOVERRIDES=winhttp=n,b`, damit Wine diese `winhttp.dll` statt der eigenen lädt. Doorstop startet dann den
-  Vorlader, bevor Code des Spiels läuft.
+  [NeighTools/UnityDoorstop](https://github.com/NeighTools/UnityDoorstop)). Unter Linux setzen beide Vorlagen
+  `WINEDLLOVERRIDES=winhttp=n,b`, damit Wine diese `winhttp.dll` statt der eigenen lädt; Windows lädt sie von sich aus
+  aus dem Ordner des Spiels. Doorstop startet dann den Vorlader, bevor Code des Spiels läuft.
 - **Der Vorlader** `1331550/bamp-preloader/BampSteamless.dll` (Quelle:
   [`headless/preloader/Entrypoint.cs`](headless/preloader/Entrypoint.cs), mit Harmony, MIT). Der Mod-Lader des Spiels
   sucht Mods erst, wenn Steam meldet, dass es gestartet ist (`SteamAPI.OnSteamInit`). Auf einem Server gibt es keinen
@@ -641,8 +677,31 @@ beide nur auf dem Server, Spieler installieren sie nie:
   - Er tut nichts, wenn das Spiel nicht mit `-bamp-config` gestartet wurde – das hat nur die Befehlszeile des Servers.
   - Er ändert keine Datei des Spiels und umgeht keine Besitz- oder Lizenzprüfung. „Steamless“ heißt hier „ohne
     Steam-Client“, mit dem gleichnamigen DRM-Werkzeug hat er nichts zu tun.
-  - Die Schalter `-bamp-nosteam` und `-bamp-mods-dir` sind für den eigenständigen Windows-Server (unten); die
-    AMP-Vorlage nutzt sie nicht.
+- **Startoptionen.** Die Vorlage von CubeCoders startet das Spiel unter Windows und unter Linux mit diesen Schaltern,
+  die eigene Vorlage unter Windows (unter Linux gibt sie stattdessen jeder Instanz ein eigenes Proton-Prefix):
+  - `-disable-force-steam`, ein Schalter des Spiels selbst: Ohne ihn bittet ein Spiel, das Steam nicht gestartet hat,
+    Steam um einen Neustart (`SteamClient.RestartAppIfNecessary`) und beendet sich.
+  - `-bamp-nosteam` (Vorlader): Das Spiel verbindet sich nie mit einem Steam-Client. Der Vorlader überspringt den
+    Steam-Start des Spiels (`SteamAPI.InitSteam`) und startet den Mod-Lader selbst. Ein Steam auf demselben PC bleibt
+    unberührt: kein „läuft bereits“, keine Workshop-Mods dieses Kontos auf dem Server.
+  - `-bamp-mods-dir "<Instanz>/mods"` (Vorlader): Der lokale Mod-Ordner des Spiels
+    (`ModDiscoveryRegistry.ModsLocalPath`, sonst `ModsLocal` in `AppData\LocalLow\Hovgaard Games\Big Ambitions` des
+    Dienstkontos oder des Wine-Prefix) ist der eigene `mods`-Ordner der Instanz, den die Vorstart-Stufe mit Going
+    Public Server und den Workshop-Mods füllt. Instanzen teilen ihre Mods nie. Unter Linux verlinkt die Vorlage von
+    CubeCoders den `ModsLocal`-Ordner, den das Vorstart-Skript erwartet, auf `mods/`.
+  - `-bamp-data-dir "<Instanz>/gamedata"` (der Mod, ab 1.0.17.4): Spielstände (`gamedata/SaveGames`) und die Daten
+    des Mods (Server-ID, Sperren, Logs) bleiben im Ordner der Instanz statt im Profil, das sich unter Windows alle
+    Instanzen des Dienstkontos teilen würden. AMPs Sicherungen enthalten sie. Verschoben wird nichts: Früher
+    gespeicherte Welten bleiben, wo sie waren (unter Proton in `.proton/compatdata/pfx/drive_c/users/steamuser/AppData/LocalLow/Hovgaard Games/Big Ambitions/SaveGames`);
+    nach `gamedata/SaveGames` kopieren, um sie zu behalten. Die eigene Vorlage dieses Repositorys übergibt ihn noch
+    nicht: Ein bestehender Server würde sonst mit einer leeren Welt starten.
+  - `-logFile -`: Unity schreibt sein Log in die Konsole, wo AMP es liest.
+  - Die Umgebungsvariablen `TEMP` und `TMP` zeigen auf `<Instanz>/tmp`: Das Spiel schreibt jeden Spielstand erst
+    unkomprimiert in seinen Temp-Ordner und komprimiert ihn dann in die Instanz – zwei Instanzen, die im selben Moment
+    speichern, nutzen so nie denselben Ordner. Wine und Proton geben beide nicht weiter; unter Linux bleibt das Spiel
+    beim Temp-Ordner seines Prefix, das nur dieser Instanz gehört.
+  - Unter Linux setzt die Vorlage von CubeCoders außerdem `WINEDEBUG=-all`, damit Wines eigene Meldungen nicht in der
+    Konsole landen.
 
 **Aktualisieren:** **Update** lädt das neueste Release, danach die Instanz neu starten. Die Spieler bekommen die passende
 Version aus dem Steam Workshop. Nach einem Update den Server einmal starten: Neue Einstellungen bekommen dann ihren
