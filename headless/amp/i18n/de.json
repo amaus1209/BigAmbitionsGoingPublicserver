@@ -27,6 +27,10 @@
         "false": "nein",
         "(world played last)": "(zuletzt gespielte Welt)",
         "(newest save)": "(neuester Spielstand)",
+        "(2nd newest save)": "(zweitneuester Spielstand)",
+        "(3rd newest save)": "(drittneuester Spielstand)",
+        "(4th newest save)": "(viertneuester Spielstand)",
+        "(5th newest save)": "(fünftneuester Spielstand)",
         "1x (game)": "1x (Spiel)",
         "100% (game)": "100 % (Spiel)",
         "75%": "75 %",
@@ -58,11 +62,11 @@
     ],
     "DedicatedSession": [
         "Welt",
-        "Die Welt, die der Server betreibt: die Welten auf diesem Server oder „(zuletzt gespielte Welt)“. Der Server füllt die Liste selbst; neue Welten zeigt AMP nach dem nächsten Neustart der Instanz. Eine neue Welt entsteht über „Neue Welt: Name“ (Reiter New world); gibt es noch keine Welt, legt „Neue Welt: Schwierigkeit“ eine Welt namens „Server“ an."
+        "Die Welt, die der Server betreibt: die Welten auf diesem Server oder „(zuletzt gespielte Welt)“. Der Server füllt die Liste selbst; AMP liest sie nur beim Start der Instanz ein, neue Welten erscheinen also nach dem nächsten Neustart der Instanz (ein Neustart nur des Servers reicht nicht). Eine neue Welt entsteht über „Neue Welt: Name“ (Reiter New world); gibt es noch keine Welt, legt „Neue Welt: Schwierigkeit“ eine Welt namens „Server“ an."
     ],
     "DedicatedLoadSave": [
         "Spielstand einmal laden",
-        "Beim nächsten Start einmal diesen Spielstand statt des neuesten laden – spätere Neustarts laden wieder den neuesten. Die Liste zeigt die Spielstände auf diesem Server, neueste zuerst, mit Spieltag und Uhrzeit; der Server füllt sie selbst, neue Spielstände zeigt AMP nach dem nächsten Neustart der Instanz. „(neuester Spielstand)“ = immer den neuesten."
+        "Beim nächsten Start einmal diesen Spielstand statt des neuesten laden – spätere Neustarts laden wieder den neuesten. „(zweitneuester Spielstand)“ bis „(fünftneuester Spielstand)“ zählen vom neuesten Spielstand der Welt zurück, die der Server betreibt, und stehen immer zur Wahl. Die Spielstände mit Namen, neueste zuerst mit Spieltag und Uhrzeit, trägt der Server selbst ein; AMP liest sie nur beim Start der Instanz ein, neue Spielstände erscheinen also nach dem nächsten Neustart der Instanz (ein Neustart nur des Servers reicht nicht). In der Konsole zeigt saves alle Spielstände, und load #N oder load mit dem Namen eines Spielstands lädt einen sofort (der Server speichert vorher und startet neu) – so auch denselben Eintrag noch einmal. „(neuester Spielstand)“ = immer den neuesten."
     ],
     "DedicatedNewGame": [
         "Neue Welt: Schwierigkeit",
